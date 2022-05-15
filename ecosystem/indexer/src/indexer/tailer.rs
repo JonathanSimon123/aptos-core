@@ -543,8 +543,8 @@ mod test {
               "expiration_timestamp_secs": "1649713172",
               "payload": {
                 "type": "script_function_payload",
-                "function": "0x1::TestCoin::mint",
-                "type_arguments": [],
+                "function": "0x1::Coin::mint",
+                "type_arguments": ["0x1::TestCoin::TestCoin"],
                 "arguments": [
                   "0x45b44793724a5ecc6ad85fa60949d0824cfc7f61d6bd74490b13598379313142",
                   "20000"
