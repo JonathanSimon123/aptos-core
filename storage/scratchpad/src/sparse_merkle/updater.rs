@@ -1,10 +1,11 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     sparse_merkle::{
         node::{InternalNode, Node, NodeHandle, NodeInner},
-        utils::{partition, swap_if, Either},
+        utils::{partition, swap_if},
         UpdateError,
     },
     ProofRead,
@@ -13,16 +14,18 @@ use aptos_crypto::{
     hash::{CryptoHash, SPARSE_MERKLE_PLACEHOLDER_HASH},
     HashValue,
 };
-use aptos_types::proof::{SparseMerkleLeafNode, SparseMerkleProof};
+use aptos_drop_helper::ArcAsyncDrop;
+use aptos_experimental_runtimes::thread_manager::THREAD_MANAGER;
+use aptos_types::proof::{definition::NodeInProof, SparseMerkleLeafNode, SparseMerkleProofExt};
 use std::cmp::Ordering;
 
 type Result<T> = std::result::Result<T, UpdateError>;
 
 type InMemSubTree<V> = super::node::SubTree<V>;
-type InMemInternal<V> = super::node::InternalNode<V>;
+type InMemInternal<V> = InternalNode<V>;
 
 #[derive(Clone)]
-enum InMemSubTreeInfo<V> {
+enum InMemSubTreeInfo<V: ArcAsyncDrop> {
     Internal {
         subtree: InMemSubTree<V>,
         node: InMemInternal<V>,
@@ -37,7 +40,7 @@ enum InMemSubTreeInfo<V> {
     Empty,
 }
 
-impl<V: Clone + CryptoHash> InMemSubTreeInfo<V> {
+impl<V: Clone + CryptoHash + Send + Sync + 'static> InMemSubTreeInfo<V> {
     fn create_leaf_with_update(update: (HashValue, &V), generation: u64) -> Self {
         let subtree = InMemSubTree::new_leaf_with_value(update.0, (*update.1).clone(), generation);
         Self::Leaf {
@@ -87,9 +90,9 @@ impl<V: Clone + CryptoHash> InMemSubTreeInfo<V> {
         // If there's a only leaf in the subtree,
         // rollup the leaf, otherwise create an internal node.
         match (&left, &right) {
-            (Self::Empty, Self::Leaf { .. }) => right,
+            (Self::Empty, Self::Empty) => Self::Empty,
             (Self::Leaf { .. }, Self::Empty) => left,
-            (Self::Empty, Self::Empty) => unreachable!(),
+            (Self::Empty, Self::Leaf { .. }) => right,
             _ => InMemSubTreeInfo::create_internal(left, right, generation),
         }
     }
@@ -97,18 +100,18 @@ impl<V: Clone + CryptoHash> InMemSubTreeInfo<V> {
 
 #[derive(Clone)]
 enum PersistedSubTreeInfo<'a> {
-    ProofPathInternal { proof: &'a SparseMerkleProof },
+    ProofPathInternal { proof: &'a SparseMerkleProofExt },
     ProofSibling { hash: HashValue },
     Leaf { leaf: SparseMerkleLeafNode },
 }
 
 #[derive(Clone)]
-enum SubTreeInfo<'a, V> {
+enum SubTreeInfo<'a, V: ArcAsyncDrop> {
     InMem(InMemSubTreeInfo<V>),
     Persisted(PersistedSubTreeInfo<'a>),
 }
 
-impl<'a, V: Clone + CryptoHash> SubTreeInfo<'a, V> {
+impl<'a, V: Clone + CryptoHash + Send + Sync + 'static> SubTreeInfo<'a, V> {
     fn new_empty() -> Self {
         Self::InMem(InMemSubTreeInfo::Empty)
     }
@@ -117,16 +120,21 @@ impl<'a, V: Clone + CryptoHash> SubTreeInfo<'a, V> {
         Self::Persisted(PersistedSubTreeInfo::Leaf { leaf })
     }
 
-    fn new_proof_sibling(hash: HashValue) -> Self {
-        if hash == *SPARSE_MERKLE_PLACEHOLDER_HASH {
-            Self::InMem(InMemSubTreeInfo::Empty)
-        } else {
-            Self::Persisted(PersistedSubTreeInfo::ProofSibling { hash })
+    fn new_proof_sibling(node_in_proof: &NodeInProof) -> Self {
+        match node_in_proof {
+            NodeInProof::Leaf(leaf) => Self::new_proof_leaf(*leaf),
+            NodeInProof::Other(hash) => {
+                if *hash == *SPARSE_MERKLE_PLACEHOLDER_HASH {
+                    Self::InMem(InMemSubTreeInfo::Empty)
+                } else {
+                    Self::Persisted(PersistedSubTreeInfo::ProofSibling { hash: *hash })
+                }
+            },
         }
     }
 
-    fn new_on_proof_path(proof: &'a SparseMerkleProof, depth: usize) -> Self {
-        match proof.siblings().len().cmp(&depth) {
+    fn new_on_proof_path(proof: &'a SparseMerkleProofExt, depth: usize) -> Self {
+        match proof.bottom_depth().cmp(&depth) {
             Ordering::Greater => Self::Persisted(PersistedSubTreeInfo::ProofPathInternal { proof }),
             Ordering::Equal => match proof.leaf() {
                 Some(leaf) => Self::new_proof_leaf(leaf),
@@ -144,10 +152,10 @@ impl<'a, V: Clone + CryptoHash> SubTreeInfo<'a, V> {
         let proof = proof_reader
             .get_proof(a_descendant_key)
             .ok_or(UpdateError::MissingProof)?;
-        if depth > proof.siblings().len() {
+        if depth > proof.bottom_depth() {
             return Err(UpdateError::ShortProof {
                 key: a_descendant_key,
-                num_siblings: proof.siblings().len(),
+                num_siblings: proof.bottom_depth(),
                 depth,
             });
         }
@@ -164,7 +172,7 @@ impl<'a, V: Clone + CryptoHash> SubTreeInfo<'a, V> {
                             node: internal_node.clone(),
                             subtree: subtree.weak(),
                         })
-                    }
+                    },
                     NodeInner::Leaf(leaf_node) => {
                         // Create a new leaf node with the data pointing to previous version via
                         // weak ref (if exists). This is only necessary when this leaf node is "split"
@@ -185,7 +193,7 @@ impl<'a, V: Clone + CryptoHash> SubTreeInfo<'a, V> {
                             key: leaf_node.key,
                             subtree,
                         })
-                    }
+                    },
                 },
                 None => SubTreeInfo::InMem(InMemSubTreeInfo::Unknown {
                     subtree: subtree.weak(),
@@ -221,7 +229,7 @@ impl<'a, V: Clone + CryptoHash> SubTreeInfo<'a, V> {
                 InMemSubTreeInfo::Leaf { key, .. } => {
                     let key = *key;
                     swap_if(myself, SubTreeInfo::new_empty(), key.bit(depth))
-                }
+                },
                 InMemSubTreeInfo::Internal { node, .. } => (
                     // n.b. When we recurse into either side, the updates can be empty, where the
                     // specific type of the in-mem node is irrelevant, so the parsing of it can be
@@ -235,15 +243,13 @@ impl<'a, V: Clone + CryptoHash> SubTreeInfo<'a, V> {
                 PersistedSubTreeInfo::Leaf { leaf } => {
                     let key = leaf.key();
                     swap_if(myself, SubTreeInfo::new_empty(), key.bit(depth))
-                }
+                },
                 PersistedSubTreeInfo::ProofPathInternal { proof } => {
-                    let siblings = proof.siblings();
-                    assert!(siblings.len() > depth);
                     let sibling_child =
-                        SubTreeInfo::new_proof_sibling(siblings[siblings.len() - depth - 1]);
+                        SubTreeInfo::new_proof_sibling(proof.sibling_at_depth(depth + 1).unwrap());
                     let on_path_child = SubTreeInfo::new_on_proof_path(proof, depth + 1);
                     swap_if(on_path_child, sibling_child, a_descendent_key.bit(depth))
-                }
+                },
                 PersistedSubTreeInfo::ProofSibling { .. } => unreachable!(),
             },
         })
@@ -255,29 +261,29 @@ impl<'a, V: Clone + CryptoHash> SubTreeInfo<'a, V> {
             Self::Persisted(info) => match info {
                 PersistedSubTreeInfo::Leaf { leaf } => {
                     InMemSubTreeInfo::create_leaf_with_proof(&leaf, generation)
-                }
+                },
                 PersistedSubTreeInfo::ProofSibling { hash } => {
                     InMemSubTreeInfo::create_unknown(hash)
-                }
+                },
                 PersistedSubTreeInfo::ProofPathInternal { .. } => {
                     unreachable!()
-                }
+                },
             },
         }
     }
 }
 
-pub struct SubTreeUpdater<'a, V> {
+pub struct SubTreeUpdater<'a, V: ArcAsyncDrop> {
     depth: usize,
     info: SubTreeInfo<'a, V>,
-    updates: &'a [(HashValue, &'a V)],
+    updates: &'a [(HashValue, Option<&'a V>)],
     generation: u64,
 }
 
-impl<'a, V: Send + Sync + Clone + CryptoHash> SubTreeUpdater<'a, V> {
+impl<'a, V: ArcAsyncDrop + Clone + CryptoHash> SubTreeUpdater<'a, V> {
     pub(crate) fn update(
         root: InMemSubTree<V>,
-        updates: &'a [(HashValue, &'a V)],
+        updates: &'a [(HashValue, Option<&'a V>)],
         proof_reader: &'a impl ProofRead,
         generation: u64,
     ) -> Result<InMemSubTree<V>> {
@@ -298,48 +304,83 @@ impl<'a, V: Send + Sync + Clone + CryptoHash> SubTreeUpdater<'a, V> {
 
         let generation = self.generation;
         let depth = self.depth;
-        match self.maybe_end_recursion() {
-            Either::A(ended) => Ok(ended),
-            Either::B(myself) => {
+        match self.maybe_end_recursion()? {
+            MaybeEndRecursion::End(ended) => Ok(ended),
+            MaybeEndRecursion::Continue(myself) => {
                 let (left, right) = myself.into_children(proof_reader)?;
                 let (left_ret, right_ret) = if depth <= MAX_PARALLELIZABLE_DEPTH
                     && left.updates.len() >= MIN_PARALLELIZABLE_SIZE
                     && right.updates.len() >= MIN_PARALLELIZABLE_SIZE
                 {
-                    rayon::join(|| left.run(proof_reader), || right.run(proof_reader))
+                    THREAD_MANAGER
+                        .get_exe_cpu_pool()
+                        .join(|| left.run(proof_reader), || right.run(proof_reader))
                 } else {
                     (left.run(proof_reader), right.run(proof_reader))
                 };
 
                 Ok(InMemSubTreeInfo::combine(left_ret?, right_ret?, generation))
-            }
+            },
         }
     }
 
-    fn maybe_end_recursion(self) -> Either<InMemSubTreeInfo<V>, Self> {
-        match self.updates.len() {
-            0 => Either::A(self.info.materialize(self.generation)),
-            1 => match &self.info {
-                SubTreeInfo::InMem(in_mem_info) => match in_mem_info {
-                    InMemSubTreeInfo::Empty => Either::A(
-                        InMemSubTreeInfo::create_leaf_with_update(self.updates[0], self.generation),
-                    ),
-                    InMemSubTreeInfo::Leaf { key, .. } => Either::or(
-                        *key == self.updates[0].0,
-                        InMemSubTreeInfo::create_leaf_with_update(self.updates[0], self.generation),
-                        self,
-                    ),
-                    _ => Either::B(self),
-                },
-                SubTreeInfo::Persisted(PersistedSubTreeInfo::Leaf { leaf }) => Either::or(
-                    leaf.key() == self.updates[0].0,
-                    InMemSubTreeInfo::create_leaf_with_update(self.updates[0], self.generation),
-                    self,
-                ),
-                _ => Either::B(self),
+    fn maybe_end_recursion(self) -> Result<MaybeEndRecursion<InMemSubTreeInfo<V>, Self>> {
+        Ok(match self.updates.len() {
+            0 => MaybeEndRecursion::End(self.info.materialize(self.generation)),
+            1 => {
+                let (key_to_update, update) = &self.updates[0];
+                match &self.info {
+                    SubTreeInfo::InMem(in_mem_info) => match in_mem_info {
+                        InMemSubTreeInfo::Empty => match update {
+                            Some(value) => {
+                                MaybeEndRecursion::End(InMemSubTreeInfo::create_leaf_with_update(
+                                    (*key_to_update, value),
+                                    self.generation,
+                                ))
+                            },
+                            None => MaybeEndRecursion::End(self.info.materialize(self.generation)),
+                        },
+                        InMemSubTreeInfo::Leaf { key, .. } => match update {
+                            Some(value) => MaybeEndRecursion::or(
+                                key == key_to_update,
+                                InMemSubTreeInfo::create_leaf_with_update(
+                                    (*key_to_update, value),
+                                    self.generation,
+                                ),
+                                self,
+                            ),
+                            None => {
+                                if key == key_to_update {
+                                    MaybeEndRecursion::End(InMemSubTreeInfo::Empty)
+                                } else {
+                                    MaybeEndRecursion::End(self.info.materialize(self.generation))
+                                }
+                            },
+                        },
+                        _ => MaybeEndRecursion::Continue(self),
+                    },
+                    SubTreeInfo::Persisted(PersistedSubTreeInfo::Leaf { leaf }) => match update {
+                        Some(value) => MaybeEndRecursion::or(
+                            leaf.key() == *key_to_update,
+                            InMemSubTreeInfo::create_leaf_with_update(
+                                (*key_to_update, value),
+                                self.generation,
+                            ),
+                            self,
+                        ),
+                        None => {
+                            if leaf.key() == *key_to_update {
+                                MaybeEndRecursion::End(InMemSubTreeInfo::Empty)
+                            } else {
+                                MaybeEndRecursion::End(self.info.materialize(self.generation))
+                            }
+                        },
+                    },
+                    _ => MaybeEndRecursion::Continue(self),
+                }
             },
-            _ => Either::B(self),
-        }
+            _ => MaybeEndRecursion::Continue(self),
+        })
     }
 
     fn into_children(self, proof_reader: &'a impl ProofRead) -> Result<(Self, Self)> {
@@ -364,5 +405,20 @@ impl<'a, V: Send + Sync + Clone + CryptoHash> SubTreeUpdater<'a, V> {
                 generation,
             },
         ))
+    }
+}
+
+pub(crate) enum MaybeEndRecursion<A, B> {
+    End(A),
+    Continue(B),
+}
+
+impl<A, B> MaybeEndRecursion<A, B> {
+    pub fn or(cond: bool, a: A, b: B) -> Self {
+        if cond {
+            MaybeEndRecursion::End(a)
+        } else {
+            MaybeEndRecursion::Continue(b)
+        }
     }
 }

@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -7,18 +8,23 @@ use crate::{
     },
     util::mock_time_service::SimulatedTimeService,
 };
-
+use aptos_consensus_types::{
+    common::Round,
+    quorum_cert::QuorumCert,
+    round_timeout::RoundTimeoutReason,
+    sync_info::SyncInfo,
+    timeout_2chain::{TwoChainTimeout, TwoChainTimeoutCertificate},
+    vote_data::VoteData,
+};
 use aptos_crypto::HashValue;
 use aptos_types::{
+    aggregate_signature::AggregateSignature,
     block_info::BlockInfo,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-};
-use consensus_types::{
-    common::Round, quorum_cert::QuorumCert, sync_info::SyncInfo, timeout::Timeout,
-    timeout_certificate::TimeoutCertificate, vote_data::VoteData,
+    validator_verifier::random_validator_verifier,
 };
 use futures::StreamExt;
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 #[test]
 fn test_round_time_interval() {
@@ -36,10 +42,11 @@ fn test_round_time_interval() {
 #[tokio::test]
 /// Verify that RoundState properly outputs local timeout events upon timeout
 async fn test_basic_timeout() {
+    let (_, verifier) = random_validator_verifier(1, None, false);
     let (mut pm, mut timeout_rx) = make_round_state();
 
     // jump start the round_state
-    pm.process_certificates(generate_sync_info(Some(0), None, None));
+    pm.process_certificates(generate_sync_info(Some(0), None, None), &verifier);
     for _ in 0..2 {
         let round = timeout_rx.next().await.unwrap();
         // Here we just test timeout send retry,
@@ -51,37 +58,38 @@ async fn test_basic_timeout() {
 
 #[test]
 fn test_round_event_generation() {
+    let (_, verifier) = random_validator_verifier(1, None, false);
     let (mut pm, _) = make_round_state();
     // Happy path with new QC
     expect_qc(
         2,
-        pm.process_certificates(generate_sync_info(Some(1), None, None)),
+        pm.process_certificates(generate_sync_info(Some(1), None, None), &verifier),
     );
     // Old QC does not generate anything
     assert!(pm
-        .process_certificates(generate_sync_info(Some(1), None, None))
+        .process_certificates(generate_sync_info(Some(1), None, None), &verifier)
         .is_none());
     // A TC for a higher round
     expect_timeout(
         3,
-        pm.process_certificates(generate_sync_info(None, Some(2), None)),
+        pm.process_certificates(generate_sync_info(None, Some(2), None), &verifier),
     );
     // In case both QC and TC are present choose the one with the higher value
     expect_timeout(
         4,
-        pm.process_certificates(generate_sync_info(Some(2), Some(3), None)),
+        pm.process_certificates(generate_sync_info(Some(2), Some(3), None), &verifier),
     );
     // In case both QC and TC are present with the same value, choose QC
     expect_qc(
         5,
-        pm.process_certificates(generate_sync_info(Some(4), Some(4), None)),
+        pm.process_certificates(generate_sync_info(Some(4), Some(4), None), &verifier),
     );
 }
 
-fn make_round_state() -> (RoundState, channel::Receiver<Round>) {
+fn make_round_state() -> (RoundState, aptos_channels::Receiver<Round>) {
     let time_interval = Box::new(ExponentialTimeInterval::fixed(Duration::from_millis(2)));
     let simulated_time = SimulatedTimeService::auto_advance_until(Duration::from_millis(4));
-    let (timeout_tx, timeout_rx) = channel::new_test(1_024);
+    let (timeout_tx, timeout_rx) = aptos_channels::new_test(1_024);
     (
         RoundState::new(time_interval, Arc::new(simulated_time), timeout_tx),
         timeout_rx,
@@ -97,7 +105,10 @@ fn expect_qc(round: Round, event: Option<NewRoundEvent>) {
 fn expect_timeout(round: Round, event: Option<NewRoundEvent>) {
     let event = event.unwrap();
     assert_eq!(round, event.round);
-    assert_eq!(event.reason, NewRoundReason::Timeout);
+    assert_eq!(
+        event.reason,
+        NewRoundReason::Timeout(RoundTimeoutReason::Unknown)
+    );
 }
 
 fn generate_sync_info(
@@ -119,7 +130,7 @@ fn generate_sync_info(
     );
     let ledger_info = LedgerInfoWithSignatures::new(
         LedgerInfo::new(commit_block, HashValue::zero()),
-        BTreeMap::new(),
+        AggregateSignature::empty(),
     );
     let quorum_cert = QuorumCert::new(
         VoteData::new(
@@ -136,7 +147,11 @@ fn generate_sync_info(
         ),
         ledger_info,
     );
-    let commit_cert = quorum_cert.clone();
-    let timeout_cert = TimeoutCertificate::new(Timeout::new(1, timeout_round));
-    SyncInfo::new(quorum_cert, commit_cert, Some(timeout_cert), None)
+    let commit_cert = quorum_cert.into_wrapped_ledger_info();
+    let tc = TwoChainTimeoutCertificate::new(TwoChainTimeout::new(
+        1,
+        timeout_round,
+        quorum_cert.clone(),
+    ));
+    SyncInfo::new(quorum_cert, commit_cert, Some(tc))
 }

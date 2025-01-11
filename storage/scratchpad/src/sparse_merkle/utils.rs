@@ -1,7 +1,13 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use aptos_crypto::HashValue;
+
+/// Returns the shard id of the hashed key.
+pub fn get_state_shard_id(key: HashValue) -> u8 {
+    key.nibble(0)
+}
 
 /// Swap template-type values if 'cond'=true - useful to determine left/right parameters.
 pub(crate) fn swap_if<T>(first: T, second: T, cond: bool) -> (T, T) {
@@ -28,19 +34,4 @@ pub(crate) fn partition<T>(updates: &[(HashValue, T)], depth: usize) -> usize {
         }
     }
     i
-}
-
-pub(crate) enum Either<A, B> {
-    A(A),
-    B(B),
-}
-
-impl<A, B> Either<A, B> {
-    pub fn or(cond: bool, a: A, b: B) -> Self {
-        if cond {
-            Either::A(a)
-        } else {
-            Either::B(b)
-        }
-    }
 }

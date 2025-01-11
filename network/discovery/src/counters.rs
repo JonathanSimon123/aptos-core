@@ -1,9 +1,10 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use aptos_metrics::{
-    register_histogram, register_int_counter_vec, register_int_gauge_vec, DurationHistogram,
-    IntCounterVec, IntGaugeVec,
+use aptos_metrics_core::{
+    op_counters::DurationHistogram, register_histogram, register_int_counter_vec,
+    register_int_gauge_vec, IntCounterVec, IntGaugeVec,
 };
 use once_cell::sync::Lazy;
 

@@ -1,8 +1,10 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::Result;
 use anyhow::{bail, Context};
+use aptos_logger::info;
 use serde::Deserialize;
 use std::{
     env, fs,
@@ -16,6 +18,21 @@ use tempfile::NamedTempFile;
 pub struct Metadata {
     pub target_directory: PathBuf,
     pub workspace_root: PathBuf,
+}
+
+/// at _forge_ compile time, decide what kind of build we will use for `aptos-node`
+pub fn use_release() -> bool {
+    option_env!("LOCAL_SWARM_NODE_RELEASE").is_some()
+}
+
+/// at _forge_ compile time, decide to build `aptos-node` only for consensus perf tests
+pub fn build_consensus_only_node() -> bool {
+    option_env!("CONSENSUS_ONLY_PERF_TEST").is_some()
+}
+
+/// at forge _run_ time, compile `aptos-node` without indexer
+pub fn build_aptos_node_without_indexer() -> bool {
+    std::env::var("FORGE_BUILD_WITHOUT_INDEXER").is_ok()
 }
 
 pub fn metadata() -> Result<Metadata> {
@@ -99,7 +116,7 @@ fn git_rev_parse<R: AsRef<str>>(metadata: &Metadata, rev: R) -> Result<String> {
 // Determine if the worktree is dirty
 fn git_is_worktree_dirty() -> Result<bool> {
     Command::new("git")
-        .args(&["diff-index", "--name-only", "HEAD", "--"])
+        .args(["diff-index", "--name-only", "HEAD", "--"])
         .output()
         .context("Failed to determine if the worktree is dirty")
         .map(|output| !output.stdout.is_empty())
@@ -147,6 +164,21 @@ pub fn git_merge_base<R: AsRef<str>>(rev: R) -> Result<String> {
     }
 }
 
+pub fn cargo_build_common_args() -> Vec<&'static str> {
+    let mut args = if build_aptos_node_without_indexer() {
+        vec!["build", "--features=failpoints,smoke-test"]
+    } else {
+        vec!["build", "--features=failpoints,indexer,smoke-test"]
+    };
+    if build_consensus_only_node() {
+        args.push("--features=consensus-only-perf-test");
+    }
+    if use_release() {
+        args.push("--release");
+    }
+    args
+}
+
 fn cargo_build_aptos_node<D, T>(directory: D, target_directory: T) -> Result<PathBuf>
 where
     D: AsRef<Path>,
@@ -154,23 +186,32 @@ where
 {
     let target_directory = target_directory.as_ref();
     let directory = directory.as_ref();
+
+    let mut args = cargo_build_common_args();
+    // build the aptos-node package directly to avoid feature unification issues
+    args.push("--package=aptos-node");
+    info!("Compiling with cargo args: {:?}", args);
     let output = Command::new("cargo")
         .current_dir(directory)
         .env("CARGO_TARGET_DIR", target_directory)
-        .args(&["build", "--bin=aptos-node", "--features=failpoints"])
+        .args(&args)
         .output()
         .context("Failed to build aptos-node")?;
 
     if output.status.success() {
-        let bin_path =
-            target_directory.join(format!("debug/{}{}", "aptos-node", env::consts::EXE_SUFFIX));
+        let bin_path = target_directory.join(format!(
+            "{}/{}{}",
+            if use_release() { "release" } else { "debug" },
+            "aptos-node",
+            env::consts::EXE_SUFFIX
+        ));
         if !bin_path.exists() {
             bail!(
                 "Can't find binary aptos-node at expected path {:?}",
                 bin_path
             );
         }
-
+        info!("Local swarm node binary path: {:?}", bin_path);
         Ok(bin_path)
     } else {
         io::stderr().write_all(&output.stderr)?;
@@ -194,7 +235,7 @@ fn checkout_revision(metadata: &Metadata, revision: &str, to: &Path) -> Result<(
         .arg("--format=tar")
         .arg("--output")
         .arg(&archive_file)
-        .arg(&revision)
+        .arg(revision)
         .output()
         .context("Failed to run git archive")?;
     if !output.status.success() {

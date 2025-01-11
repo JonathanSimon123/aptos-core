@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module implements an in-memory Merkle Accumulator that is similar to what we use in
@@ -21,7 +22,8 @@ use crate::proof::definition::{LeafCount, MAX_ACCUMULATOR_LEAVES};
 use anyhow::{ensure, format_err, Result};
 use aptos_crypto::{
     hash::{
-        CryptoHash, CryptoHasher, ACCUMULATOR_PLACEHOLDER_HASH, SPARSE_MERKLE_PLACEHOLDER_HASH,
+        CryptoHash, CryptoHasher, EventAccumulatorHasher, TransactionAccumulatorHasher,
+        ACCUMULATOR_PLACEHOLDER_HASH,
     },
     HashValue,
 };
@@ -46,13 +48,13 @@ pub struct InMemoryAccumulator<H> {
     ///      / \     / \     / \
     ///     a   b   c   d   e   placeholder
     /// ```
-    frozen_subtree_roots: Vec<HashValue>,
+    pub frozen_subtree_roots: Vec<HashValue>,
 
     /// The total number of leaves in this accumulator.
-    num_leaves: LeafCount,
+    pub num_leaves: LeafCount,
 
     /// The root hash of this accumulator.
-    root_hash: HashValue,
+    pub root_hash: HashValue,
 
     phantom: PhantomData<H>,
 }
@@ -83,10 +85,14 @@ where
     }
 
     pub fn new_empty() -> Self {
+        Self::new_empty_with_root_hash(*ACCUMULATOR_PLACEHOLDER_HASH)
+    }
+
+    pub fn new_empty_with_root_hash(root_hash: HashValue) -> Self {
         Self {
             frozen_subtree_roots: Vec::new(),
             num_leaves: 0,
-            root_hash: *SPARSE_MERKLE_PLACEHOLDER_HASH,
+            root_hash,
             phantom: PhantomData,
         }
     }
@@ -324,3 +330,7 @@ where
         Self::new(vec![], 0).expect("Constructing empty accumulator should work.")
     }
 }
+
+pub type InMemoryTransactionAccumulator = InMemoryAccumulator<TransactionAccumulatorHasher>;
+
+pub type InMemoryEventAccumulator = InMemoryAccumulator<EventAccumulatorHasher>;

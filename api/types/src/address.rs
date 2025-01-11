@@ -1,22 +1,50 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use aptos_types::account_address::AccountAddress;
-use move_deps::move_core_types;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use std::{fmt, str::FromStr};
 
-#[derive(Clone, Debug, PartialEq, Copy)]
+/// The address of an account
+///
+/// This is represented in a string as a 64 character hex string, sometimes
+/// shortened by stripping leading 0s, and adding a 0x.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Address(AccountAddress);
 
 impl Address {
     pub fn inner(&self) -> &AccountAddress {
         &self.0
     }
+
+    /// Represent an account address in a way that is compliant with the v1 address
+    /// standard. The standard is defined as part of AIP-40, read more here:
+    /// <https://github.com/aptos-foundation/AIPs/blob/main/aips/aip-40.md>
+    ///
+    /// In short, all special addresses MUST be represented in SHORT form, e.g.
+    ///
+    /// 0x1
+    ///
+    /// All other addresses MUST be represented in LONG form, e.g.
+    ///
+    /// 0x002098630cfad4734812fa37dc18d9b8d59242feabe49259e26318d468a99584
+    ///
+    /// For an explanation of what defines a special address, see `is_special`.
+    ///
+    /// All string representations of addresses MUST be prefixed with 0x.
+    pub fn to_standard_string(&self) -> String {
+        self.0.to_standard_string()
+    }
 }
 
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // While the inner type, AccountAddress, has a Display impl already, we don't
+        // use it. As part of the AIP-40 migration, the Display impl of the inner
+        // AccountAddress was changed to conform to AIP-40, but doing that for the API
+        // would constitute a breaking change. So we keep an explicit display impl
+        // here that maintains the existing address formatting behavior.
         write!(f, "{}", self.0.to_hex_literal())
     }
 }
@@ -25,12 +53,8 @@ impl FromStr for Address {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> anyhow::Result<Self, anyhow::Error> {
-        let mut ret = AccountAddress::from_hex_literal(s);
-        if ret.is_err() {
-            ret = AccountAddress::from_hex(s)
-        }
-        Ok(Self(ret.map_err(|_| {
-            anyhow::format_err!("invalid account address {:?}", s)
+        Ok(Self(AccountAddress::from_str(s).map_err(|e| {
+            anyhow::format_err!("Invalid account address: {:#}", e)
         })?))
     }
 }
@@ -78,9 +102,7 @@ impl<'de> Deserialize<'de> for Address {
 #[cfg(test)]
 mod tests {
     use crate::address::Address;
-
     use aptos_types::account_address::AccountAddress;
-
     use serde_json::{json, Value};
 
     #[test]
@@ -90,12 +112,15 @@ mod tests {
             assert_eq!(address.parse::<Address>().unwrap().to_string(), "0x1");
         }
 
-        let invalid_addresses = vec!["invalid", "00x1", "x1", "01", "1"];
+        let invalid_addresses = vec!["invalid", "00x1", "x1"];
         for address in invalid_addresses {
-            assert_eq!(
-                format!("invalid account address {:?}", address),
-                address.parse::<Address>().unwrap_err().to_string()
-            );
+            assert!(address
+                .parse::<Address>()
+                .unwrap_err()
+                .to_string()
+                .starts_with(
+                    "Invalid account address: Hex characters are invalid: Invalid character",
+                ));
         }
     }
 
