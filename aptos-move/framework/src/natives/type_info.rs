@@ -1,53 +1,28 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
-
-use move_deps::{
-    move_binary_format::errors::PartialVMResult,
-    move_core_types::{
-        gas_schedule::GasCost,
-        language_storage::{StructTag, TypeTag},
-    },
-    move_vm_runtime::native_functions::NativeContext,
-    move_vm_types::{
-        loaded_data::runtime_types::Type,
-        natives::function::NativeResult,
-        values::{Struct, Value},
-    },
+use crate::natives::transaction_context::NativeTransactionContext;
+use aptos_gas_schedule::gas_params::natives::aptos_framework::*;
+use aptos_native_interface::{
+    RawSafeNative, SafeNativeBuilder, SafeNativeContext, SafeNativeError, SafeNativeResult,
+};
+use move_core_types::{
+    gas_algebra::NumBytes,
+    language_storage::{StructTag, TypeTag},
+};
+use move_vm_runtime::native_functions::NativeFunction;
+use move_vm_types::{
+    loaded_data::runtime_types::Type,
+    values::{Struct, Value},
 };
 use smallvec::{smallvec, SmallVec};
 use std::{collections::VecDeque, fmt::Write};
 
-/// Returns the structs Module Address, Module Name and the Structs Name
-pub fn type_of(
-    context: &mut NativeContext,
-    ty_args: Vec<Type>,
-    arguments: VecDeque<Value>,
-) -> PartialVMResult<NativeResult> {
-    debug_assert!(ty_args.len() == 1);
-    debug_assert!(arguments.is_empty());
-
-    let cost = GasCost::new(super::cost::APTOS_LIB_TYPE_OF, 1).total();
-
-    let type_tag = context.type_to_type_tag(&ty_args[0])?;
-    if let TypeTag::Struct(struct_tag) = type_tag {
-        Ok(NativeResult::ok(
-            cost,
-            type_of_internal(&struct_tag).expect("type_of should never fail."),
-        ))
-    } else {
-        Ok(NativeResult::err(
-            cost,
-            super::status::NFE_EXPECTED_STRUCT_TYPE_TAG,
-        ))
-    }
-}
-
 fn type_of_internal(struct_tag: &StructTag) -> Result<SmallVec<[Value; 1]>, std::fmt::Error> {
     let mut name = struct_tag.name.to_string();
-    if let Some(first_ty) = struct_tag.type_params.first() {
+    if let Some(first_ty) = struct_tag.type_args.first() {
         write!(name, "<")?;
         write!(name, "{}", first_ty)?;
-        for ty in struct_tag.type_params.iter().skip(1) {
+        for ty in struct_tag.type_args.iter().skip(1) {
             write!(name, ", {}", ty)?;
         }
         write!(name, ">")?;
@@ -61,13 +36,119 @@ fn type_of_internal(struct_tag: &StructTag) -> Result<SmallVec<[Value; 1]>, std:
     Ok(smallvec![Value::struct_(struct_value)])
 }
 
+/***************************************************************************************************
+ * native fun type_of
+ *
+ *   Returns the structs Module Address, Module Name and the Structs Name.
+ *
+ *   gas cost: base_cost + unit_cost * type_size
+ *
+ **************************************************************************************************/
+fn native_type_of(
+    context: &mut SafeNativeContext,
+    ty_args: Vec<Type>,
+    arguments: VecDeque<Value>,
+) -> SafeNativeResult<SmallVec<[Value; 1]>> {
+    debug_assert!(ty_args.len() == 1);
+    debug_assert!(arguments.is_empty());
+
+    context.charge(TYPE_INFO_TYPE_OF_BASE)?;
+
+    let type_tag = context.type_to_type_tag(&ty_args[0])?;
+
+    if context.eval_gas(TYPE_INFO_TYPE_OF_PER_BYTE_IN_STR) > 0.into() {
+        let type_tag_str = type_tag.to_string();
+        // Ideally, we would charge *before* the `type_to_type_tag()` and `type_tag.to_string()` calls above.
+        // But there are other limits in place that prevent this native from being called with too much work.
+        context
+            .charge(TYPE_INFO_TYPE_OF_PER_BYTE_IN_STR * NumBytes::new(type_tag_str.len() as u64))?;
+    }
+
+    if let TypeTag::Struct(struct_tag) = type_tag {
+        Ok(type_of_internal(&struct_tag).expect("type_of should never fail."))
+    } else {
+        Err(SafeNativeError::Abort {
+            abort_code: super::status::NFE_EXPECTED_STRUCT_TYPE_TAG,
+        })
+    }
+}
+
+/***************************************************************************************************
+ * native fun type_name
+ *
+ *   Returns a string representing the TypeTag of the parameter.
+ *
+ *   gas cost: base_cost + unit_cost * type_size
+ *
+ **************************************************************************************************/
+fn native_type_name(
+    context: &mut SafeNativeContext,
+    ty_args: Vec<Type>,
+    arguments: VecDeque<Value>,
+) -> SafeNativeResult<SmallVec<[Value; 1]>> {
+    debug_assert!(ty_args.len() == 1);
+    debug_assert!(arguments.is_empty());
+
+    context.charge(TYPE_INFO_TYPE_NAME_BASE)?;
+
+    let type_tag = context.type_to_type_tag(&ty_args[0])?;
+    let type_name = type_tag.to_string();
+
+    // TODO: Ideally, we would charge *before* the `type_to_type_tag()` and `type_tag.to_string()` calls above.
+    context.charge(TYPE_INFO_TYPE_NAME_PER_BYTE_IN_STR * NumBytes::new(type_name.len() as u64))?;
+
+    Ok(smallvec![Value::struct_(Struct::pack(vec![
+        Value::vector_u8(type_name.as_bytes().to_vec())
+    ]))])
+}
+
+/***************************************************************************************************
+ * native fun chain_id
+ *
+ *   Returns the chain ID
+ *
+ *   gas cost: base_cost
+ *
+ **************************************************************************************************/
+fn native_chain_id(
+    context: &mut SafeNativeContext,
+    _ty_args: Vec<Type>,
+    arguments: VecDeque<Value>,
+) -> SafeNativeResult<SmallVec<[Value; 1]>> {
+    debug_assert!(_ty_args.is_empty());
+    debug_assert!(arguments.is_empty());
+
+    context.charge(TYPE_INFO_CHAIN_ID_BASE)?;
+
+    let chain_id = context
+        .extensions()
+        .get::<NativeTransactionContext>()
+        .chain_id();
+
+    Ok(smallvec![Value::u8(chain_id)])
+}
+
+/***************************************************************************************************
+ * module
+ *
+ **************************************************************************************************/
+pub fn make_all(
+    builder: &SafeNativeBuilder,
+) -> impl Iterator<Item = (String, NativeFunction)> + '_ {
+    let natives = [
+        ("type_of", native_type_of as RawSafeNative),
+        ("type_name", native_type_name),
+        ("chain_id_internal", native_chain_id),
+    ];
+
+    builder.make_named_natives(natives)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use move_deps::{
-        move_core_types::{account_address::AccountAddress, identifier::Identifier},
-        move_vm_types::values::VMValueCast,
-    };
+    use move_core_types::{account_address::AccountAddress, identifier::Identifier};
+    use move_vm_types::values::VMValueCast;
 
     #[test]
     fn test_type_of_internal() {
@@ -75,7 +156,7 @@ mod tests {
             address: AccountAddress::random(),
             module: Identifier::new("DummyModule").unwrap(),
             name: Identifier::new("DummyStruct").unwrap(),
-            type_params: vec![TypeTag::Vector(Box::new(TypeTag::U8))],
+            type_args: vec![TypeTag::Vector(Box::new(TypeTag::U8))],
         };
 
         let dummy_as_strings = dummy_st.to_string();

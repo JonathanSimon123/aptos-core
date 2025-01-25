@@ -1,8 +1,11 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::DiscoveryError;
 use aptos_config::config::PeerSet;
+#[cfg(test)]
+use aptos_logger::spawn_named;
 use aptos_time_service::{Interval, TimeService, TimeServiceTrait};
 use futures::Stream;
 use std::{
@@ -54,15 +57,16 @@ fn load_file(path: &Path) -> Result<PeerSet, DiscoveryError> {
 mod tests {
     use super::*;
     use crate::DiscoveryChangeListener;
+    use aptos_channels::Receiver;
     use aptos_config::{
         config::{Peer, PeerRole},
         network_id::NetworkContext,
     };
+    use aptos_event_notifications::DbBackedOnChainConfig;
+    use aptos_network::connectivity_manager::{ConnectivityRequest, DiscoverySource};
     use aptos_temppath::TempPath;
     use aptos_types::{network_address::NetworkAddress, PeerId};
-    use channel::Receiver;
     use futures::StreamExt;
-    use network::connectivity_manager::{ConnectivityRequest, DiscoverySource};
     use std::{collections::HashSet, str::FromStr, sync::Arc};
     use tokio::time::sleep;
 
@@ -70,10 +74,12 @@ mod tests {
         let check_interval = Duration::from_millis(5);
         // TODO: Figure out why mock time doesn't work right
         let time_service = TimeService::real();
-        let (conn_mgr_reqs_tx, conn_mgr_reqs_rx) =
-            channel::new(1, &network::counters::PENDING_CONNECTIVITY_MANAGER_REQUESTS);
+        let (conn_mgr_reqs_tx, conn_mgr_reqs_rx) = aptos_channels::new(
+            1,
+            &aptos_network::counters::PENDING_CONNECTIVITY_MANAGER_REQUESTS,
+        );
         let listener_task = async move {
-            let listener = DiscoveryChangeListener::file(
+            let listener = DiscoveryChangeListener::<DbBackedOnChainConfig>::file(
                 NetworkContext::mock(),
                 conn_mgr_reqs_tx,
                 path.as_ref().as_ref(),
@@ -83,7 +89,7 @@ mod tests {
             Box::pin(listener).run().await
         };
 
-        tokio::task::spawn(listener_task);
+        spawn_named!("[Network] Listener Task", listener_task);
         conn_mgr_reqs_rx
     }
 
@@ -116,7 +122,7 @@ mod tests {
 
         // Try with a peer
         let mut peers = PeerSet::new();
-        let addr = NetworkAddress::from_str("/ip4/1.2.3.4/tcp/6180/ln-noise-ik/080e287879c918794170e258bfaddd75acac5b3e350419044655e4983a487120/ln-handshake/0").unwrap();
+        let addr = NetworkAddress::from_str("/ip4/1.2.3.4/tcp/6180/noise-ik/080e287879c918794170e258bfaddd75acac5b3e350419044655e4983a487120/handshake/0").unwrap();
         let key = addr.find_noise_proto().unwrap();
         let addrs = vec![addr];
         let mut keys = HashSet::new();
@@ -154,7 +160,7 @@ mod tests {
             let peers: PeerSet = PeerSet::new();
             write_peer_set(&peers, path.as_ref().as_ref());
         };
-        tokio::task::spawn(writer_task);
+        spawn_named!("[Network] Writer Task", writer_task);
 
         if let Some(ConnectivityRequest::UpdateDiscoveredPeers(
             DiscoverySource::File,

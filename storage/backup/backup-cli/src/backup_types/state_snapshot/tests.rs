@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -10,14 +11,14 @@ use crate::{
     utils::{
         backup_service_client::BackupServiceClient,
         test_utils::{start_local_backup_service, tmp_db_with_random_content},
-        ConcurrentDownloadsOpt, GlobalBackupOpt, GlobalRestoreOpt, RocksdbOpt, TrustedWaypointOpt,
+        ConcurrentDownloadsOpt, GlobalBackupOpt, GlobalRestoreOpt, ReplayConcurrencyLevelOpt,
+        RocksdbOpt, TrustedWaypointOpt,
     },
 };
+use aptos_db::{state_restore::StateSnapshotRestoreMode, AptosDB};
+use aptos_storage_interface::DbReader;
 use aptos_temppath::TempPath;
-use aptos_types::transaction::PRE_GENESIS_VERSION;
-use aptosdb::AptosDB;
 use std::{convert::TryInto, sync::Arc};
-use storage_interface::DbReader;
 use tokio::time::Duration;
 
 #[test]
@@ -29,22 +30,41 @@ fn end_to_end() {
     backup_dir.create_as_dir().unwrap();
     let store: Arc<dyn BackupStorage> = Arc::new(LocalFs::new(backup_dir.path().to_path_buf()));
 
-    let latest_tree_state = src_db.get_latest_tree_state().unwrap();
-    let version = latest_tree_state.num_transactions - 1;
-    let state_root_hash = latest_tree_state.state_checkpoint_hash;
+    let epoch = src_db
+        .get_latest_ledger_info()
+        .unwrap()
+        .ledger_info()
+        .next_block_epoch()
+        - 1;
+    let latest_epoch_ending_li = src_db
+        .get_epoch_ending_ledger_infos(epoch, epoch + 1)
+        .unwrap()
+        .ledger_info_with_sigs
+        .pop()
+        .unwrap();
+    let version = latest_epoch_ending_li.ledger_info().version();
+    let state_root_hash = src_db
+        .get_transactions(version, 1, version, false)
+        .unwrap()
+        .proof
+        .transaction_infos
+        .pop()
+        .unwrap()
+        .state_checkpoint_hash()
+        .unwrap();
 
     let (rt, port) = start_local_backup_service(src_db);
     let client = Arc::new(BackupServiceClient::new(format!(
         "http://localhost:{}",
         port
     )));
-
     let manifest_handle = rt
         .block_on(
             StateSnapshotBackupController::new(
-                StateSnapshotBackupOpt { version },
+                StateSnapshotBackupOpt { epoch },
                 GlobalBackupOpt {
                     max_chunk_size: 500,
+                    concurrent_data_requests: 2,
                 },
                 client,
                 Arc::clone(&store),
@@ -57,7 +77,9 @@ fn end_to_end() {
         StateSnapshotRestoreController::new(
             StateSnapshotRestoreOpt {
                 manifest_handle,
-                version: PRE_GENESIS_VERSION,
+                version,
+                validate_modules: false,
+                restore_mode: StateSnapshotRestoreMode::Default,
             },
             GlobalRestoreOpt {
                 dry_run: false,
@@ -65,7 +87,9 @@ fn end_to_end() {
                 target_version: None, // max
                 trusted_waypoints: TrustedWaypointOpt::default(),
                 rocksdb_opt: RocksdbOpt::default(),
-                concurernt_downloads: ConcurrentDownloadsOpt::default(),
+                concurrent_downloads: ConcurrentDownloadsOpt::default(),
+                replay_concurrency_level: ReplayConcurrencyLevelOpt::default(),
+                enable_state_indices: false,
             }
             .try_into()
             .unwrap(),
@@ -76,13 +100,13 @@ fn end_to_end() {
     )
     .unwrap();
 
-    let tgt_db = AptosDB::new_for_test(&tgt_db_dir);
+    let tgt_db = AptosDB::new_readonly_for_test(&tgt_db_dir);
     assert_eq!(
         tgt_db
-            .get_latest_tree_state()
+            .get_state_snapshot_before(version + 1) // We cannot use get_latest_snapshot() because it searches backward from the latest txn_info version
             .unwrap()
-            .state_checkpoint_hash,
-        state_root_hash,
+            .unwrap(),
+        (version, state_root_hash)
     );
 
     rt.shutdown_timeout(Duration::from_secs(1));

@@ -1,135 +1,175 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+mod rest_interface;
 mod storage_interface;
 
-pub use crate::storage_interface::DBDebuggerInterface;
-
-use anyhow::{anyhow, Result};
-use aptos_state_view::StateView;
+pub use crate::{rest_interface::RestDebuggerInterface, storage_interface::DBDebuggerInterface};
+use anyhow::Result;
+use aptos_framework::natives::code::PackageMetadata;
 use aptos_types::{
     account_address::AccountAddress,
-    account_config,
-    account_state::AccountState,
-    account_view::AccountView,
-    contract_event::EventWithProof,
-    event::EventKey,
-    on_chain_config::ValidatorSet,
-    state_store::{state_key::StateKey, state_value::StateValue},
-    transaction::{Transaction, Version},
+    state_store::{
+        state_key::StateKey, state_storage_usage::StateStorageUsage, state_value::StateValue,
+        StateViewId, StateViewResult, TStateView,
+    },
+    transaction::{Transaction, TransactionInfo, Version},
 };
-use move_deps::move_binary_format::file_format::CompiledModule;
+use lru::LruCache;
+use move_core_types::language_storage::ModuleId;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+#[derive(Clone, Copy)]
+pub struct FilterCondition {
+    pub skip_failed_txns: bool,
+    pub skip_publish_txns: bool,
+    pub check_source_code: bool,
+    pub target_account: Option<AccountAddress>,
+}
 
 // TODO(skedia) Clean up this interfact to remove account specific logic and move to state store
 // key-value interface with fine grained storage project
+#[async_trait::async_trait]
 pub trait AptosValidatorInterface: Sync {
-    fn get_account_state_by_version(
-        &self,
-        account: AccountAddress,
-        version: Version,
-    ) -> Result<Option<AccountState>>;
-
-    fn get_state_value_by_version(
+    async fn get_state_value_by_version(
         &self,
         state_key: &StateKey,
         version: Version,
     ) -> Result<Option<StateValue>>;
 
-    fn get_events(&self, key: &EventKey, start_seq: u64, limit: u64)
-        -> Result<Vec<EventWithProof>>;
+    async fn get_committed_transactions(
+        &self,
+        start: Version,
+        limit: u64,
+    ) -> Result<(Vec<Transaction>, Vec<TransactionInfo>)>;
 
-    fn get_committed_transactions(&self, start: Version, limit: u64) -> Result<Vec<Transaction>>;
+    async fn get_and_filter_committed_transactions(
+        &self,
+        start: Version,
+        limit: u64,
+        filter_condition: FilterCondition,
+        package_cache: &mut HashMap<
+            ModuleId,
+            (
+                AccountAddress,
+                String,
+                HashMap<(AccountAddress, String), PackageMetadata>,
+            ),
+        >,
+    ) -> Result<
+        Vec<(
+            u64,
+            Transaction,
+            Option<(
+                AccountAddress,
+                String,
+                HashMap<(AccountAddress, String), PackageMetadata>,
+            )>,
+        )>,
+    >;
 
-    fn get_latest_version(&self) -> Result<Version>;
+    async fn get_latest_ledger_info_version(&self) -> Result<Version>;
 
-    fn get_version_by_account_sequence(
+    async fn get_version_by_account_sequence(
         &self,
         account: AccountAddress,
         seq: u64,
     ) -> Result<Option<Version>>;
+}
 
-    fn get_framework_modules_by_version(&self, version: Version) -> Result<Vec<CompiledModule>> {
-        let mut acc = vec![];
-        for module_bytes in self
-            .get_account_state_by_version(account_config::CORE_CODE_ADDRESS, version)?
-            .ok_or_else(|| anyhow!("Failure reading aptos root address state"))?
-            .get_modules()
-        {
-            acc.push(
-                CompiledModule::deserialize(module_bytes)
-                    .map_err(|e| anyhow!("Failure deserializing module: {:?}", e))?,
-            )
+pub struct DebuggerStateView {
+    query_sender: Mutex<
+        UnboundedSender<(
+            StateKey,
+            Version,
+            std::sync::mpsc::Sender<Result<Option<StateValue>>>,
+        )>,
+    >,
+    version: Version,
+}
+
+async fn handler_thread<'a>(
+    db: Arc<dyn AptosValidatorInterface + Send>,
+    mut thread_receiver: UnboundedReceiver<(
+        StateKey,
+        Version,
+        std::sync::mpsc::Sender<Result<Option<StateValue>>>,
+    )>,
+) {
+    const M: usize = 1024 * 1024;
+    let cache = Arc::new(Mutex::new(LruCache::<
+        (StateKey, Version),
+        Option<StateValue>,
+    >::new(M)));
+    loop {
+        let (key, version, sender) =
+            if let Some((key, version, sender)) = thread_receiver.recv().await {
+                (key, version, sender)
+            } else {
+                break;
+            };
+        if let Some(val) = cache.lock().unwrap().get(&(key.clone(), version)) {
+            sender.send(Ok(val.clone())).unwrap();
+        } else {
+            assert!(version > 0, "Expecting a non-genesis version");
+            let db = db.clone();
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                let res = db.get_state_value_by_version(&key, version - 1).await;
+                match res {
+                    Ok(val) => {
+                        cache.lock().unwrap().put((key, version), val.clone());
+                        sender.send(Ok(val))
+                    },
+                    Err(err) => sender.send(Err(err)),
+                }
+            });
         }
-        Ok(acc)
-    }
-
-    /// Get the account states of the most critical accounts, including:
-    /// 1. Aptos Framework code address
-    /// 2. Aptos Root address
-    /// 3. All validator addresses
-    fn get_admin_accounts(&self, version: Version) -> Result<Vec<(AccountAddress, AccountState)>> {
-        let mut result = vec![];
-        let aptos_root = self
-            .get_account_state_by_version(account_config::aptos_root_address(), version)?
-            .ok_or_else(|| anyhow!("aptos_root_address doesn't exist"))?;
-
-        // Get all validator accounts
-        let validators = aptos_root
-            .get_config::<ValidatorSet>()?
-            .ok_or_else(|| anyhow!("validator_config doesn't exist"))?;
-
-        // Get code account, aptos_root
-        result.push((
-            account_config::CORE_CODE_ADDRESS,
-            self.get_account_state_by_version(account_config::CORE_CODE_ADDRESS, version)?
-                .ok_or_else(|| anyhow!("core_code_address doesn't exist"))?,
-        ));
-        result.push((account_config::aptos_root_address(), aptos_root));
-
-        // Get all validator accounts
-        for validator_info in validators.payload() {
-            let addr = *validator_info.account_address();
-            result.push((
-                addr,
-                self.get_account_state_by_version(addr, version)?
-                    .ok_or_else(|| anyhow!("validator {:?} doesn't exist", addr))?,
-            ));
-        }
-        Ok(result)
     }
 }
 
-pub struct DebuggerStateView<'a> {
-    db: &'a dyn AptosValidatorInterface,
-    version: Option<Version>,
-}
-
-impl<'a> DebuggerStateView<'a> {
-    pub fn new(db: &'a dyn AptosValidatorInterface, version: Option<Version>) -> Self {
-        Self { db, version }
+impl DebuggerStateView {
+    pub fn new(db: Arc<dyn AptosValidatorInterface + Send>, version: Version) -> Self {
+        let (query_sender, thread_receiver) = unbounded_channel();
+        tokio::spawn(async move { handler_thread(db, thread_receiver).await });
+        Self {
+            query_sender: Mutex::new(query_sender),
+            version,
+        }
     }
 
     fn get_state_value_internal(
         &self,
         state_key: &StateKey,
         version: Version,
-    ) -> Result<Option<Vec<u8>>> {
-        match self.db.get_state_value_by_version(state_key, version)? {
-            None => Ok(None),
-            Some(state_value) => Ok(state_value.maybe_bytes),
-        }
+    ) -> Result<Option<StateValue>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let query_handler_locked = self.query_sender.lock().unwrap();
+        query_handler_locked
+            .send((state_key.clone(), version, tx))
+            .unwrap();
+        rx.recv()?
     }
 }
 
-impl<'a> StateView for DebuggerStateView<'a> {
-    fn get_state_value(&self, state_key: &StateKey) -> Result<Option<Vec<u8>>> {
-        match self.version {
-            None => Ok(None),
-            Some(version) => self.get_state_value_internal(state_key, version),
-        }
+impl TStateView for DebuggerStateView {
+    type Key = StateKey;
+
+    fn id(&self) -> StateViewId {
+        StateViewId::Replay
     }
 
-    fn is_genesis(&self) -> bool {
-        false
+    fn get_state_value(&self, state_key: &StateKey) -> StateViewResult<Option<StateValue>> {
+        self.get_state_value_internal(state_key, self.version)
+            .map_err(Into::into)
+    }
+
+    fn get_usage(&self) -> StateViewResult<StateStorageUsage> {
+        unimplemented!()
     }
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
 //! Test file for the procedural macros CryptoHasher and BCSCryptoHash.
@@ -28,6 +28,13 @@ pub struct Bar {}
 pub struct Baz<T> {
     a: T,
     b: u32,
+}
+
+#[derive(Serialize, Deserialize, CryptoHasher, BCSCryptoHash)]
+pub struct Duplo<A, B> {
+    a: A,
+    b: B,
+    c: u32,
 }
 
 impl CryptoHash for Bar {
@@ -105,4 +112,17 @@ fn test_cryptohasher_salt_access() {
         &prefixed_sha3(b"Foo")
     );
     assert_eq!(<Bar as CryptoHash>::Hasher::seed(), &prefixed_sha3(b"Foo"));
+
+    assert_eq!(
+        <Duplo<(), ()> as CryptoHash>::Hasher::seed(),
+        &prefixed_sha3(b"Duplo")
+    );
+
+    // WARNING: There is no domain separation between `Foo<A>` and `Foo<B>`. This might be on purpose,
+    // so as to avoid changing the hash when the type of A or B needs to be changed in the code, but
+    // it means we should exercise extreme caution when using the CryptoHasher derive.
+    assert_eq!(
+        <Duplo<usize, u8> as CryptoHash>::Hasher::seed(),
+        &prefixed_sha3(b"Duplo")
+    );
 }

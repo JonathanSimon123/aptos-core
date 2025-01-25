@@ -1,19 +1,28 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     account_address::AccountAddress,
+    block_executor::config::BlockExecutorConfigFromOnchain,
     chain_id::ChainId,
     transaction::{
-        authenticator::AccountAuthenticator, Module, RawTransaction, RawTransactionWithData,
-        Script, SignatureCheckedTransaction, SignedTransaction, Transaction, TransactionPayload,
+        authenticator::AccountAuthenticator,
+        signature_verified_transaction::{
+            into_signature_verified_block, SignatureVerifiedTransaction,
+        },
+        RawTransaction, RawTransactionWithData, Script, SignedTransaction, Transaction,
+        TransactionPayload,
     },
-    write_set::WriteSet,
 };
 use aptos_crypto::{ed25519::*, traits::*};
 
 const MAX_GAS_AMOUNT: u64 = 1_000_000;
-const TEST_GAS_PRICE: u64 = 0;
+const TEST_GAS_PRICE: u64 = 100;
+
+// The block executor onchain config (gas limit parameters) for executor tests
+pub const TEST_BLOCK_EXECUTOR_ONCHAIN_CONFIG: BlockExecutorConfigFromOnchain =
+    BlockExecutorConfigFromOnchain::on_but_large_for_test();
 
 static EMPTY_SCRIPT: &[u8] = include_bytes!("empty_script.mv");
 
@@ -24,30 +33,6 @@ fn expiration_time(seconds: u64) -> u64 {
         .expect("System time is before the UNIX_EPOCH")
         .as_secs()
         + seconds
-}
-
-// Test helper for transaction creation
-pub fn get_test_signed_module_publishing_transaction(
-    sender: AccountAddress,
-    sequence_number: u64,
-    private_key: &Ed25519PrivateKey,
-    public_key: Ed25519PublicKey,
-    module: Module,
-) -> SignedTransaction {
-    let expiration_time = expiration_time(10);
-    let raw_txn = RawTransaction::new_module(
-        sender,
-        sequence_number,
-        module,
-        MAX_GAS_AMOUNT,
-        TEST_GAS_PRICE,
-        expiration_time,
-        ChainId::test(),
-    );
-
-    let signature = private_key.sign(&raw_txn);
-
-    SignedTransaction::new(raw_txn, public_key, signature)
 }
 
 // Test helper for transaction creation
@@ -73,7 +58,7 @@ pub fn get_test_signed_transaction(
         ChainId::test(),
     );
 
-    let signature = private_key.sign(&raw_txn);
+    let signature = private_key.sign(&raw_txn).unwrap();
 
     SignedTransaction::new(raw_txn, public_key, signature)
 }
@@ -124,7 +109,7 @@ fn get_test_unchecked_transaction_(
         chain_id,
     );
 
-    let signature = private_key.sign(&raw_txn);
+    let signature = private_key.sign(&raw_txn).unwrap();
 
     SignedTransaction::new(raw_txn, public_key, signature)
 }
@@ -196,12 +181,12 @@ pub fn get_test_unchecked_multi_agent_txn(
     let message =
         RawTransactionWithData::new_multi_agent(raw_txn.clone(), secondary_signers.clone());
 
-    let sender_signature = sender_private_key.sign(&message);
+    let sender_signature = sender_private_key.sign(&message).unwrap();
     let sender_authenticator = AccountAuthenticator::ed25519(sender_public_key, sender_signature);
 
     let mut secondary_authenticators = vec![];
     for i in 0..secondary_public_keys.len() {
-        let signature = secondary_private_keys[i].sign(&message);
+        let signature = secondary_private_keys[i].sign(&message).unwrap();
         secondary_authenticators.push(AccountAuthenticator::ed25519(
             secondary_public_keys[i].clone(),
             signature,
@@ -234,25 +219,32 @@ pub fn get_test_txn_with_chain_id(
         chain_id,
     );
 
-    let signature = private_key.sign(&raw_txn);
+    let signature = private_key.sign(&raw_txn).unwrap();
 
     SignedTransaction::new(raw_txn, public_key, signature)
 }
 
-pub fn get_write_set_txn(
-    sender: AccountAddress,
-    sequence_number: u64,
-    private_key: &Ed25519PrivateKey,
-    public_key: Ed25519PublicKey,
-    write_set: Option<WriteSet>,
-) -> SignatureCheckedTransaction {
-    let write_set = write_set.unwrap_or_default();
-    RawTransaction::new_write_set(sender, sequence_number, write_set, ChainId::test())
-        .sign(private_key, public_key)
-        .unwrap()
+pub fn block(user_txns: Vec<Transaction>) -> Vec<SignatureVerifiedTransaction> {
+    into_signature_verified_block(user_txns)
 }
 
-pub fn block(mut user_txns: Vec<Transaction>) -> Vec<Transaction> {
-    user_txns.push(Transaction::StateCheckpoint);
-    user_txns
+pub fn get_test_raw_transaction(
+    sender: AccountAddress,
+    sequence_number: u64,
+    payload: Option<TransactionPayload>,
+    expiration_timestamp_secs: Option<u64>,
+    gas_unit_price: Option<u64>,
+    max_gas_amount: Option<u64>,
+) -> RawTransaction {
+    RawTransaction::new(
+        sender,
+        sequence_number,
+        payload.unwrap_or_else(|| {
+            TransactionPayload::Script(Script::new(EMPTY_SCRIPT.to_vec(), vec![], vec![]))
+        }),
+        max_gas_amount.unwrap_or(MAX_GAS_AMOUNT),
+        gas_unit_price.unwrap_or(TEST_GAS_PRICE),
+        expiration_timestamp_secs.unwrap_or(expiration_time(10)),
+        ChainId::test(),
+    )
 }

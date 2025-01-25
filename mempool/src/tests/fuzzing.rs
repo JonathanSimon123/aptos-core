@@ -1,27 +1,63 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     core_mempool::{CoreMempool, TimelineState},
+    network::{BroadcastPeerPriority, MempoolSyncMsg},
     shared_mempool::{tasks, types::SharedMempool},
 };
-use aptos_config::{config::NodeConfig, network_id::NetworkId};
+use aptos_config::{
+    config::{NodeConfig, NodeType},
+    network_id::NetworkId,
+};
 use aptos_infallible::{Mutex, RwLock};
+use aptos_network::{
+    application::{interface::NetworkClient, storage::PeersAndMetadata},
+    protocols::wire::handshake::v1::ProtocolId::MempoolDirectSend,
+};
+use aptos_storage_interface::mock::MockDbReaderWriter;
 use aptos_types::transaction::SignedTransaction;
-use network::application::storage::PeerMetadataStorage;
+use aptos_vm_validator::mocks::mock_vm_validator::MockVMValidator;
 use proptest::{
     arbitrary::any,
     prelude::*,
     strategy::{Just, Strategy},
 };
 use std::{collections::HashMap, sync::Arc};
-use storage_interface::mock::MockDbReaderWriter;
-use vm_validator::mocks::mock_vm_validator::MockVMValidator;
 
-pub fn mempool_incoming_transactions_strategy(
-) -> impl Strategy<Value = (Vec<SignedTransaction>, TimelineState)> {
+impl Arbitrary for BroadcastPeerPriority {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        prop_oneof![
+            Just(BroadcastPeerPriority::Primary),
+            Just(BroadcastPeerPriority::Failover),
+        ]
+        .boxed()
+    }
+}
+
+pub fn mempool_incoming_transactions_strategy() -> impl Strategy<
+    Value = (
+        Vec<(
+            SignedTransaction,
+            Option<u64>,
+            Option<BroadcastPeerPriority>,
+        )>,
+        TimelineState,
+    ),
+> {
     (
-        proptest::collection::vec(any::<SignedTransaction>(), 0..100),
+        proptest::collection::vec(
+            any::<(
+                SignedTransaction,
+                Option<u64>,
+                Option<BroadcastPeerPriority>,
+            )>(),
+            0..100,
+        ),
         prop_oneof![
             Just(TimelineState::NotReady),
             Just(TimelineState::NonQualified)
@@ -30,24 +66,33 @@ pub fn mempool_incoming_transactions_strategy(
 }
 
 pub fn test_mempool_process_incoming_transactions_impl(
-    txns: Vec<SignedTransaction>,
+    txns: Vec<(
+        SignedTransaction,
+        Option<u64>,
+        Option<BroadcastPeerPriority>,
+    )>,
     timeline_state: TimelineState,
 ) {
     let config = NodeConfig::default();
     let mock_db = MockDbReaderWriter;
     let vm_validator = Arc::new(RwLock::new(MockVMValidator));
-    let smp = SharedMempool::new(
+    let network_client = NetworkClient::new(
+        vec![MempoolDirectSend],
+        vec![],
+        HashMap::new(),
+        PeersAndMetadata::new(&[NetworkId::Validator]),
+    );
+    let smp: SharedMempool<NetworkClient<MempoolSyncMsg>, MockVMValidator> = SharedMempool::new(
         Arc::new(Mutex::new(CoreMempool::new(&config))),
         config.mempool.clone(),
-        HashMap::new(),
+        network_client,
         Arc::new(mock_db),
         vm_validator,
         vec![],
-        config.base.role,
-        PeerMetadataStorage::new(&[NetworkId::Validator]),
+        NodeType::extract_from_config(&config),
     );
 
-    let _ = tasks::process_incoming_transactions(&smp, txns, timeline_state);
+    let _ = tasks::process_incoming_transactions(&smp, txns, timeline_state, false);
 }
 
 proptest! {

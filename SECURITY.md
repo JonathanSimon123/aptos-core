@@ -1,11 +1,5 @@
-# Security
+# Aptos Foundation Bounty Program
 
-As Aptos Core is currently in the prototype stage and does not power a blockchain with a cryptocurrency that has real-world value, our security procedures are not fully in place. We will release a more complete disclosure policy prior to the launch of the mainnet.
+The Aptos Foundation welcomes feedback from security researchers and the general public to help improve the security of the Aptos Network, and, at its sole discretion, offers bounty rewards for security reports that identify previously unknown, in-scope security vulnerabilities.
 
-## Reporting a Bug
-
-The Aptos Core team and community take all security bugs in the Aptos project seriously to ensure the security of the Aptos Blockchain.
-
-You can also report security bugs by emailing us directly at security@aptoslabs.com.
-
-Thank you for improving the security of the Aptos Blockchain! Your efforts and responsible disclosure are appreciated, and every effort will be made to acknowledge your contributions in a timely manner.
+To learn more visit the [Aptos Foundation Bounty Program](https://hackenproof.com/aptos) page.

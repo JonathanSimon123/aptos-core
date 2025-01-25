@@ -1,16 +1,19 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{error::Error, safety_rules::next_round, SafetyRules};
-use aptos_crypto::{ed25519::Ed25519Signature, hash::CryptoHash, HashValue};
-use aptos_types::{block_info::BlockInfo, ledger_info::LedgerInfo};
-use consensus_types::{
+use aptos_consensus_types::{
     block::Block,
+    order_vote::OrderVote,
+    order_vote_proposal::OrderVoteProposal,
     safety_data::SafetyData,
     timeout_2chain::{TwoChainTimeout, TwoChainTimeoutCertificate},
     vote::Vote,
-    vote_proposal::MaybeSignedVoteProposal,
+    vote_proposal::VoteProposal,
 };
+use aptos_crypto::{bls12381, hash::CryptoHash, HashValue};
+use aptos_types::{block_info::BlockInfo, ledger_info::LedgerInfo};
 
 /// 2-chain safety rules implementation
 impl SafetyRules {
@@ -18,7 +21,7 @@ impl SafetyRules {
         &mut self,
         timeout: &TwoChainTimeout,
         timeout_cert: Option<&TwoChainTimeoutCertificate>,
-    ) -> Result<Ed25519Signature, Error> {
+    ) -> Result<bls12381::Signature, Error> {
         self.signer()?;
         let mut safety_data = self.persistent_storage.safety_data()?;
         self.verify_epoch(timeout.epoch(), &safety_data)?;
@@ -38,8 +41,9 @@ impl SafetyRules {
         }
         if timeout.round() > safety_data.last_voted_round {
             self.verify_and_update_last_vote_round(timeout.round(), &mut safety_data)?;
-            self.persistent_storage.set_safety_data(safety_data)?;
         }
+        self.update_highest_timeout_round(timeout, &mut safety_data);
+        self.persistent_storage.set_safety_data(safety_data)?;
 
         let signature = self.sign(&timeout.signing_format())?;
         Ok(signature)
@@ -47,17 +51,17 @@ impl SafetyRules {
 
     pub(crate) fn guarded_construct_and_sign_vote_two_chain(
         &mut self,
-        maybe_signed_vote_proposal: &MaybeSignedVoteProposal,
+        vote_proposal: &VoteProposal,
         timeout_cert: Option<&TwoChainTimeoutCertificate>,
     ) -> Result<Vote, Error> {
         // Exit early if we cannot sign
         self.signer()?;
 
-        let vote_data = self.verify_proposal(maybe_signed_vote_proposal)?;
+        let vote_data = self.verify_proposal(vote_proposal)?;
         if let Some(tc) = timeout_cert {
             self.verify_tc(tc)?;
         }
-        let proposed_block = maybe_signed_vote_proposal.vote_proposal.block();
+        let proposed_block = vote_proposal.block();
         let mut safety_data = self.persistent_storage.safety_data()?;
 
         // if already voted on this round, send back the previous vote
@@ -87,6 +91,30 @@ impl SafetyRules {
         self.persistent_storage.set_safety_data(safety_data)?;
 
         Ok(vote)
+    }
+
+    pub(crate) fn guarded_construct_and_sign_order_vote(
+        &mut self,
+        order_vote_proposal: &OrderVoteProposal,
+    ) -> Result<OrderVote, Error> {
+        // Exit early if we cannot sign
+        self.signer()?;
+        self.verify_order_vote_proposal(order_vote_proposal)?;
+        let proposed_block = order_vote_proposal.block();
+        let mut safety_data = self.persistent_storage.safety_data()?;
+
+        // Record 1-chain data
+        self.observe_qc(order_vote_proposal.quorum_cert(), &mut safety_data);
+
+        self.safe_for_order_vote(proposed_block, &safety_data)?;
+        // Construct and sign order vote
+        let author = self.signer()?.author();
+        let ledger_info =
+            LedgerInfo::new(order_vote_proposal.block_info().clone(), HashValue::zero());
+        let signature = self.sign(&ledger_info)?;
+        let order_vote = OrderVote::new_with_signature(author, ledger_info.clone(), signature);
+        self.persistent_storage.set_safety_data(safety_data)?;
+        Ok(order_vote)
     }
 
     /// Core safety timeout rule for 2-chain protocol. Return success if 1 and 2 are true
@@ -133,6 +161,18 @@ impl SafetyRules {
             Ok(())
         } else {
             Err(Error::NotSafeToVote(round, qc_round, tc_round, hqc_round))
+        }
+    }
+
+    fn safe_for_order_vote(&self, block: &Block, safety_data: &SafetyData) -> Result<(), Error> {
+        let round = block.round();
+        if round > safety_data.highest_timeout_round {
+            Ok(())
+        } else {
+            Err(Error::NotSafeForOrderVote(
+                round,
+                safety_data.highest_timeout_round,
+            ))
         }
     }
 

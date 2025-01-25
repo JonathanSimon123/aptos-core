@@ -1,66 +1,58 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+mod account_abstraction_test;
 mod accounts_test;
+mod blocks_test;
 mod converter_test;
+mod event_v2_translation_test;
 mod events_test;
-mod golden_output;
 mod index_test;
 mod invalid_post_request_test;
+mod modules;
+mod multisig_transactions_test;
+mod objects;
+mod resource_groups;
+mod secp256k1_ecdsa;
+mod simulation_test;
 mod state_test;
 mod string_resource_test;
-mod test_context;
+mod transaction_vector_test;
 mod transactions_test;
+mod view_function;
+mod webauthn_secp256r1_ecdsa;
 
-use serde_json::Value;
-pub use test_context::{new_test_context, TestContext};
+use aptos_api_test_context::{new_test_context_inner as super_new_test_context, TestContext};
+use aptos_config::config::{internal_indexer_db_config::InternalIndexerDBConfig, NodeConfig};
 
-pub fn find_value(val: &Value, filter: for<'r> fn(&'r &Value) -> bool) -> Value {
-    let resources = val
-        .as_array()
-        .unwrap_or_else(|| panic!("expect array, but got: {}", val));
-    let mut balances = resources.iter().filter(filter);
-    match balances.next() {
-        Some(resource) => {
-            let more = balances.next();
-            if let Some(val) = more {
-                panic!("found multiple items by the filter: {}", pretty(val));
-            }
-            resource.clone()
-        }
-        None => {
-            panic!("\ncould not find item in {}", pretty(val))
-        }
-    }
+fn new_test_context(test_name: String) -> TestContext {
+    new_test_context_with_config(test_name, NodeConfig::default())
 }
 
-pub fn assert_json(ret: Value, expected: Value) {
-    assert!(
-        ret == expected,
-        "\nexpected: {}, \nbut got: {}",
-        pretty(&expected),
-        pretty(&ret)
-    )
+fn new_test_context_with_config(test_name: String, node_config: NodeConfig) -> TestContext {
+    super_new_test_context(test_name, node_config, false, None)
 }
 
-pub fn pretty(val: &Value) -> String {
-    serde_json::to_string_pretty(val).unwrap() + "\n"
+#[cfg(test)]
+fn new_test_context_with_db_sharding_and_internal_indexer(test_name: String) -> TestContext {
+    let mut node_config = NodeConfig::default();
+    node_config.storage.rocksdb_configs.enable_storage_sharding = true;
+    node_config.indexer_db_config = InternalIndexerDBConfig::new(true, true, true, 0, true, 10);
+    let test_context = super_new_test_context(test_name, node_config, false, None);
+    let _ = test_context
+        .get_indexer_reader()
+        .unwrap()
+        .wait_for_internal_indexer(0);
+    test_context
 }
 
-/// Returns the name of the current function. This macro is used to derive the name for the golden
-/// file of each test case.
-#[macro_export]
-macro_rules! current_function_name {
-    () => {{
-        fn f() {}
-        fn type_name_of<T>(_: T) -> &'static str {
-            std::any::type_name::<T>()
-        }
-        let name = type_name_of(f);
-        let mut strip = 3;
-        if name.contains("::{{closure}}") {
-            strip += 13;
-        }
-        &name[..name.len() - strip]
-    }};
+fn new_test_context_with_sharding_and_delayed_internal_indexer(
+    test_name: String,
+    end_version: Option<u64>,
+) -> TestContext {
+    let mut node_config = NodeConfig::default();
+    node_config.storage.rocksdb_configs.enable_storage_sharding = true;
+    node_config.indexer_db_config = InternalIndexerDBConfig::new(true, true, true, 0, true, 1);
+    super_new_test_context(test_name, node_config, false, end_version)
 }

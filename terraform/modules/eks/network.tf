@@ -3,7 +3,7 @@ resource "aws_vpc" "vpc" {
   enable_dns_hostnames = true
 
   tags = merge(local.default_tags, {
-    Name                                                 = "aptos-${local.workspace_name}"
+    Name                                                  = "aptos-${local.workspace_name}"
     "kubernetes.io/cluster/aptos-${local.workspace_name}" = "shared"
   })
 }
@@ -16,9 +16,9 @@ resource "aws_subnet" "public" {
   map_public_ip_on_launch = true
 
   tags = merge(local.default_tags, {
-    Name                                                 = "aptos-${local.workspace_name}/public-${local.aws_availability_zones[count.index]}"
+    Name                                                  = "aptos-${local.workspace_name}/public-${local.aws_availability_zones[count.index]}"
     "kubernetes.io/cluster/aptos-${local.workspace_name}" = "shared"
-    "kubernetes.io/role/elb"                             = "1"
+    "kubernetes.io/role/elb"                              = "1"
   })
 }
 
@@ -45,7 +45,7 @@ resource "aws_route_table" "public" {
 
 resource "aws_route_table_association" "public" {
   count          = length(local.aws_availability_zones)
-  subnet_id      = element(aws_subnet.public.*.id, count.index)
+  subnet_id      = element(aws_subnet.public[*].id, count.index)
   route_table_id = aws_route_table.public.id
 }
 
@@ -56,9 +56,9 @@ resource "aws_subnet" "private" {
   availability_zone = local.aws_availability_zones[count.index]
 
   tags = merge(local.default_tags, {
-    Name                                                 = "aptos-${local.workspace_name}/private-${local.aws_availability_zones[count.index]}"
+    Name                                                  = "aptos-${local.workspace_name}/private-${local.aws_availability_zones[count.index]}"
     "kubernetes.io/cluster/aptos-${local.workspace_name}" = "shared"
-    "kubernetes.io/role/internal-elb"                    = "1"
+    "kubernetes.io/role/internal-elb"                     = "1"
   })
 }
 
@@ -91,7 +91,7 @@ resource "aws_route_table" "private" {
 
 resource "aws_route_table_association" "private" {
   count          = length(local.aws_availability_zones)
-  subnet_id      = element(aws_subnet.private.*.id, count.index)
+  subnet_id      = element(aws_subnet.private[*].id, count.index)
   route_table_id = aws_route_table.private.id
 }
 
@@ -201,11 +201,11 @@ output "vpc_id" {
 }
 
 output "aws_subnet_public" {
-  value     = aws_subnet.public
+  value = aws_subnet.public
 }
 
 output "aws_subnet_private" {
-  value     = aws_subnet.private
+  value = aws_subnet.private
 }
 
 output "aws_vpc_cidr_block" {

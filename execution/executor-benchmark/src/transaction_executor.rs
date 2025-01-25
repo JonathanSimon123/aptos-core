@@ -1,78 +1,87 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::{metrics::TIMER, pipeline::LedgerUpdateMessage};
 use aptos_crypto::hash::HashValue;
-use aptos_types::transaction::{Transaction, Version};
-use aptos_vm::AptosVM;
-use executor::block_executor::BlockExecutor;
-use executor_types::BlockExecutorTrait;
+use aptos_executor::block_executor::BlockExecutor;
+use aptos_executor_types::BlockExecutorTrait;
+use aptos_logger::info;
+use aptos_types::block_executor::{
+    config::BlockExecutorConfigFromOnchain, partitioner::ExecutableBlock,
+};
+use aptos_vm::VMBlockExecutor;
 use std::{
     sync::{mpsc, Arc},
     time::{Duration, Instant},
 };
 
-pub struct TransactionExecutor {
-    executor: Arc<BlockExecutor<AptosVM>>,
+pub const BENCHMARKS_BLOCK_EXECUTOR_ONCHAIN_CONFIG: BlockExecutorConfigFromOnchain =
+    BlockExecutorConfigFromOnchain::on_but_large_for_test();
+
+pub struct TransactionExecutor<V> {
+    num_blocks_processed: usize,
+    executor: Arc<BlockExecutor<V>>,
     parent_block_id: HashValue,
-    start_time: Instant,
-    version: Version,
-    // If commit_sender is `None`, we will commit all the execution result immediately in this struct.
-    commit_sender:
-        Option<mpsc::SyncSender<(HashValue, HashValue, Instant, Instant, Duration, usize)>>,
+    maybe_first_block_start_time: Option<Instant>,
+    ledger_update_sender: mpsc::SyncSender<LedgerUpdateMessage>,
 }
 
-impl TransactionExecutor {
+impl<V> TransactionExecutor<V>
+where
+    V: VMBlockExecutor,
+{
     pub fn new(
-        executor: Arc<BlockExecutor<AptosVM>>,
+        executor: Arc<BlockExecutor<V>>,
         parent_block_id: HashValue,
-        version: Version,
-        commit_sender: Option<
-            mpsc::SyncSender<(HashValue, HashValue, Instant, Instant, Duration, usize)>,
-        >,
+        ledger_update_sender: mpsc::SyncSender<LedgerUpdateMessage>,
     ) -> Self {
         Self {
+            num_blocks_processed: 0,
             executor,
             parent_block_id,
-            version,
-            start_time: Instant::now(),
-            commit_sender,
+            maybe_first_block_start_time: None,
+            ledger_update_sender,
         }
     }
 
-    pub fn execute_block(&mut self, transactions: Vec<Transaction>) {
-        let num_txns = transactions.len();
-        self.version += num_txns as Version;
-
-        let execution_start = std::time::Instant::now();
-
-        let block_id = HashValue::random();
-        let output = self
-            .executor
-            .execute_block((block_id, transactions), self.parent_block_id)
-            .unwrap();
-
-        self.parent_block_id = block_id;
-
-        if let Some(ref commit_sender) = self.commit_sender {
-            commit_sender
-                .send((
-                    block_id,
-                    output.root_hash(),
-                    self.start_time,
-                    execution_start,
-                    Instant::now().duration_since(execution_start),
-                    num_txns,
-                ))
-                .unwrap();
-        } else {
-            let ledger_info_with_sigs = super::transaction_committer::gen_li_with_sigs(
-                block_id,
-                output.root_hash(),
-                self.version,
-            );
+    pub fn execute_block(
+        &mut self,
+        current_block_start_time: Instant,
+        partition_time: Duration,
+        executable_block: ExecutableBlock,
+    ) {
+        let execution_start_time = Instant::now();
+        if self.maybe_first_block_start_time.is_none() {
+            self.maybe_first_block_start_time = Some(current_block_start_time);
+        }
+        let block_id = executable_block.block_id;
+        info!(
+            "In iteration {}, received block {}.",
+            self.num_blocks_processed, block_id
+        );
+        let num_input_txns = executable_block.transactions.num_transactions();
+        {
+            let _timer = TIMER.with_label_values(&["execute"]).start_timer();
             self.executor
-                .commit_blocks(vec![block_id], ledger_info_with_sigs)
+                .execute_and_update_state(
+                    executable_block,
+                    self.parent_block_id,
+                    BENCHMARKS_BLOCK_EXECUTOR_ONCHAIN_CONFIG,
+                )
                 .unwrap();
         }
+        let msg = LedgerUpdateMessage {
+            current_block_start_time,
+            first_block_start_time: *self.maybe_first_block_start_time.as_ref().unwrap(),
+            partition_time,
+            execution_time: Instant::now().duration_since(execution_start_time),
+            block_id,
+            parent_block_id: self.parent_block_id,
+            num_input_txns,
+        };
+        self.ledger_update_sender.send(msg).unwrap();
+        self.parent_block_id = block_id;
+        self.num_blocks_processed += 1;
     }
 }

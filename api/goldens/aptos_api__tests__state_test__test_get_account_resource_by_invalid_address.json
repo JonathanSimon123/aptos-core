@@ -1,12 +1,10 @@
 {
-  "code": 400,
-  "message": "invalid parameter account address: 1"
+  "message": "failed to parse path `address`: failed to parse \"string(Address)\": Invalid account address: Hex characters are invalid: Invalid character 'x' at position 62",
+  "error_code": "web_framework_error",
+  "vm_error_code": null
 }
 {
-  "code": 400,
-  "message": "invalid parameter account address: 0xzz"
-}
-{
-  "code": 400,
-  "message": "invalid parameter account address: 01"
+  "message": "failed to parse path `address`: failed to parse \"string(Address)\": Invalid account address: Hex characters are invalid: Invalid character 'z' at position 62",
+  "error_code": "web_framework_error",
+  "vm_error_code": null
 }

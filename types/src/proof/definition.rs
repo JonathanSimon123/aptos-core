@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module has definition of various proofs.
@@ -9,7 +10,7 @@ use super::{
 };
 use crate::{
     ledger_info::LedgerInfo,
-    state_store::state_value::StateValue,
+    proof::accumulator::InMemoryTransactionAccumulator,
     transaction::{TransactionInfo, Version},
 };
 use anyhow::{bail, ensure, format_err, Context, Result};
@@ -25,7 +26,7 @@ use aptos_crypto::{
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-use std::marker::PhantomData;
+use std::{any::type_name, marker::PhantomData};
 
 /// A proof that can be used authenticate an element in an accumulator given trusted root hash. For
 /// example, both `LedgerInfoToTransactionInfoProof` and `TransactionInfoToEventProof` can be
@@ -101,7 +102,8 @@ where
             .0;
         ensure!(
             actual_root_hash == expected_root_hash,
-            "Root hashes do not match. Actual root hash: {:x}. Expected root hash: {:x}.",
+            "{}: Root hashes do not match. Actual root hash: {:x}. Expected root hash: {:x}.",
+            type_name::<Self>(),
             actual_root_hash,
             expected_root_hash
         );
@@ -144,9 +146,142 @@ pub struct SparseMerkleProof {
     ///       empty.
     leaf: Option<SparseMerkleLeafNode>,
 
-    /// All siblings in this proof, including the default ones. Siblings are ordered from the bottom
-    /// level to the root level.
+    /// All siblings in this proof, including the default ones. Siblings are ordered from the root
+    /// level to the bottom level.
     siblings: Vec<HashValue>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum NodeInProof {
+    Leaf(SparseMerkleLeafNode),
+    Other(HashValue),
+}
+
+impl From<HashValue> for NodeInProof {
+    fn from(hash: HashValue) -> Self {
+        Self::Other(hash)
+    }
+}
+
+impl From<SparseMerkleLeafNode> for NodeInProof {
+    fn from(leaf: SparseMerkleLeafNode) -> Self {
+        Self::Leaf(leaf)
+    }
+}
+
+impl NodeInProof {
+    pub fn hash(&self) -> HashValue {
+        match self {
+            Self::Leaf(leaf) => leaf.hash(),
+            Self::Other(hash) => *hash,
+        }
+    }
+}
+
+/// A more detailed version of `SparseMerkleProof` with the only difference that all the leaf
+/// siblings are explicitly set as `SparseMerkleLeafNode` instead of its hash value.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SparseMerkleProofExt {
+    leaf: Option<SparseMerkleLeafNode>,
+    /// All siblings in this proof, including the default ones. Siblings are ordered from the root
+    /// level to the bottom level.
+    siblings: Vec<NodeInProof>,
+    /// Depth of the subtree root. When this is non-zero, it's a partial proof
+    root_depth: usize,
+}
+
+impl SparseMerkleProofExt {
+    /// Constructs a new `SparseMerkleProofExt` using leaf and a list of sibling nodes.
+    pub fn new(leaf: Option<SparseMerkleLeafNode>, siblings: Vec<NodeInProof>) -> Self {
+        Self {
+            leaf,
+            siblings,
+            root_depth: 0,
+        }
+    }
+
+    pub fn new_empty() -> Self {
+        Self::new(None, vec![])
+    }
+
+    pub fn new_partial(
+        leaf: Option<SparseMerkleLeafNode>,
+        siblings: Vec<NodeInProof>,
+        root_depth: usize,
+    ) -> Self {
+        Self {
+            leaf,
+            siblings,
+            root_depth,
+        }
+    }
+
+    /// Returns the leaf node in this proof.
+    pub fn leaf(&self) -> Option<SparseMerkleLeafNode> {
+        self.leaf
+    }
+
+    pub fn sibling_at_depth(&self, depth: usize) -> Result<&NodeInProof> {
+        ensure!(
+            depth > self.root_depth() && depth <= self.bottom_depth(),
+            "Proof between depth {} and {} does not cover depth {}",
+            self.root_depth(),
+            self.bottom_depth(),
+            depth,
+        );
+        Ok(&self.siblings[depth - self.root_depth() - 1])
+    }
+
+    /// Returns the depth of the leaf (or the None-leaf that proves there's no such leaf).
+    pub fn bottom_depth(&self) -> usize {
+        self.root_depth + self.siblings.len()
+    }
+
+    /// Assuming a possible partial proof, returns the depth of the root of the subtree this
+    /// proof proves, i.e. this holds: `self.root_depth() + self.siblings.len() == self.bottom_depth()`
+    pub fn root_depth(&self) -> usize {
+        self.root_depth
+    }
+
+    pub fn verify<V: CryptoHash>(
+        &self,
+        expected_root_hash: HashValue,
+        element_key: HashValue,
+        element_value: Option<&V>,
+    ) -> Result<()> {
+        self.verify_by_hash(
+            expected_root_hash,
+            element_key,
+            element_value.map(|v| v.hash()),
+        )
+    }
+
+    pub fn verify_by_hash(
+        &self,
+        expected_root_hash: HashValue,
+        element_key: HashValue,
+        element_hash: Option<HashValue>,
+    ) -> Result<()> {
+        SparseMerkleProof::from(self.clone()).verify_by_hash_partial(
+            expected_root_hash,
+            element_key,
+            element_hash,
+            self.root_depth(),
+        )
+    }
+}
+
+impl From<SparseMerkleProofExt> for SparseMerkleProof {
+    fn from(proof_ext: SparseMerkleProofExt) -> Self {
+        Self::new(
+            proof_ext.leaf,
+            proof_ext
+                .siblings
+                .into_iter()
+                .map(|node| node.hash())
+                .collect(),
+        )
+    }
 }
 
 impl SparseMerkleProof {
@@ -188,10 +323,21 @@ impl SparseMerkleProof {
         element_key: HashValue,
         element_hash: Option<HashValue>,
     ) -> Result<()> {
+        self.verify_by_hash_partial(expected_root_hash, element_key, element_hash, 0)
+    }
+
+    pub fn verify_by_hash_partial(
+        &self,
+        expected_root_hash: HashValue,
+        element_key: HashValue,
+        element_hash: Option<HashValue>,
+        root_depth: usize,
+    ) -> Result<()> {
         ensure!(
-            self.siblings.len() <= HashValue::LENGTH_IN_BITS,
-            "Sparse Merkle Tree proof has more than {} ({}) siblings.",
+            self.siblings.len() + root_depth <= HashValue::LENGTH_IN_BITS,
+            "Sparse Merkle Tree proof has more than {} ({} + {}) siblings.",
             HashValue::LENGTH_IN_BITS,
+            root_depth,
             self.siblings.len(),
         );
 
@@ -202,19 +348,28 @@ impl SparseMerkleProof {
                 // route from the leaf node to the root.
                 ensure!(
                     element_key == leaf.key,
-                    "Keys do not match. Key in proof: {:x}. Expected key: {:x}.",
+                    "Keys do not match. Key in proof: {:x}. Expected key: {:x}. \
+                     Element hash: {:x}. Value hash in proof {:x}",
                     leaf.key,
-                    element_key
+                    element_key,
+                    hash,
+                    leaf.value_hash
                 );
                 ensure!(
                     hash == leaf.value_hash,
-                    "Value hashes do not match. Value hash in proof: {:x}. \
-                     Expected value hash: {:x}",
+                    "Value hashes do not match for key {:x}. Value hash in proof: {:x}. \
+                     Expected value hash: {:x}. ",
+                    element_key,
                     leaf.value_hash,
-                    hash,
+                    hash
                 );
-            }
-            (Some(_hash), None) => bail!("Expected inclusion proof. Found non-inclusion proof."),
+            },
+            (Some(hash), None) => {
+                bail!(
+                    "Expected inclusion proof, value hash: {:x}. Found non-inclusion proof.",
+                    hash
+                )
+            },
             (None, Some(leaf)) => {
                 // This is a non-inclusion proof. The proof intends to show that if a leaf node
                 // representing `element_key` is inserted, it will break a currently existing leaf
@@ -222,20 +377,26 @@ impl SparseMerkleProof {
                 // route from that leaf node to the root.
                 ensure!(
                     element_key != leaf.key,
-                    "Expected non-inclusion proof, but key exists in proof.",
+                    "Expected non-inclusion proof, but key exists in proof. \
+                     Key: {:x}. Key in proof: {:x}.",
+                    element_key,
+                    leaf.key,
                 );
                 ensure!(
-                    element_key.common_prefix_bits_len(leaf.key) >= self.siblings.len(),
+                    element_key.common_prefix_bits_len(leaf.key)
+                        >= root_depth + self.siblings.len(),
                     "Key would not have ended up in the subtree where the provided key in proof \
                      is the only existing key, if it existed. So this is not a valid \
-                     non-inclusion proof.",
+                     non-inclusion proof. Key: {:x}. Key in proof: {:x}.",
+                    element_key,
+                    leaf.key
                 );
-            }
+            },
             (None, None) => {
                 // This is a non-inclusion proof. The proof intends to show that if a leaf node
                 // representing `element_key` is inserted, it will show up at a currently empty
                 // position. `sibling` should prove the route from this empty position to the root.
-            }
+            },
         }
 
         let current_hash = self
@@ -244,11 +405,12 @@ impl SparseMerkleProof {
         let actual_root_hash = self
             .siblings
             .iter()
+            .rev()
             .zip(
                 element_key
                     .iter_bits()
                     .rev()
-                    .skip(HashValue::LENGTH_IN_BITS - self.siblings.len()),
+                    .skip(HashValue::LENGTH_IN_BITS - self.siblings.len() - root_depth),
             )
             .fold(current_hash, |hash, (sibling_hash, bit)| {
                 if bit {
@@ -259,7 +421,8 @@ impl SparseMerkleProof {
             });
         ensure!(
             actual_root_hash == expected_root_hash,
-            "Root hashes do not match. Actual root hash: {:x}. Expected root hash: {:x}.",
+            "{}: Root hashes do not match. Actual root hash: {:x}. Expected root hash: {:x}.",
+            type_name::<Self>(),
             actual_root_hash,
             expected_root_hash,
         );
@@ -277,10 +440,10 @@ impl SparseMerkleProof {
 /// attempt to extend their accumulator summary with an [`AccumulatorConsistencyProof`]
 /// to verifiably ratchet their trusted view of the accumulator to a newer state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct TransactionAccumulatorSummary(InMemoryAccumulator<TransactionAccumulatorHasher>);
+pub struct TransactionAccumulatorSummary(pub InMemoryTransactionAccumulator);
 
 impl TransactionAccumulatorSummary {
-    pub fn new(accumulator: InMemoryAccumulator<TransactionAccumulatorHasher>) -> Result<Self> {
+    pub fn new(accumulator: InMemoryTransactionAccumulator) -> Result<Self> {
         ensure!(
             !accumulator.is_empty(),
             "empty accumulator: we can't verify consistency proofs from an empty accumulator",
@@ -517,7 +680,7 @@ where
 
             // Next we take two children at a time and compute their parents.
             let mut children_iter = children_iter.as_slice().chunks_exact(2);
-            while let Some(chunk) = children_iter.next() {
+            for chunk in children_iter.by_ref() {
                 let left_hash = chunk[0];
                 let right_hash = chunk[1];
                 parent_hashes.push(MerkleTreeInternalNode::<H>::new(left_hash, right_hash).hash());
@@ -542,7 +705,8 @@ where
 
         ensure!(
             current_hashes[0] == expected_root_hash,
-            "Root hashes do not match. Actual root hash: {:x}. Expected root hash: {:x}.",
+            "{}: Root hashes do not match. Actual root hash: {:x}. Expected root hash: {:x}.",
+            type_name::<Self>(),
             current_hashes[0],
             expected_root_hash,
         );
@@ -653,7 +817,8 @@ impl SparseMerkleRangeProof {
 
         ensure!(
             current_hash == expected_root_hash,
-            "Root hashes do not match. Actual root hash: {:x}. Expected root hash: {:x}.",
+            "{}: Root hashes do not match. Actual root hash: {:x}. Expected root hash: {:x}.",
+            type_name::<Self>(),
             current_hash,
             expected_root_hash,
         );
@@ -710,119 +875,6 @@ impl TransactionInfoWithProof {
     }
 }
 
-/// The complete proof used to authenticate the state of a resource in state store.
-/// This structure consists of the `AccumulatorProof` from `LedgerInfo` to `TransactionInfo`,
-/// the `TransactionInfo` object and the `SparseMerkleProof` from state root to the resource.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
-pub struct StateStoreValueProof {
-    transaction_info_with_proof: TransactionInfoWithProof,
-
-    /// The sparse merkle proof from state root to the account state.
-    transaction_info_to_value_proof: SparseMerkleProof,
-}
-
-impl StateStoreValueProof {
-    /// Constructs a new `AccountStateProof` using given `ledger_info_to_transaction_info_proof`,
-    /// `transaction_info` and `transaction_info_to_account_proof`.
-    pub fn new(
-        transaction_info_with_proof: TransactionInfoWithProof,
-        transaction_info_to_value_proof: SparseMerkleProof,
-    ) -> Self {
-        StateStoreValueProof {
-            transaction_info_with_proof,
-            transaction_info_to_value_proof,
-        }
-    }
-
-    /// Returns the `transaction_info_with_proof` object in this proof.
-    pub fn transaction_info_with_proof(&self) -> &TransactionInfoWithProof {
-        &self.transaction_info_with_proof
-    }
-
-    /// Returns the `transaction_info_to_account_proof` object in this proof.
-    pub fn transaction_info_to_account_proof(&self) -> &SparseMerkleProof {
-        &self.transaction_info_to_value_proof
-    }
-
-    /// Verifies that the state of an account at version `state_version` is correct using the
-    /// provided proof. If `state_value` is present, we expect the account to exist,
-    /// otherwise we expect the account to not exist.
-    pub fn verify(
-        &self,
-        ledger_info: &LedgerInfo,
-        state_version: Version,
-        value_hash: HashValue,
-        state_value: Option<&StateValue>,
-    ) -> Result<()> {
-        self.transaction_info_to_value_proof.verify(
-            self.transaction_info_with_proof
-                .transaction_info
-                .ensure_state_checkpoint_hash()?,
-            value_hash,
-            state_value,
-        )?;
-
-        self.transaction_info_with_proof
-            .verify(ledger_info, state_version)?;
-
-        Ok(())
-    }
-}
-
-/// The complete proof used to authenticate a contract event. This structure consists of the
-/// `AccumulatorProof` from `LedgerInfo` to `TransactionInfo`, the `TransactionInfo` object and the
-/// `AccumulatorProof` from event accumulator root to the event.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
-pub struct EventProof {
-    transaction_info_with_proof: TransactionInfoWithProof,
-
-    /// The accumulator proof from event root to the actual event.
-    transaction_info_to_event_proof: EventAccumulatorProof,
-}
-
-impl EventProof {
-    /// Constructs a new `EventProof` using given `ledger_info_to_transaction_info_proof`,
-    /// `transaction_info` and `transaction_info_to_event_proof`.
-    pub fn new(
-        transaction_info_with_proof: TransactionInfoWithProof,
-        transaction_info_to_event_proof: EventAccumulatorProof,
-    ) -> Self {
-        EventProof {
-            transaction_info_with_proof,
-            transaction_info_to_event_proof,
-        }
-    }
-
-    /// Returns the `transaction_info_with_proof` object in this proof.
-    pub fn transaction_info_with_proof(&self) -> &TransactionInfoWithProof {
-        &self.transaction_info_with_proof
-    }
-
-    /// Verifies that a given event is correct using provided proof.
-    pub fn verify(
-        &self,
-        ledger_info: &LedgerInfo,
-        event_hash: HashValue,
-        transaction_version: Version,
-        event_version_within_transaction: Version,
-    ) -> Result<()> {
-        self.transaction_info_to_event_proof.verify(
-            self.transaction_info_with_proof
-                .transaction_info()
-                .event_root_hash(),
-            event_hash,
-            event_version_within_transaction,
-        )?;
-
-        self.transaction_info_with_proof
-            .verify(ledger_info, transaction_version)?;
-
-        Ok(())
-    }
-}
-
 /// The proof used to authenticate a list of consecutive transaction infos.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
@@ -845,6 +897,13 @@ impl TransactionInfoListWithProof {
     /// Constructs a proof for an empty list of transaction infos. Mostly used for tests.
     pub fn new_empty() -> Self {
         Self::new(AccumulatorRangeProof::new_empty(), vec![])
+    }
+
+    pub fn state_checkpoint_hashes(&self) -> Vec<Option<HashValue>> {
+        self.transaction_infos
+            .iter()
+            .map(|t| t.state_checkpoint_hash())
+            .collect()
     }
 
     /// Verifies the list of transaction infos are correct using the proof. The verifier
@@ -896,7 +955,7 @@ impl TransactionInfoListWithProof {
                 .rev()
                 .cloned()
                 .collect::<Vec<_>>();
-            let accu_from_proof = InMemoryAccumulator::<TransactionAccumulatorHasher>::new(
+            let accu_from_proof = InMemoryTransactionAccumulator::new(
                 frozen_subtree_roots_from_proof,
                 first_version,
             )?
@@ -953,7 +1012,8 @@ impl<H: CryptoHasher> AccumulatorExtensionProof<H> {
             InMemoryAccumulator::<H>::new(self.frozen_subtree_roots.clone(), self.num_leaves)?;
         ensure!(
             original_tree.root_hash() == original_root,
-            "Root hashes do not match. Actual root hash: {:x}. Expected root hash: {:x}.",
+            "{}: Root hashes do not match. Actual root hash: {:x}. Expected root hash: {:x}.",
+            type_name::<Self>(),
             original_tree.root_hash(),
             original_root
         );

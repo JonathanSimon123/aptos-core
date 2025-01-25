@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module defines physical storage schema for consensus quorum certificate (of a block).
@@ -9,14 +10,16 @@
 //! | block_hash |  QuorumCert  |
 //! ```
 
-use super::QC_CF_NAME;
+use crate::define_schema;
 use anyhow::Result;
+use aptos_consensus_types::quorum_cert::QuorumCert;
 use aptos_crypto::HashValue;
-use consensus_types::quorum_cert::QuorumCert;
-use schemadb::{
-    define_schema,
+use aptos_schemadb::{
     schema::{KeyCodec, ValueCodec},
+    ColumnFamilyName,
 };
+
+pub const QC_CF_NAME: ColumnFamilyName = "quorum_certificate";
 
 define_schema!(QCSchema, HashValue, QuorumCert, QC_CF_NAME);
 

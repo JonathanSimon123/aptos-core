@@ -1,5 +1,8 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
+
+#![allow(clippy::arc_with_non_send_sync)]
 
 use crate::{
     epoch_change::{EpochChangeProof, Verifier},
@@ -198,7 +201,7 @@ impl TrustedState {
             let (curr_waypoint, curr_epoch_state) = match self {
                 Self::EpochWaypoint(_) => {
                     bail!("EpochWaypoint can only verify an epoch change ledger info")
-                }
+                },
                 Self::EpochState {
                     waypoint,
                     epoch_state,
@@ -243,10 +246,10 @@ impl Verifier for TrustedState {
         match self {
             Self::EpochWaypoint(waypoint) => {
                 Verifier::epoch_change_verification_required(waypoint, epoch)
-            }
+            },
             Self::EpochState { epoch_state, .. } => {
                 Verifier::epoch_change_verification_required(epoch_state, epoch)
-            }
+            },
         }
     }
 
@@ -255,7 +258,7 @@ impl Verifier for TrustedState {
             Self::EpochWaypoint(waypoint) => Verifier::is_ledger_info_stale(waypoint, ledger_info),
             Self::EpochState { epoch_state, .. } => {
                 Verifier::is_ledger_info_stale(epoch_state, ledger_info)
-            }
+            },
         }
     }
 }

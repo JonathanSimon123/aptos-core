@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -11,20 +12,47 @@ use crate::{
     storage::BackupStorage,
     utils::{GlobalRestoreOptions, RestoreRunMode, TrustedWaypointOpt},
 };
-use anyhow::{ensure, Result};
+use anyhow::Result;
+use aptos_db::backup::restore_handler::RestoreHandler;
+use aptos_executor_types::VerifyExecutionMode;
 use aptos_logger::prelude::*;
-use aptos_types::transaction::Version;
-use aptosdb::backup::restore_handler::RestoreHandler;
+use aptos_storage_interface::AptosDbError;
+use aptos_types::{on_chain_config::TimedFeatureOverride, transaction::Version};
+use aptos_vm::AptosVM;
+use aptos_vm_environment::prod_configs::set_timed_feature_override;
 use std::sync::Arc;
+use thiserror::Error;
 
+#[derive(Debug, Error)]
+pub enum ReplayError {
+    #[error("Txn mismatch error")]
+    TxnMismatch,
+    #[error("Other Replay error {0}")]
+    OtherError(String),
+}
+
+impl From<anyhow::Error> for ReplayError {
+    fn from(error: anyhow::Error) -> Self {
+        ReplayError::OtherError(error.to_string())
+    }
+}
+
+impl From<AptosDbError> for ReplayError {
+    fn from(error: AptosDbError) -> Self {
+        ReplayError::OtherError(error.to_string())
+    }
+}
 pub struct ReplayVerifyCoordinator {
     storage: Arc<dyn BackupStorage>,
     metadata_cache_opt: MetadataCacheOpt,
     trusted_waypoints_opt: TrustedWaypointOpt,
     concurrent_downloads: usize,
+    replay_concurrency_level: usize,
     restore_handler: RestoreHandler,
     start_version: Version,
     end_version: Version,
+    validate_modules: bool,
+    verify_execution_mode: VerifyExecutionMode,
 }
 
 impl ReplayVerifyCoordinator {
@@ -33,24 +61,29 @@ impl ReplayVerifyCoordinator {
         metadata_cache_opt: MetadataCacheOpt,
         trusted_waypoints_opt: TrustedWaypointOpt,
         concurrent_downloads: usize,
+        replay_concurrency_level: usize,
         restore_handler: RestoreHandler,
         start_version: Version,
         end_version: Version,
+        validate_modules: bool,
+        verify_execution_mode: VerifyExecutionMode,
     ) -> Result<Self> {
         Ok(Self {
             storage,
             metadata_cache_opt,
             trusted_waypoints_opt,
             concurrent_downloads,
+            replay_concurrency_level,
             restore_handler,
             start_version,
             end_version,
+            validate_modules,
+            verify_execution_mode,
         })
     }
 
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(self) -> Result<(), ReplayError> {
         info!("ReplayVerify coordinator started.");
-
         let ret = self.run_impl().await;
 
         if let Err(e) = &ret {
@@ -65,64 +98,117 @@ impl ReplayVerifyCoordinator {
         ret
     }
 
-    async fn run_impl(self) -> Result<()> {
+    async fn run_impl(self) -> Result<(), ReplayError> {
+        AptosVM::set_concurrency_level_once(self.replay_concurrency_level);
+        set_timed_feature_override(TimedFeatureOverride::Replay);
+
         let metadata_view = metadata::cache::sync_and_load(
             &self.metadata_cache_opt,
             Arc::clone(&self.storage),
             self.concurrent_downloads,
         )
         .await?;
-        ensure!(
-            self.start_version <= self.end_version,
-            "start_version should precede end_version."
-        );
+        if self.start_version > self.end_version {
+            return Err(ReplayError::OtherError(format!(
+                "start_version {} should precede end_version {}.",
+                self.start_version, self.end_version
+            )));
+        }
 
-        let state_snapshot = if self.start_version == 0 {
-            None
+        let run_mode = Arc::new(RestoreRunMode::Restore {
+            restore_handler: self.restore_handler,
+        });
+        let mut next_txn_version = run_mode.get_next_expected_transaction_version()?;
+        let (state_snapshot, snapshot_version) = if let Some(version) =
+            run_mode.get_in_progress_state_kv_snapshot()?
+        {
+            info!(
+                version = version,
+                "Found in progress state snapshot restore",
+            );
+            (
+                Some(metadata_view.expect_state_snapshot(version)?),
+                Some(version),
+            )
+        } else if let Some(snapshot) = metadata_view.select_state_snapshot(self.start_version)? {
+            let snapshot_version = snapshot.version;
+            info!(
+                "Found state snapshot backup at epoch {}, will replay from version {}.",
+                snapshot.epoch,
+                snapshot_version + 1
+            );
+            (Some(snapshot), Some(snapshot_version))
         } else {
-            metadata_view.select_state_snapshot(self.start_version.wrapping_sub(1))?
+            (None, None)
         };
-        let replay_transactions_from_version = state_snapshot
-            .as_ref()
-            .map(|b| b.version.wrapping_add(1))
-            .unwrap_or(0);
-        let transactions = metadata_view
-            .select_transaction_backups(replay_transactions_from_version, self.end_version)?;
 
+        let skip_snapshot: bool =
+            snapshot_version.is_none() || next_txn_version > snapshot_version.unwrap();
+        if skip_snapshot {
+            info!(
+                next_txn_version = next_txn_version,
+                snapshot_version = snapshot_version,
+                "found in progress replay and skip the state snapshot restore",
+            );
+        }
+
+        // Once it begins replay, we want to directly start from the version that failed
+        let save_start_version = (next_txn_version > 0).then_some(next_txn_version);
+
+        next_txn_version = std::cmp::max(next_txn_version, snapshot_version.map_or(0, |v| v + 1));
+
+        let transactions = metadata_view.select_transaction_backups(
+            // transaction info at the snapshot must be restored otherwise the db will be confused
+            // about the latest version after snapshot is restored.
+            next_txn_version.saturating_sub(1),
+            self.end_version,
+        )?;
         let global_opt = GlobalRestoreOptions {
             target_version: self.end_version,
             trusted_waypoints: Arc::new(self.trusted_waypoints_opt.verify()?),
-            run_mode: Arc::new(RestoreRunMode::Restore {
-                restore_handler: self.restore_handler,
-            }),
+            run_mode,
             concurrent_downloads: self.concurrent_downloads,
+            replay_concurrency_level: 0, // won't replay, doesn't matter
         };
 
-        if let Some(backup) = state_snapshot {
-            StateSnapshotRestoreController::new(
-                StateSnapshotRestoreOpt {
-                    manifest_handle: backup.manifest,
-                    version: backup.version,
-                },
-                global_opt.clone(),
-                Arc::clone(&self.storage),
-                None, /* epoch_history */
-            )
-            .run()
-            .await?;
+        if !skip_snapshot {
+            if let Some(backup) = state_snapshot {
+                StateSnapshotRestoreController::new(
+                    StateSnapshotRestoreOpt {
+                        manifest_handle: backup.manifest,
+                        version: backup.version,
+                        validate_modules: self.validate_modules,
+                        restore_mode: Default::default(),
+                    },
+                    global_opt.clone(),
+                    Arc::clone(&self.storage),
+                    None, /* epoch_history */
+                )
+                .run()
+                .await?;
+            }
         }
 
-        let txn_manifests = transactions.into_iter().map(|b| b.manifest).collect();
         TransactionRestoreBatchController::new(
             global_opt,
             self.storage,
-            txn_manifests,
-            Some(replay_transactions_from_version), /* replay_from_version */
-            None,                                   /* epoch_history */
+            transactions
+                .into_iter()
+                .map(|t| t.manifest)
+                .collect::<Vec<_>>(),
+            save_start_version,
+            Some((next_txn_version, false)), /* replay_from_version */
+            None,                            /* epoch_history */
+            self.verify_execution_mode.clone(),
+            None,
         )
         .run()
         .await?;
 
-        Ok(())
+        if self.verify_execution_mode.seen_error() {
+            Err(ReplayError::TxnMismatch)
+        } else {
+            Ok(())
+        }
     }
 }

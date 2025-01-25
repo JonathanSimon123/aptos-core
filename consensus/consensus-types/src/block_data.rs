@@ -1,20 +1,24 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     common::{Author, Payload, Round},
+    proposal_ext::ProposalExt,
     quorum_cert::QuorumCert,
     vote_data::VoteData,
 };
+use aptos_bitvec::BitVec;
 use aptos_crypto::hash::HashValue;
 use aptos_crypto_derive::{BCSCryptoHash, CryptoHasher};
 use aptos_types::{
+    aggregate_signature::AggregateSignature,
     block_info::BlockInfo,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    validator_txn::ValidatorTransaction,
 };
 use mirai_annotations::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 pub enum BlockType {
@@ -23,15 +27,40 @@ pub enum BlockType {
         payload: Payload,
         /// Author of the block that can be validated by the author's public key and the signature
         author: Author,
+        /// Failed authors from the parent's block to this block.
+        /// I.e. the list of consecutive proposers from the
+        /// immediately preceeding rounds that didn't produce a successful block.
+        failed_authors: Vec<(Round, Author)>,
     },
     /// NIL blocks don't have authors or signatures: they're generated upon timeouts to fill in the
     /// gaps in the rounds.
-    NilBlock,
+    NilBlock {
+        /// Failed authors from the parent's block to this block (including this block)
+        /// I.e. the list of consecutive proposers from the
+        /// immediately preceeding rounds that didn't produce a successful block.
+        failed_authors: Vec<(Round, Author)>,
+    },
     /// A genesis block is the first committed block in any epoch that is identically constructed on
     /// all validators by any (potentially different) LedgerInfo that justifies the epoch change
-    /// from the previous epoch.  The genesis block is used as the the first root block of the
+    /// from the previous epoch.  The genesis block is used as the first root block of the
     /// BlockTree for all epochs.
     Genesis,
+
+    /// Proposal with extensions (e.g. system transactions).
+    ProposalExt(ProposalExt),
+
+    /// A virtual block that's constructed by nodes from DAG, this is purely a local thing so
+    /// we hide it from serde
+    #[serde(skip_deserializing)]
+    DAGBlock {
+        author: Author,
+        failed_authors: Vec<(Round, Author)>,
+        validator_txns: Vec<ValidatorTransaction>,
+        payload: Payload,
+        node_digests: Vec<HashValue>,
+        parent_block_id: HashValue,
+        parents_bitvec: BitVec,
+    },
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, CryptoHasher, BCSCryptoHash)]
@@ -69,10 +98,12 @@ pub struct BlockData {
 
 impl BlockData {
     pub fn author(&self) -> Option<Author> {
-        if let BlockType::Proposal { author, .. } = self.block_type {
-            Some(author)
-        } else {
-            None
+        match &self.block_type {
+            BlockType::Proposal { author, .. } | BlockType::DAGBlock { author, .. } => {
+                Some(*author)
+            },
+            BlockType::ProposalExt(p) => Some(*p.author()),
+            _ => None,
         }
     }
 
@@ -85,12 +116,41 @@ impl BlockData {
     }
 
     pub fn parent_id(&self) -> HashValue {
-        self.quorum_cert.certified_block().id()
+        if let BlockType::DAGBlock {
+            parent_block_id, ..
+        } = self.block_type()
+        {
+            *parent_block_id
+        } else {
+            self.quorum_cert.certified_block().id()
+        }
     }
 
     pub fn payload(&self) -> Option<&Payload> {
-        if let BlockType::Proposal { payload, .. } = &self.block_type {
-            Some(payload)
+        match &self.block_type {
+            BlockType::Proposal { payload, .. } | BlockType::DAGBlock { payload, .. } => {
+                Some(payload)
+            },
+            BlockType::ProposalExt(p) => p.payload(),
+            _ => None,
+        }
+    }
+
+    pub fn validator_txns(&self) -> Option<&Vec<ValidatorTransaction>> {
+        match &self.block_type {
+            BlockType::ProposalExt(proposal_ext) => proposal_ext.validator_txns(),
+            BlockType::Proposal { .. } | BlockType::NilBlock { .. } | BlockType::Genesis => None,
+            BlockType::DAGBlock { validator_txns, .. } => Some(validator_txns),
+        }
+    }
+
+    pub fn dag_nodes(&self) -> Option<&Vec<HashValue>> {
+        if let BlockType::DAGBlock {
+            node_digests: nodes_digests,
+            ..
+        } = &self.block_type
+        {
+            Some(nodes_digests)
         } else {
             None
         }
@@ -113,7 +173,19 @@ impl BlockData {
     }
 
     pub fn is_nil_block(&self) -> bool {
-        matches!(self.block_type, BlockType::NilBlock)
+        matches!(self.block_type, BlockType::NilBlock { .. })
+    }
+
+    /// the list of consecutive proposers from the immediately preceeding
+    /// rounds that didn't produce a successful block
+    pub fn failed_authors(&self) -> Option<&Vec<(Round, Author)>> {
+        match &self.block_type {
+            BlockType::Proposal { failed_authors, .. }
+            | BlockType::NilBlock { failed_authors, .. }
+            | BlockType::DAGBlock { failed_authors, .. } => Some(failed_authors),
+            BlockType::ProposalExt(p) => Some(p.failed_authors()),
+            BlockType::Genesis => None,
+        }
     }
 
     pub fn new_genesis_from_ledger_info(ledger_info: &LedgerInfo) -> Self {
@@ -134,7 +206,7 @@ impl BlockData {
             VoteData::new(ancestor.clone(), ancestor.clone()),
             LedgerInfoWithSignatures::new(
                 LedgerInfo::new(ancestor, HashValue::zero()),
-                BTreeMap::new(),
+                AggregateSignature::empty(),
             ),
         );
 
@@ -159,6 +231,19 @@ impl BlockData {
         }
     }
 
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn dummy_with_validator_txns(txns: Vec<ValidatorTransaction>) -> Self {
+        Self::new_proposal_ext(
+            txns,
+            Payload::empty(false, true),
+            Author::ONE,
+            vec![],
+            1,
+            1,
+            QuorumCert::dummy(),
+        )
+    }
+
     pub fn new_genesis(timestamp_usecs: u64, quorum_cert: QuorumCert) -> Self {
         assume!(quorum_cert.certified_block().epoch() < u64::max_value()); // unlikely to be false in this universe
         Self {
@@ -170,7 +255,11 @@ impl BlockData {
         }
     }
 
-    pub fn new_nil(round: Round, quorum_cert: QuorumCert) -> Self {
+    pub fn new_nil(
+        round: Round,
+        quorum_cert: QuorumCert,
+        failed_authors: Vec<(Round, Author)>,
+    ) -> Self {
         // We want all the NIL blocks to agree on the timestamps even though they're generated
         // independently by different validators, hence we're using the timestamp of a parent + 1.
         assume!(quorum_cert.certified_block().timestamp_usecs() < u64::max_value()); // unlikely to be false in this universe
@@ -181,13 +270,49 @@ impl BlockData {
             round,
             timestamp_usecs,
             quorum_cert,
-            block_type: BlockType::NilBlock,
+            block_type: BlockType::NilBlock { failed_authors },
+        }
+    }
+
+    pub fn new_for_dag(
+        epoch: u64,
+        round: Round,
+        timestamp_usecs: u64,
+        validator_txns: Vec<ValidatorTransaction>,
+        payload: Payload,
+        author: Author,
+        failed_authors: Vec<(Round, Author)>,
+        parent_block_id: HashValue,
+        parents_bitvec: BitVec,
+        node_digests: Vec<HashValue>,
+    ) -> Self {
+        Self {
+            epoch,
+            round,
+            timestamp_usecs,
+            quorum_cert: QuorumCert::new(
+                VoteData::new(BlockInfo::empty(), BlockInfo::empty()),
+                LedgerInfoWithSignatures::new(
+                    LedgerInfo::new(BlockInfo::empty(), HashValue::zero()),
+                    AggregateSignature::new(BitVec::default(), None),
+                ),
+            ),
+            block_type: BlockType::DAGBlock {
+                author,
+                validator_txns,
+                payload,
+                failed_authors,
+                node_digests,
+                parent_block_id,
+                parents_bitvec,
+            },
         }
     }
 
     pub fn new_proposal(
         payload: Payload,
         author: Author,
+        failed_authors: Vec<(Round, Author)>,
         round: Round,
         timestamp_usecs: u64,
         quorum_cert: QuorumCert,
@@ -197,7 +322,34 @@ impl BlockData {
             round,
             timestamp_usecs,
             quorum_cert,
-            block_type: BlockType::Proposal { payload, author },
+            block_type: BlockType::Proposal {
+                payload,
+                author,
+                failed_authors,
+            },
+        }
+    }
+
+    pub fn new_proposal_ext(
+        validator_txns: Vec<ValidatorTransaction>,
+        payload: Payload,
+        author: Author,
+        failed_authors: Vec<(Round, Author)>,
+        round: Round,
+        timestamp_usecs: u64,
+        quorum_cert: QuorumCert,
+    ) -> Self {
+        Self {
+            epoch: quorum_cert.certified_block().epoch(),
+            round,
+            timestamp_usecs,
+            quorum_cert,
+            block_type: BlockType::ProposalExt(ProposalExt::V0 {
+                validator_txns,
+                payload,
+                author,
+                failed_authors,
+            }),
         }
     }
 
@@ -229,10 +381,43 @@ fn test_reconfiguration_suffix() {
                 BlockInfo::genesis(HashValue::random(), ValidatorSet::empty()),
                 HashValue::zero(),
             ),
-            BTreeMap::new(),
+            AggregateSignature::empty(),
         ),
     );
-    let reconfig_suffix_block =
-        BlockData::new_proposal(vec![], AccountAddress::random(), 2, 2, quorum_cert);
+    let reconfig_suffix_block = BlockData::new_proposal(
+        Payload::empty(false, true),
+        AccountAddress::random(),
+        Vec::new(),
+        2,
+        2,
+        quorum_cert,
+    );
     assert!(reconfig_suffix_block.is_reconfiguration_suffix());
+}
+
+#[test]
+fn test_dag_block_no_deserialize() {
+    #[derive(Serialize)]
+    #[serde(rename = "BlockType")]
+    #[allow(dead_code)]
+    pub enum FakeBlockType {
+        Proposal,
+        NilBlock,
+        Genesis,
+        DAG {
+            author: Author,
+            failed_authors: Vec<(Round, Author)>,
+            payload: Payload,
+            node_digests: Vec<HashValue>,
+        },
+    }
+    // test deserialize failure
+    let fake = FakeBlockType::DAG {
+        author: Author::ZERO,
+        failed_authors: vec![],
+        payload: Payload::DirectMempool(vec![]),
+        node_digests: vec![],
+    };
+    let bytes = bcs::to_bytes(&fake).unwrap();
+    bcs::from_bytes::<BlockType>(&bytes).unwrap_err();
 }
