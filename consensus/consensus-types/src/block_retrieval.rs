@@ -1,26 +1,25 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::block::Block;
 use anyhow::ensure;
 use aptos_crypto::hash::HashValue;
+use aptos_short_hex_str::AsShortHexStr;
 use aptos_types::validator_verifier::ValidatorVerifier;
 use serde::{Deserialize, Serialize};
-use short_hex_str::AsShortHexStr;
 use std::fmt;
 
-// this number is recommended to be greater than backpressure limit
-// (so block retrievals can be done in a single request)
-// but it should not be too large as the response size is bounded.
-// TODO: add a test
-pub const MAX_BLOCKS_PER_REQUEST: u64 = 10;
+pub const NUM_RETRIES: usize = 5;
+pub const NUM_PEERS_PER_RETRY: usize = 3;
+pub const RETRY_INTERVAL_MSEC: u64 = 500;
+pub const RPC_TIMEOUT_MSEC: u64 = 5000;
 
 /// RPC to get a chain of block of the given length starting from the given block id.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct BlockRetrievalRequest {
     block_id: HashValue,
     num_blocks: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     target_block_id: Option<HashValue>,
 }
 
@@ -32,6 +31,7 @@ impl BlockRetrievalRequest {
             target_block_id: None,
         }
     }
+
     pub fn new_with_target_block_id(
         block_id: HashValue,
         num_blocks: u64,
@@ -43,15 +43,19 @@ impl BlockRetrievalRequest {
             target_block_id: Some(target_block_id),
         }
     }
+
     pub fn block_id(&self) -> HashValue {
         self.block_id
     }
+
     pub fn num_blocks(&self) -> u64 {
         self.num_blocks
     }
+
     pub fn target_block_id(&self) -> Option<HashValue> {
         self.target_block_id
     }
+
     pub fn match_target_id(&self, hash_value: HashValue) -> bool {
         self.target_block_id.map_or(false, |id| id == hash_value)
     }
@@ -113,8 +117,10 @@ impl BlockRetrievalResponse {
         );
         ensure!(
             self.status != BlockRetrievalStatus::SucceededWithTarget
-                || (!self.blocks.is_empty()
-                    && retrieval_request.match_target_id(self.blocks.last().unwrap().id())),
+                || self
+                    .blocks
+                    .last()
+                    .map_or(false, |block| retrieval_request.match_target_id(block.id())),
             "target not found in blocks returned, expect {:?}",
             retrieval_request.target_block_id(),
         );
@@ -151,7 +157,7 @@ impl fmt::Display for BlockRetrievalResponse {
                     .finish()?;
 
                 write!(f, "]")
-            }
+            },
             _ => write!(f, "[BlockRetrievalResponse: status: {:?}]", self.status()),
         }
     }

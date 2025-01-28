@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module defines all kinds of structures in the Sparse Merkle Tree maintained in scratch pad.
@@ -25,28 +26,29 @@ use aptos_crypto::{
     hash::{CryptoHash, SPARSE_MERKLE_PLACEHOLDER_HASH},
     HashValue,
 };
+use aptos_drop_helper::ArcAsyncDrop;
 use aptos_types::proof::{SparseMerkleInternalNode, SparseMerkleLeafNode};
 use std::sync::{Arc, Weak};
 
 #[derive(Clone, Debug)]
-pub(crate) struct InternalNode<V> {
+pub(crate) struct InternalNode<V: ArcAsyncDrop> {
     pub left: SubTree<V>,
     pub right: SubTree<V>,
 }
 
-impl<V: CryptoHash> InternalNode<V> {
+impl<V: CryptoHash + Send + Sync + 'static> InternalNode<V> {
     pub fn calc_hash(&self) -> HashValue {
         SparseMerkleInternalNode::new(self.left.hash(), self.right.hash()).hash()
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LeafNode<V> {
+pub(crate) struct LeafNode<V: ArcAsyncDrop> {
     pub key: HashValue,
     pub value: LeafValue<V>,
 }
 
-impl<V> LeafNode<V> {
+impl<V: ArcAsyncDrop> LeafNode<V> {
     pub fn new(key: HashValue, value: LeafValue<V>) -> Self {
         Self { key, value }
     }
@@ -59,13 +61,13 @@ impl<V> LeafNode<V> {
     }
 }
 
-impl<V: CryptoHash> LeafNode<V> {
+impl<V: CryptoHash + Send + Sync + 'static> LeafNode<V> {
     pub fn calc_hash(&self) -> HashValue {
         SparseMerkleLeafNode::new(self.key, self.value.hash).hash()
     }
 }
 
-impl<V> From<&SparseMerkleLeafNode> for LeafNode<V>
+impl<V: ArcAsyncDrop> From<&SparseMerkleLeafNode> for LeafNode<V>
 where
     V: CryptoHash,
 {
@@ -78,18 +80,18 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) enum NodeInner<V> {
+pub(crate) enum NodeInner<V: ArcAsyncDrop> {
     Internal(InternalNode<V>),
     Leaf(LeafNode<V>),
 }
 
 #[derive(Debug)]
-pub(crate) struct Node<V> {
+pub(crate) struct Node<V: ArcAsyncDrop> {
     generation: u64,
     inner: NodeInner<V>,
 }
 
-impl<V: CryptoHash> Node<V> {
+impl<V: CryptoHash + Send + Sync + 'static> Node<V> {
     pub fn calc_hash(&self) -> HashValue {
         match &self.inner {
             NodeInner::Internal(internal_node) => internal_node.calc_hash(),
@@ -98,7 +100,7 @@ impl<V: CryptoHash> Node<V> {
     }
 }
 
-impl<V> Node<V> {
+impl<V: ArcAsyncDrop> Node<V> {
     pub fn new_leaf(key: HashValue, value: LeafValue<V>, generation: u64) -> Self {
         Self {
             generation,
@@ -175,7 +177,7 @@ impl<R> Clone for Ref<R> {
 pub(crate) type NodeHandle<V> = Ref<Node<V>>;
 
 #[derive(Clone, Debug)]
-pub(crate) enum SubTree<V> {
+pub(crate) enum SubTree<V: ArcAsyncDrop> {
     Empty,
     NonEmpty {
         hash: HashValue,
@@ -183,7 +185,7 @@ pub(crate) enum SubTree<V> {
     },
 }
 
-impl<V: CryptoHash> SubTree<V> {
+impl<V: CryptoHash + Send + Sync + 'static> SubTree<V> {
     pub fn new_empty() -> Self {
         Self::Empty
     }
@@ -258,13 +260,10 @@ impl<V: CryptoHash> SubTree<V> {
 
     #[cfg(test)]
     pub fn is_unknown(&self) -> bool {
-        matches!(
-            self,
-            Self::NonEmpty {
-                root: NodeHandle::Weak(_),
-                ..
-            }
-        )
+        matches!(self, Self::NonEmpty {
+            root: NodeHandle::Weak(_),
+            ..
+        })
     }
 
     #[cfg(test)]
@@ -274,12 +273,12 @@ impl<V: CryptoHash> SubTree<V> {
 }
 
 #[derive(Clone, Debug)]
-pub struct LeafValue<V> {
+pub struct LeafValue<V: ArcAsyncDrop> {
     pub hash: HashValue,
     pub data: Ref<V>,
 }
 
-impl<V> LeafValue<V> {
+impl<V: ArcAsyncDrop> LeafValue<V> {
     pub fn new_with_value(value: V) -> Self
     where
         V: CryptoHash,

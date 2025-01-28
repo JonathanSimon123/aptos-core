@@ -1,3 +1,4 @@
+{{- if $.Values.backup.enable }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -5,10 +6,10 @@ metadata:
   labels:
     {{- include "backup.labels" . | nindent 4 }}
 data:
-{{ (.Files.Glob "files/backup/*.toml").AsConfig | indent 2 }}
+{{ (.Files.Glob "files/backup/*.yaml").AsConfig | indent 2 }}
 
 ---
-
+{{ $backup_statefulset := lookup "apps/v1" "StatefulSet" $.Release.Namespace (print (include "backup.fullname" .) "-backup")}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -18,7 +19,7 @@ metadata:
     app.kubernetes.io/name: backup
 spec:
   serviceName: {{ include "backup.fullname" . }}-backup
-  replicas: {{ int .Values.backup.enable }}
+  replicas: 1
   podManagementPolicy: Parallel
   selector:
     matchLabels:
@@ -29,42 +30,56 @@ spec:
       labels:
         {{- include "backup.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/name: backup
+        {{- if or $.Values.chain.label $.Values.chain.name }}
+        chain_name: {{ $.Values.chain.label | default $.Values.chain.name }}
+        {{- end}}
       annotations:
-        seccomp.security.alpha.kubernetes.io/pod: runtime/default
+        {{- if $.Values.metrics.destination }}
+        aptos.dev/metrics-destination: {{ $.Values.metrics.destination }}
+        {{- end}}
     spec:
-      terminationGracePeriodSeconds: 0
       containers:
       - name: backup
+        {{- if and $backup_statefulset (not $.Values.manageImages) }} # if the statefulset already exists and we do not want helm to simply overwrite the image, use the existing image
+        image: {{ (first $backup_statefulset.spec.template.spec.containers).image }}
+        {{- else }}
         image: {{ .Values.backup.image.repo }}:{{ .Values.backup.image.tag | default .Values.imageTag }}
+        {{- end }}
         imagePullPolicy: {{ .Values.backup.image.pullPolicy }}
         resources:
           {{- toYaml .Values.backup.resources | nindent 10 }}
-        command: ["/usr/local/bin/db-backup"]
+        command: ["/usr/local/bin/aptos-debugger"]
         args:
-        - "coordinator"
-        - "run"
+        - "aptos-db"
+        - "backup"
+        - "continuously"
         - "--metadata-cache-dir"
         - "/tmp/aptos-backup-metadata"
         - "--backup-service-address"
         - "http://{{ include "backup.backupService" . }}"
         {{- with .Values.backup }}
-        - "--state-snapshot-interval"
-        - "{{ int .config.state_snapshot_interval }}"
+        - "--state-snapshot-interval-epochs"
+        - "{{ int .config.state_snapshot_interval_epochs }}"
         - "--transaction-batch-size"
         - "{{ int .config.transaction_batch_size }}"
-        - "command-adapter"
-        - "--config"
-        - "/opt/aptos/etc/{{ .config.location }}.toml"
+        {{- if .config.concurrent_data_requests }}
+        - "--concurrent-data-requests"
+        - "{{ int .config.concurrent_data_requests }}"
+        {{- end }}
+        - "--command-adapter-config"
+        - "/opt/aptos/etc/{{ .config.location }}.yaml"
         env:
         - name: RUST_LOG
-          value: "debug"
+          value: "info"
         - name: RUST_BACKTRACE
           value: "1"
-        - name: STRUCT_LOG_TCP_ADDR
-          value: {{ include "backup.loggingAddress" $ | quote }}
-        {{- if (include "backup.pushGateway" $) }}
+        {{- if (include "backup.pushMetricsEndpoint" $) }}
+        - name: KUBERNETES_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         - name: PUSH_METRICS_ENDPOINT
-          value: "{{- include "backup.pushGateway" $ }}/metrics/job/{{- .jobName | default "db_backup" }}"
+          value: "{{- include "backup.pushMetricsEndpoint" $ }}/api/v1/import/prometheus?extra_label=role={{- .jobName | default "db_backup" }}&extra_label=kubernetes_pod_name=$(KUBERNETES_POD_NAME)&extra_label=chain_name={{ $.Values.chain.label | default $.Values.chain.name }}"
         {{- end }}
         {{- include "backup.backupEnvironment" (dict "config" .config "era" $.Values.chain.era) | nindent 8 }}
         volumeMounts:
@@ -83,6 +98,8 @@ spec:
         runAsUser: 6180
         runAsGroup: 6180
         fsGroup: 6180
+        seccompProfile:
+          type: RuntimeDefault
       {{- with .nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -107,3 +124,4 @@ spec:
       imagePullSecrets:
       - name: {{.Values.imagePullSecret}}
       {{- end }}
+{{- end }} # if $.Values.backup.enable

@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use mirai_annotations::debug_checked_precondition;
@@ -20,8 +21,8 @@ pub struct ShortHexStr([u8; ShortHexStr::LENGTH]);
 pub struct InputTooShortError;
 
 impl ShortHexStr {
-    pub const SOURCE_LENGTH: usize = 4;
     pub const LENGTH: usize = 2 * ShortHexStr::SOURCE_LENGTH;
+    pub const SOURCE_LENGTH: usize = 4;
 
     /// Format a new `ShortHexStr` from a byte slice.
     ///
@@ -82,15 +83,15 @@ const HEX_CHARS_LOWER: &[u8; 16] = b"0123456789abcdef";
 /// the second character as ASCII bytes.
 #[inline(always)]
 fn byte2hex(byte: u8) -> (u8, u8) {
-    #[allow(clippy::integer_arithmetic)] // X >> 4 is valid for all bytes
-    let hi = HEX_CHARS_LOWER[((byte >> 4) & 0x0f) as usize];
-    let lo = HEX_CHARS_LOWER[(byte & 0x0f) as usize];
+    #[allow(clippy::arithmetic_side_effects)] // X >> 4 is valid for all bytes
+    let hi = HEX_CHARS_LOWER[((byte >> 4) & 0x0F) as usize];
+    let lo = HEX_CHARS_LOWER[(byte & 0x0F) as usize];
     (hi, lo)
 }
 
 /// Hex encode a byte slice into the destination byte slice.
 #[inline(always)]
-#[allow(clippy::integer_arithmetic)] // debug only assertion
+#[allow(clippy::arithmetic_side_effects)] // debug only assertion
 fn hex_encode(src: &[u8], dst: &mut [u8]) {
     debug_checked_precondition!(dst.len() == 2 * src.len());
 
@@ -129,7 +130,7 @@ mod test {
 
     #[test]
     fn test_hex_encode() {
-        let src = [0x12_u8, 0x34, 0xfe, 0xba];
+        let src = [0x12_u8, 0x34, 0xFE, 0xBA];
         let mut actual = [0u8; 8];
         hex_encode(&src, &mut actual);
         let expected = b"1234feba";

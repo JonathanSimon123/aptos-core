@@ -1,5 +1,6 @@
 #!/bin/bash
-# Copyright (c) Aptos
+# Copyright © Aptos Foundation
+# Parts of the project are originally copyright © Meta Platforms, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
 set -e
@@ -73,11 +74,11 @@ done
 for rev in $(git rev-list $oldrev..$newrev); do
 	comparison=$(git rev-parse --quiet --verify $rev^ || true)
 
-	whitespace=$(git diff --check $comparison $rev || true)
+	whitespace=$(git diff --check $comparison $rev  -- . ':!*.exp' || true)
 	if [[ $whitespace ]] ; then
 		echo "Found whitespace errors in commit $rev:"
 		echo
-		git diff --check $comparison $rev
+		git diff --check $comparison $rev -- . ':!*.exp'
 		exit 1
 	fi
 done

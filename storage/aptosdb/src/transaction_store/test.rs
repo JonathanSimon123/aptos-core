@@ -1,15 +1,14 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::redundant_clone)] // Required to work around prop_assert_eq! limitations
+
 use super::*;
-use crate::AptosDB;
+use crate::{ledger_db::transaction_db_test::init_db, AptosDB};
 use aptos_proptest_helpers::Index;
 use aptos_temppath::TempPath;
-use aptos_types::{
-    block_metadata::BlockMetadata,
-    proptest_types::{AccountInfoUniverse, SignatureCheckedTransactionGen},
-    transaction::{SignedTransaction, Transaction},
-};
+use aptos_types::proptest_types::{AccountInfoUniverse, SignatureCheckedTransactionGen};
 use proptest::{collection::vec, prelude::*};
 use std::collections::BTreeMap;
 
@@ -19,33 +18,20 @@ proptest! {
     #[test]
     fn test_put_get(
         universe in any_with::<AccountInfoUniverse>(3),
-        gens_and_write_sets in vec(
-            ((any::<Index>(), any::<SignatureCheckedTransactionGen>()), any::<WriteSet>()),
+        gens in vec(
+            (any::<Index>(), any::<SignatureCheckedTransactionGen>()),
             1..10
         ),
     ) {
         let tmp_dir = TempPath::new();
         let db = AptosDB::new_for_test(&tmp_dir);
         let store = &db.transaction_store;
-        let (gens, write_sets):(Vec<_>, Vec<_>) = gens_and_write_sets.into_iter().unzip();
-        let txns = init_store(universe, gens, store);
-
-        // write sets
-        let mut cs = ChangeSet::new();
-        for (ver, ws) in write_sets.iter().enumerate() {
-            store.put_write_set(ver as Version, ws, &mut cs).unwrap();
-        }
-        store.db.write_schemas(cs.batch).unwrap();
-        assert_eq!(store.get_write_sets(0, write_sets.len() as Version).unwrap(), write_sets);
-
-        assert_eq!(store.get_first_txn_version().unwrap(), Some(0));
-        assert_eq!(store.get_first_write_set_version().unwrap(), Some(0));
+        let txns = init_db(universe, gens, db.ledger_db.transaction_db());
 
         let ledger_version = txns.len() as Version - 1;
-        for (ver, (txn, write_set)) in itertools::zip_eq(txns.iter(), write_sets.iter()).enumerate() {
-            prop_assert_eq!(store.get_transaction(ver as Version).unwrap(), txn.clone());
+        for (ver, txn) in txns.iter().enumerate() {
             let user_txn = txn
-                .as_signed_user_txn()
+                .try_as_signed_user_txn()
                 .expect("All should be user transactions here.");
             prop_assert_eq!(
                 store
@@ -57,112 +43,6 @@ proptest! {
                     .unwrap(),
                 Some(ver as Version)
             );
-            prop_assert_eq!(store.get_write_set(ver as Version).unwrap(), write_set.clone());
-        }
-
-        prop_assert!(store.get_transaction(ledger_version + 1).is_err());
-        prop_assert!(store.get_write_set(ledger_version + 1).is_err());
-    }
-
-    #[test]
-    fn test_get_transaction_iter(
-        universe in any_with::<AccountInfoUniverse>(3),
-        gens in vec(
-            (any::<Index>(), any::<SignatureCheckedTransactionGen>()),
-            1..10
-        ),
-    ) {
-        let tmp_dir = TempPath::new();
-        let db = AptosDB::new_for_test(&tmp_dir);
-        let store = &db.transaction_store;
-        let txns = init_store(universe, gens, store);
-
-        let total_num_txns = txns.len();
-
-        let actual = store
-            .get_transaction_iter(0, total_num_txns)
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        prop_assert_eq!(actual, txns.clone());
-
-        let actual = store
-            .get_transaction_iter(0, total_num_txns + 1)
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        prop_assert_eq!(actual, txns.clone());
-
-        let actual = store
-            .get_transaction_iter(0, 0)
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        prop_assert!(actual.is_empty());
-
-        if total_num_txns > 0 {
-            let actual = store
-                .get_transaction_iter(0, total_num_txns - 1)
-                .unwrap()
-                .collect::<Result<Vec<_>>>()
-                .unwrap();
-            prop_assert_eq!(
-                actual,
-                txns
-                    .into_iter()
-                    .take(total_num_txns as usize - 1)
-                    .collect::<Vec<_>>()
-            );
-        }
-
-        prop_assert!(store.get_transaction_iter(10, usize::max_value()).is_err());
-    }
-
-    #[test]
-    fn test_get_block_metadata(
-        txns in vec(
-            prop_oneof![
-                any::<BlockMetadata>().prop_map(Transaction::BlockMetadata),
-                any::<SignedTransaction>().prop_map(Transaction::UserTransaction),
-            ],
-            1..100,
-        )
-    ) {
-        let tmp_dir = TempPath::new();
-        let db = AptosDB::new_for_test(&tmp_dir);
-        let store = &db.transaction_store;
-
-        let mut cs = ChangeSet::new();
-        for (ver, txn) in txns.iter().enumerate() {
-            store
-                .put_transaction(ver as Version, txn, &mut cs)
-                .unwrap();
-        }
-        store.db.write_schemas(cs.batch).unwrap();
-
-        let mut timestamp = 0;
-        let mut block_meta_ver = 0;
-        let mut seen_any_block = false;
-        for (ver, txn) in txns.into_iter().enumerate() {
-            if let Transaction::BlockMetadata(b) = txn {
-                timestamp = b.timestamp_usecs();
-                block_meta_ver = ver as Version;
-                seen_any_block = true;
-            }
-            let block_meta_opt = store.get_block_metadata(ver as Version).unwrap();
-            if seen_any_block {
-                let (v, block_meta) = block_meta_opt.unwrap();
-                prop_assert_eq!(
-                    v,
-                    block_meta_ver
-                );
-                prop_assert_eq!(
-                    block_meta.timestamp_usecs(),
-                    timestamp
-                );
-            } else {
-                prop_assert!(block_meta_opt.is_none());
-            }
         }
     }
 
@@ -180,12 +60,12 @@ proptest! {
         let tmp_dir = TempPath::new();
         let db = AptosDB::new_for_test(&tmp_dir);
         let store = &db.transaction_store;
-        let txns = init_store(universe, gens, store);
+        let txns = init_db(universe, gens, db.ledger_db.transaction_db());
 
         let txns = txns
             .iter()
             .enumerate()
-            .map(|(version, txn)| (version as u64, txn.as_signed_user_txn().unwrap()))
+            .map(|(version, txn)| (version as u64, txn.try_as_signed_user_txn().unwrap()))
             .collect::<Vec<_>>();
 
         // can we just get all the account transaction versions individually
@@ -248,27 +128,4 @@ proptest! {
 
         prop_assert_eq!(&actual_scan, &expected_scan);
     }
-}
-
-fn init_store(
-    mut universe: AccountInfoUniverse,
-    gens: Vec<(Index, SignatureCheckedTransactionGen)>,
-    store: &TransactionStore,
-) -> Vec<Transaction> {
-    let txns = gens
-        .into_iter()
-        .map(|(index, gen)| {
-            Transaction::UserTransaction(gen.materialize(*index, &mut universe).into_inner())
-        })
-        .collect::<Vec<_>>();
-
-    assert!(store.get_transaction(0).is_err());
-
-    let mut cs = ChangeSet::new();
-    for (ver, txn) in txns.iter().enumerate() {
-        store.put_transaction(ver as Version, txn, &mut cs).unwrap();
-    }
-    store.db.write_schemas(cs.batch).unwrap();
-
-    txns
 }

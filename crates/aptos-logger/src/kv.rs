@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Key-Value definitions for macros
@@ -12,10 +13,7 @@
 //! ```
 
 use serde::Serialize;
-use std::{
-    borrow::{Borrow, Cow},
-    fmt,
-};
+use std::{borrow::Cow, fmt};
 
 /// The key part of a logging key value pair e.g. `info!(key = value)`
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -31,7 +29,7 @@ impl Key {
     }
 
     pub fn as_str(&self) -> &'_ Self {
-        self.borrow()
+        self
     }
 }
 
@@ -50,7 +48,7 @@ impl<'v> fmt::Debug for Value<'v> {
             Value::Display(d) => fmt::Display::fmt(d, f),
             Value::Serde(s) => {
                 fmt::Debug::fmt(&serde_json::to_value(s).map_err(|_| fmt::Error)?, f)
-            }
+            },
         }
     }
 }

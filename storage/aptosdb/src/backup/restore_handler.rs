@@ -1,51 +1,41 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    backup::restore_utils, event_store::EventStore, ledger_store::LedgerStore,
-    state_store::StateStore, transaction_store::TransactionStore, AptosDB,
+    backup::restore_utils,
+    ledger_db::LedgerDb,
+    schema::db_metadata::{DbMetadataKey, DbMetadataSchema},
+    state_restore::{StateSnapshotRestore, StateSnapshotRestoreMode},
+    state_store::StateStore,
+    AptosDB,
 };
-use anyhow::Result;
-use aptos_crypto::{hash::SPARSE_MERKLE_PLACEHOLDER_HASH, HashValue};
-use aptos_jellyfish_merkle::restore::StateSnapshotRestore;
+use aptos_crypto::HashValue;
+use aptos_storage_interface::{DbReader, Result};
 use aptos_types::{
     contract_event::ContractEvent,
     ledger_info::LedgerInfoWithSignatures,
     proof::definition::LeafCount,
-    state_store::{state_key::StateKey, state_value::StateKeyAndValue},
-    transaction::{Transaction, TransactionInfo, Version, PRE_GENESIS_VERSION},
+    state_store::{state_key::StateKey, state_value::StateValue},
+    transaction::{Transaction, TransactionInfo, Version},
+    write_set::WriteSet,
 };
-use schemadb::DB;
 use std::sync::Arc;
-use storage_interface::{DbReader, TreeState};
 
 /// Provides functionalities for AptosDB data restore.
 #[derive(Clone)]
 pub struct RestoreHandler {
-    db: Arc<DB>,
     pub aptosdb: Arc<AptosDB>,
-    ledger_store: Arc<LedgerStore>,
-    transaction_store: Arc<TransactionStore>,
     state_store: Arc<StateStore>,
-    event_store: Arc<EventStore>,
+    ledger_db: Arc<LedgerDb>,
 }
 
 impl RestoreHandler {
-    pub(crate) fn new(
-        db: Arc<DB>,
-        aptosdb: Arc<AptosDB>,
-        ledger_store: Arc<LedgerStore>,
-        transaction_store: Arc<TransactionStore>,
-        state_store: Arc<StateStore>,
-        event_store: Arc<EventStore>,
-    ) -> Self {
+    pub(crate) fn new(aptosdb: Arc<AptosDB>, state_store: Arc<StateStore>) -> Self {
         Self {
-            db,
+            ledger_db: Arc::clone(&aptosdb.ledger_db),
             aptosdb,
-            ledger_store,
-            transaction_store,
             state_store,
-            event_store,
         }
     }
 
@@ -53,16 +43,24 @@ impl RestoreHandler {
         &self,
         version: Version,
         expected_root_hash: HashValue,
-    ) -> Result<StateSnapshotRestore<StateKey, StateKeyAndValue>> {
-        StateSnapshotRestore::new_overwrite(
-            Arc::clone(&self.state_store),
+        restore_mode: StateSnapshotRestoreMode,
+    ) -> Result<StateSnapshotRestore<StateKey, StateValue>> {
+        StateSnapshotRestore::new(
+            &self.state_store.state_merkle_db,
+            &self.state_store,
             version,
             expected_root_hash,
+            true, /* async_commit */
+            restore_mode,
         )
     }
 
+    pub fn reset_state_store(&self) {
+        self.state_store.reset();
+    }
+
     pub fn save_ledger_infos(&self, ledger_infos: &[LedgerInfoWithSignatures]) -> Result<()> {
-        restore_utils::save_ledger_infos(self.db.clone(), self.ledger_store.clone(), ledger_infos)
+        restore_utils::save_ledger_infos(self.aptosdb.ledger_db.metadata_db(), ledger_infos, None)
     }
 
     pub fn confirm_or_save_frozen_subtrees(
@@ -70,7 +68,12 @@ impl RestoreHandler {
         num_leaves: LeafCount,
         frozen_subtrees: &[HashValue],
     ) -> Result<()> {
-        restore_utils::confirm_or_save_frozen_subtrees(self.db.clone(), num_leaves, frozen_subtrees)
+        restore_utils::confirm_or_save_frozen_subtrees(
+            self.aptosdb.ledger_db.transaction_accumulator_db_raw(),
+            num_leaves,
+            frozen_subtrees,
+            None,
+        )
     }
 
     pub fn save_transactions(
@@ -79,42 +82,68 @@ impl RestoreHandler {
         txns: &[Transaction],
         txn_infos: &[TransactionInfo],
         events: &[Vec<ContractEvent>],
+        write_sets: Vec<WriteSet>,
     ) -> Result<()> {
         restore_utils::save_transactions(
-            self.db.clone(),
-            self.ledger_store.clone(),
-            self.transaction_store.clone(),
-            self.event_store.clone(),
+            self.state_store.clone(),
+            self.ledger_db.clone(),
             first_version,
             txns,
             txn_infos,
             events,
+            write_sets,
+            None,
+            false,
         )
     }
 
-    pub fn get_tree_state(&self, version: Option<Version>) -> Result<TreeState> {
-        let num_transactions: LeafCount = version.map_or(0, |v| v + 1);
-        let frozen_subtrees = self
-            .ledger_store
-            .get_frozen_subtree_hashes(num_transactions)?;
-        let state_root_hash = match version {
-            None => self
-                .state_store
-                .get_root_hash_option(PRE_GENESIS_VERSION)?
-                .unwrap_or(*SPARSE_MERKLE_PLACEHOLDER_HASH),
-            Some(ver) => self.state_store.get_root_hash(ver)?,
-        };
-        Ok(TreeState::new_at_state_checkpoint(
-            num_transactions,
-            frozen_subtrees,
-            state_root_hash,
-        ))
+    pub fn force_state_version_for_kv_restore(&self, version: Option<Version>) -> Result<()> {
+        self.state_store.init_state_ignoring_summary(version)
+    }
+
+    pub fn save_transactions_and_replay_kv(
+        &self,
+        first_version: Version,
+        txns: &[Transaction],
+        txn_infos: &[TransactionInfo],
+        events: &[Vec<ContractEvent>],
+        write_sets: Vec<WriteSet>,
+    ) -> Result<()> {
+        restore_utils::save_transactions(
+            self.state_store.clone(),
+            self.ledger_db.clone(),
+            first_version,
+            txns,
+            txn_infos,
+            events,
+            write_sets,
+            None,
+            true,
+        )
     }
 
     pub fn get_next_expected_transaction_version(&self) -> Result<Version> {
-        Ok(self
-            .aptosdb
-            .get_latest_transaction_info_option()?
-            .map_or(0, |(ver, _txn_info)| ver + 1))
+        Ok(self.aptosdb.get_synced_version()?.map_or(0, |ver| ver + 1))
+    }
+
+    pub fn get_state_snapshot_before(
+        &self,
+        version: Version,
+    ) -> Result<Option<(Version, HashValue)>> {
+        self.aptosdb
+            .get_state_snapshot_before(version)
+            .map_err(Into::into)
+    }
+
+    pub fn get_in_progress_state_kv_snapshot_version(&self) -> Result<Option<Version>> {
+        let db = self.aptosdb.state_kv_db.metadata_db_arc();
+        let mut iter = db.iter::<DbMetadataSchema>()?;
+        iter.seek_to_first();
+        while let Some((k, _v)) = iter.next().transpose()? {
+            if let DbMetadataKey::StateSnapshotKvRestoreProgress(version) = k {
+                return Ok(Some(version));
+            }
+        }
+        Ok(None)
     }
 }

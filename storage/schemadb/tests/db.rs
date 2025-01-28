@@ -1,14 +1,17 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use byteorder::{LittleEndian, ReadBytesExt};
-use proptest::{collection::vec, prelude::*};
-use schemadb::{
+use aptos_schemadb::{
+    batch::SchemaBatch,
     define_schema,
     schema::{KeyCodec, Schema, ValueCodec},
-    ColumnFamilyName, SchemaBatch, DB, DEFAULT_CF_NAME,
+    ColumnFamilyName, DB,
 };
+use aptos_storage_interface::AptosDbError;
+use byteorder::{LittleEndian, ReadBytesExt};
+use rocksdb::{ColumnFamilyDescriptor, DEFAULT_COLUMN_FAMILY_NAME};
 
 // Creating two schemas that share exactly the same structure but are stored in different column
 // families. Also note that the key and value are of the same type `TestField`. By implementing
@@ -73,36 +76,38 @@ impl ValueCodec<TestSchema2> for TestField {
 
 fn get_column_families() -> Vec<ColumnFamilyName> {
     vec![
-        DEFAULT_CF_NAME,
+        DEFAULT_COLUMN_FAMILY_NAME,
         TestSchema1::COLUMN_FAMILY_NAME,
         TestSchema2::COLUMN_FAMILY_NAME,
     ]
+}
+
+fn get_cfds() -> Vec<ColumnFamilyDescriptor> {
+    get_column_families()
+        .iter()
+        .map(|cf_name| ColumnFamilyDescriptor::new(*cf_name, rocksdb::Options::default()))
+        .collect()
 }
 
 fn open_db(dir: &aptos_temppath::TempPath) -> DB {
     let mut db_opts = rocksdb::Options::default();
     db_opts.create_if_missing(true);
     db_opts.create_missing_column_families(true);
-    DB::open(&dir.path(), "test", get_column_families(), &db_opts).expect("Failed to open DB.")
+    DB::open(dir.path(), "test", get_column_families(), &db_opts).expect("Failed to open DB.")
 }
 
 fn open_db_read_only(dir: &aptos_temppath::TempPath) -> DB {
-    DB::open_readonly(
-        &dir.path(),
-        "test",
-        get_column_families(),
-        &rocksdb::Options::default(),
-    )
-    .expect("Failed to open DB.")
+    DB::open_cf_readonly(&rocksdb::Options::default(), dir.path(), "test", get_cfds())
+        .expect("Failed to open DB.")
 }
 
 fn open_db_as_secondary(dir: &aptos_temppath::TempPath, dir_sec: &aptos_temppath::TempPath) -> DB {
-    DB::open_as_secondary(
-        &dir.path(),
-        &dir_sec.path(),
-        "test",
-        get_column_families(),
+    DB::open_cf_as_secondary(
         &rocksdb::Options::default(),
+        dir.path(),
+        dir_sec.path(),
+        "test",
+        get_cfds(),
     )
     .expect("Failed to open DB.")
 }
@@ -172,94 +177,10 @@ fn test_schema_put_get() {
     );
 }
 
-fn test_schemabatch_delete_range_util(begin: u32, end: u32, is_inclusive: bool) {
-    let db = TestDB::new();
-    let mut db_batch = SchemaBatch::new();
-    for i in 0..100u32 {
-        db_batch
-            .put::<TestSchema1>(&TestField(i), &TestField(i))
-            .unwrap();
-    }
-    let mut should_exist_vec = [true; 100];
-
-    db_batch
-        .delete_range::<TestSchema1>(&TestField(begin), &TestField(end))
-        .unwrap();
-    if !is_inclusive {
-        for i in begin..end {
-            should_exist_vec[i as usize] = false;
-        }
-    } else {
-        for i in begin..=end {
-            should_exist_vec[i as usize] = false;
-        }
-    }
-    db.write_schemas(db_batch).unwrap();
-    for (i, should_exist) in should_exist_vec.iter().enumerate() {
-        assert_eq!(
-            db.get::<TestSchema1>(&TestField(i as u32))
-                .unwrap()
-                .is_some(),
-            *should_exist,
-        )
-    }
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(10))]
-
-    #[test]
-    fn test_schemabatch_delete_range(
-        ranges_to_delete in vec(
-            (0..100u32).prop_flat_map(|begin| (Just(begin), (begin..100u32))), 0..10)
-    ) {
-        for (begin, end) in ranges_to_delete {
-            test_schemabatch_delete_range_util(begin, end, false);
-        }
-    }
-
-    #[test]
-    fn test_schemabatch_delete_range_inclusive(
-        ranges_to_delete in vec(
-            (0..100u32).prop_flat_map(|begin| (Just(begin), (begin..100u32))), 0..10)
-    ) {
-         for (begin, end) in ranges_to_delete {
-            test_schemabatch_delete_range_util(begin, end, false);
-        }
-    }
-
-    #[test]
-    fn test_schema_range_delete(
-        ranges_to_delete in vec(
-            (0..100u32).prop_flat_map(|begin| (Just(begin), (begin..100u32))), 0..10)
-    ) {
-        let db = TestDB::new();
-        for i in 0..100u32 {
-            db.put::<TestSchema1>(&TestField(i), &TestField(i)).unwrap();
-        }
-        let mut should_exist_vec = [true; 100];
-        for (begin, end) in ranges_to_delete {
-            db.range_delete::<TestSchema1, TestField>(&TestField(begin), &TestField(end)).unwrap();
-            for i in begin..end {
-                should_exist_vec[i as usize] = false;
-            }
-        }
-
-        for (i, should_exist) in should_exist_vec.iter().enumerate() {
-            assert_eq!(
-                db.get::<TestSchema1>(&TestField(i as u32)).unwrap().is_some(),
-                *should_exist,
-            )
-        }
-    }
-}
-
 fn collect_values<S: Schema>(db: &TestDB) -> Vec<(S::Key, S::Value)> {
-    let mut iter = db
-        .iter::<S>(Default::default())
-        .expect("Failed to create iterator.");
+    let mut iter = db.iter::<S>().expect("Failed to create iterator.");
     iter.seek_to_first();
-    iter.collect::<Result<Vec<_>>>().unwrap()
+    iter.collect::<Result<Vec<_>, AptosDbError>>().unwrap()
 }
 
 fn gen_expected_values(values: &[(u32, u32)]) -> Vec<(TestField, TestField)> {
@@ -420,7 +341,8 @@ fn test_report_size() {
         db.write_schemas(db_batch).unwrap();
     }
 
-    db.flush_all().unwrap();
+    db.flush_cf("TestCF1").unwrap();
+    db.flush_cf("TestCF2").unwrap();
 
     assert!(
         db.get_property("TestCF1", "rocksdb.estimate-live-data-size")
@@ -467,4 +389,18 @@ fn test_checkpoint() {
         );
         assert_eq!(db.get::<TestSchema1>(&TestField(1)).unwrap(), None);
     }
+}
+
+#[test]
+fn test_unrecognised_column_family() {
+    let tmpdir = aptos_temppath::TempPath::new();
+
+    let mut opts = rocksdb::Options::default();
+    opts.create_if_missing(true);
+    opts.create_missing_column_families(true);
+
+    let db = DB::open(tmpdir.path(), "test", vec!["cf1", "cf2"], &opts).unwrap();
+    drop(db);
+
+    DB::open(tmpdir.path(), "test", vec!["cf1"], &opts).unwrap();
 }
