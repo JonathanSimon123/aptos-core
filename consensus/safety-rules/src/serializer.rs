@@ -1,19 +1,21 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{counters, logging::LogEntry, ConsensusState, Error, SafetyRules, TSafetyRules};
-use aptos_crypto::ed25519::Ed25519Signature;
+use aptos_consensus_types::{
+    block_data::BlockData,
+    order_vote::OrderVote,
+    order_vote_proposal::OrderVoteProposal,
+    timeout_2chain::{TwoChainTimeout, TwoChainTimeoutCertificate},
+    vote::Vote,
+    vote_proposal::VoteProposal,
+};
+use aptos_crypto::bls12381;
 use aptos_infallible::RwLock;
 use aptos_types::{
     epoch_change::EpochChangeProof,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-};
-use consensus_types::{
-    block_data::BlockData,
-    timeout::Timeout,
-    timeout_2chain::{TwoChainTimeout, TwoChainTimeoutCertificate},
-    vote::Vote,
-    vote_proposal::MaybeSignedVoteProposal,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -22,17 +24,13 @@ use std::sync::Arc;
 pub enum SafetyRulesInput {
     ConsensusState,
     Initialize(Box<EpochChangeProof>),
-    ConstructAndSignVote(Box<MaybeSignedVoteProposal>),
     SignProposal(Box<BlockData>),
-    SignTimeout(Box<Timeout>),
     SignTimeoutWithQC(
         Box<TwoChainTimeout>,
         Box<Option<TwoChainTimeoutCertificate>>,
     ),
-    ConstructAndSignVoteTwoChain(
-        Box<MaybeSignedVoteProposal>,
-        Box<Option<TwoChainTimeoutCertificate>>,
-    ),
+    ConstructAndSignVoteTwoChain(Box<VoteProposal>, Box<Option<TwoChainTimeoutCertificate>>),
+    ConstructAndSignOrderVote(Box<OrderVoteProposal>),
     SignCommitVote(Box<LedgerInfoWithSignatures>, Box<LedgerInfo>),
 }
 
@@ -51,17 +49,11 @@ impl SerializerService {
         let output = match input {
             SafetyRulesInput::ConsensusState => {
                 serde_json::to_vec(&self.internal.consensus_state())
-            }
+            },
             SafetyRulesInput::Initialize(li) => serde_json::to_vec(&self.internal.initialize(&li)),
-            SafetyRulesInput::ConstructAndSignVote(vote_proposal) => {
-                serde_json::to_vec(&self.internal.construct_and_sign_vote(&vote_proposal))
-            }
             SafetyRulesInput::SignProposal(block_data) => {
                 serde_json::to_vec(&self.internal.sign_proposal(&block_data))
-            }
-            SafetyRulesInput::SignTimeout(timeout) => {
-                serde_json::to_vec(&self.internal.sign_timeout(&timeout))
-            }
+            },
             SafetyRulesInput::SignTimeoutWithQC(timeout, maybe_tc) => serde_json::to_vec(
                 &self
                     .internal
@@ -74,7 +66,12 @@ impl SerializerService {
                         maybe_tc.as_ref().as_ref(),
                     ),
                 )
-            }
+            },
+            SafetyRulesInput::ConstructAndSignOrderVote(order_vote_proposal) => serde_json::to_vec(
+                &self
+                    .internal
+                    .construct_and_sign_order_vote(&order_vote_proposal),
+            ),
             SafetyRulesInput::SignCommitVote(ledger_info, new_ledger_info) => serde_json::to_vec(
                 &self
                     .internal
@@ -118,27 +115,10 @@ impl TSafetyRules for SerializerClient {
         serde_json::from_slice(&response)?
     }
 
-    fn construct_and_sign_vote(
-        &mut self,
-        vote_proposal: &MaybeSignedVoteProposal,
-    ) -> Result<Vote, Error> {
-        let _timer = counters::start_timer("external", LogEntry::ConstructAndSignVote.as_str());
-        let response = self.request(SafetyRulesInput::ConstructAndSignVote(Box::new(
-            vote_proposal.clone(),
-        )))?;
-        serde_json::from_slice(&response)?
-    }
-
-    fn sign_proposal(&mut self, block_data: &BlockData) -> Result<Ed25519Signature, Error> {
+    fn sign_proposal(&mut self, block_data: &BlockData) -> Result<bls12381::Signature, Error> {
         let _timer = counters::start_timer("external", LogEntry::SignProposal.as_str());
         let response =
             self.request(SafetyRulesInput::SignProposal(Box::new(block_data.clone())))?;
-        serde_json::from_slice(&response)?
-    }
-
-    fn sign_timeout(&mut self, timeout: &Timeout) -> Result<Ed25519Signature, Error> {
-        let _timer = counters::start_timer("external", LogEntry::SignTimeout.as_str());
-        let response = self.request(SafetyRulesInput::SignTimeout(Box::new(timeout.clone())))?;
         serde_json::from_slice(&response)?
     }
 
@@ -146,7 +126,7 @@ impl TSafetyRules for SerializerClient {
         &mut self,
         timeout: &TwoChainTimeout,
         timeout_cert: Option<&TwoChainTimeoutCertificate>,
-    ) -> Result<Ed25519Signature, Error> {
+    ) -> Result<bls12381::Signature, Error> {
         let _timer = counters::start_timer("external", LogEntry::SignTimeoutWithQC.as_str());
         let response = self.request(SafetyRulesInput::SignTimeoutWithQC(
             Box::new(timeout.clone()),
@@ -157,7 +137,7 @@ impl TSafetyRules for SerializerClient {
 
     fn construct_and_sign_vote_two_chain(
         &mut self,
-        vote_proposal: &MaybeSignedVoteProposal,
+        vote_proposal: &VoteProposal,
         timeout_cert: Option<&TwoChainTimeoutCertificate>,
     ) -> Result<Vote, Error> {
         let _timer =
@@ -169,11 +149,23 @@ impl TSafetyRules for SerializerClient {
         serde_json::from_slice(&response)?
     }
 
+    fn construct_and_sign_order_vote(
+        &mut self,
+        order_vote_proposal: &OrderVoteProposal,
+    ) -> Result<OrderVote, Error> {
+        let _timer =
+            counters::start_timer("external", LogEntry::ConstructAndSignOrderVote.as_str());
+        let response = self.request(SafetyRulesInput::ConstructAndSignOrderVote(Box::new(
+            order_vote_proposal.clone(),
+        )))?;
+        serde_json::from_slice(&response)?
+    }
+
     fn sign_commit_vote(
         &mut self,
         ledger_info: LedgerInfoWithSignatures,
         new_ledger_info: LedgerInfo,
-    ) -> Result<Ed25519Signature, Error> {
+    ) -> Result<bls12381::Signature, Error> {
         let _timer = counters::start_timer("external", LogEntry::SignCommitVote.as_str());
         let response = self.request(SafetyRulesInput::SignCommitVote(
             Box::new(ledger_info),

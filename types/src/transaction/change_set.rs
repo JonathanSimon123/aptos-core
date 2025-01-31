@@ -1,10 +1,11 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{contract_event::ContractEvent, write_set::WriteSet};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChangeSet {
     write_set: WriteSet,
     events: Vec<ContractEvent>,
@@ -13,6 +14,13 @@ pub struct ChangeSet {
 impl ChangeSet {
     pub fn new(write_set: WriteSet, events: Vec<ContractEvent>) -> Self {
         Self { write_set, events }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            write_set: WriteSet::default(),
+            events: vec![],
+        }
     }
 
     pub fn into_inner(self) -> (WriteSet, Vec<ContractEvent>) {

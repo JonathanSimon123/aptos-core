@@ -1,25 +1,48 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #[cfg(test)]
 mod consensusdb_test;
 mod schema;
 
-use crate::{
-    consensusdb::schema::{
-        block::BlockSchema,
-        quorum_certificate::QCSchema,
-        single_entry::{SingleEntryKey, SingleEntrySchema},
-    },
-    error::DbError,
-};
+use crate::error::DbError;
 use anyhow::Result;
+use aptos_consensus_types::{block::Block, quorum_cert::QuorumCert};
 use aptos_crypto::HashValue;
 use aptos_logger::prelude::*;
-use consensus_types::{block::Block, quorum_cert::QuorumCert};
-use schema::{BLOCK_CF_NAME, QC_CF_NAME, SINGLE_ENTRY_CF_NAME};
-use schemadb::{Options, ReadOptions, SchemaBatch, DB, DEFAULT_CF_NAME};
-use std::{collections::HashMap, iter::Iterator, path::Path, time::Instant};
+use aptos_schemadb::{batch::SchemaBatch, schema::Schema, Options, DB, DEFAULT_COLUMN_FAMILY_NAME};
+use aptos_storage_interface::AptosDbError;
+pub use schema::{
+    block::BlockSchema,
+    dag::{CertifiedNodeSchema, DagVoteSchema, NodeSchema},
+    quorum_certificate::QCSchema,
+};
+use schema::{
+    single_entry::{SingleEntryKey, SingleEntrySchema},
+    BLOCK_CF_NAME, CERTIFIED_NODE_CF_NAME, DAG_VOTE_CF_NAME, NODE_CF_NAME, QC_CF_NAME,
+    SINGLE_ENTRY_CF_NAME,
+};
+use std::{iter::Iterator, path::Path, time::Instant};
+
+/// The name of the consensus db file
+pub const CONSENSUS_DB_NAME: &str = "consensus_db";
+
+/// Creates new physical DB checkpoint in directory specified by `checkpoint_path`.
+pub fn create_checkpoint<P: AsRef<Path> + Clone>(db_path: P, checkpoint_path: P) -> Result<()> {
+    let start = Instant::now();
+    let consensus_db_checkpoint_path = checkpoint_path.as_ref().join(CONSENSUS_DB_NAME);
+    std::fs::remove_dir_all(&consensus_db_checkpoint_path).unwrap_or(());
+    ConsensusDB::new(db_path)
+        .db
+        .create_checkpoint(&consensus_db_checkpoint_path)?;
+    info!(
+        path = consensus_db_checkpoint_path,
+        time_ms = %start.elapsed().as_millis(),
+        "Made ConsensusDB checkpoint."
+    );
+    Ok(())
+}
 
 pub struct ConsensusDB {
     db: DB,
@@ -28,13 +51,17 @@ pub struct ConsensusDB {
 impl ConsensusDB {
     pub fn new<P: AsRef<Path> + Clone>(db_root_path: P) -> Self {
         let column_families = vec![
-            /* UNUSED CF = */ DEFAULT_CF_NAME,
+            /* UNUSED CF = */ DEFAULT_COLUMN_FAMILY_NAME,
             BLOCK_CF_NAME,
             QC_CF_NAME,
             SINGLE_ENTRY_CF_NAME,
+            NODE_CF_NAME,
+            CERTIFIED_NODE_CF_NAME,
+            DAG_VOTE_CF_NAME,
+            "ordered_anchor_id", // deprecated CF
         ];
 
-        let path = db_root_path.as_ref().join("consensusdb");
+        let path = db_root_path.as_ref().join(CONSENSUS_DB_NAME);
         let instant = Instant::now();
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -56,43 +83,27 @@ impl ConsensusDB {
     ) -> Result<(
         Option<Vec<u8>>,
         Option<Vec<u8>>,
-        Option<Vec<u8>>,
         Vec<Block>,
         Vec<QuorumCert>,
     )> {
         let last_vote = self.get_last_vote()?;
-        let highest_timeout_certificate = self.get_highest_timeout_certificate()?;
         let highest_2chain_timeout_certificate = self.get_highest_2chain_timeout_certificate()?;
         let consensus_blocks = self
-            .get_blocks()?
+            .get_all::<BlockSchema>()?
             .into_iter()
-            .map(|(_block_hash, block_content)| block_content)
-            .collect::<Vec<_>>();
+            .map(|(_, block)| block)
+            .collect();
         let consensus_qcs = self
-            .get_quorum_certificates()?
+            .get_all::<QCSchema>()?
             .into_iter()
-            .map(|(_block_hash, qc)| qc)
-            .collect::<Vec<_>>();
+            .map(|(_, qc)| qc)
+            .collect();
         Ok((
             last_vote,
-            highest_timeout_certificate,
             highest_2chain_timeout_certificate,
             consensus_blocks,
             consensus_qcs,
         ))
-    }
-
-    pub fn save_highest_timeout_certificate(
-        &self,
-        highest_timeout_certificate: Vec<u8>,
-    ) -> Result<(), DbError> {
-        let mut batch = SchemaBatch::new();
-        batch.put::<SingleEntrySchema>(
-            &SingleEntryKey::HighestTimeoutCertificate,
-            &highest_timeout_certificate,
-        )?;
-        self.commit(batch)?;
-        Ok(())
     }
 
     pub fn save_highest_2chain_timeout_certificate(&self, tc: Vec<u8>) -> Result<(), DbError> {
@@ -104,7 +115,7 @@ impl ConsensusDB {
 
     pub fn save_vote(&self, last_vote: Vec<u8>) -> Result<(), DbError> {
         let mut batch = SchemaBatch::new();
-        batch.put::<SingleEntrySchema>(&SingleEntryKey::LastVoteMsg, &last_vote)?;
+        batch.put::<SingleEntrySchema>(&SingleEntryKey::LastVote, &last_vote)?;
         self.commit(batch)
     }
 
@@ -149,24 +160,10 @@ impl ConsensusDB {
     }
 
     /// Get latest timeout certificates (we only store the latest highest timeout certificates).
-    fn get_highest_timeout_certificate(&self) -> Result<Option<Vec<u8>>, DbError> {
-        Ok(self
-            .db
-            .get::<SingleEntrySchema>(&SingleEntryKey::HighestTimeoutCertificate)?)
-    }
-
-    /// Get latest timeout certificates (we only store the latest highest timeout certificates).
     fn get_highest_2chain_timeout_certificate(&self) -> Result<Option<Vec<u8>>, DbError> {
         Ok(self
             .db
             .get::<SingleEntrySchema>(&SingleEntryKey::Highest2ChainTimeoutCert)?)
-    }
-
-    /// Delete the timeout certificates
-    pub fn delete_highest_timeout_certificate(&self) -> Result<(), DbError> {
-        let mut batch = SchemaBatch::new();
-        batch.delete::<SingleEntrySchema>(&SingleEntryKey::HighestTimeoutCertificate)?;
-        self.commit(batch)
     }
 
     pub fn delete_highest_2chain_timeout_certificate(&self) -> Result<(), DbError> {
@@ -174,31 +171,41 @@ impl ConsensusDB {
         batch.delete::<SingleEntrySchema>(&SingleEntryKey::Highest2ChainTimeoutCert)?;
         self.commit(batch)
     }
+
     /// Get serialized latest vote (if available)
     fn get_last_vote(&self) -> Result<Option<Vec<u8>>, DbError> {
         Ok(self
             .db
-            .get::<SingleEntrySchema>(&SingleEntryKey::LastVoteMsg)?)
+            .get::<SingleEntrySchema>(&SingleEntryKey::LastVote)?)
     }
 
     pub fn delete_last_vote_msg(&self) -> Result<(), DbError> {
         let mut batch = SchemaBatch::new();
-        batch.delete::<SingleEntrySchema>(&SingleEntryKey::LastVoteMsg)?;
+        batch.delete::<SingleEntrySchema>(&SingleEntryKey::LastVote)?;
         self.commit(batch)?;
         Ok(())
     }
 
-    /// Get all consensus blocks.
-    fn get_blocks(&self) -> Result<HashMap<HashValue, Block>, DbError> {
-        let mut iter = self.db.iter::<BlockSchema>(ReadOptions::default())?;
-        iter.seek_to_first();
-        Ok(iter.collect::<Result<HashMap<HashValue, Block>>>()?)
+    pub fn put<S: Schema>(&self, key: &S::Key, value: &S::Value) -> Result<(), DbError> {
+        let mut batch = SchemaBatch::new();
+        batch.put::<S>(key, value)?;
+        self.commit(batch)?;
+        Ok(())
     }
 
-    /// Get all consensus QCs.
-    fn get_quorum_certificates(&self) -> Result<HashMap<HashValue, QuorumCert>, DbError> {
-        let mut iter = self.db.iter::<QCSchema>(ReadOptions::default())?;
+    pub fn delete<S: Schema>(&self, keys: Vec<S::Key>) -> Result<(), DbError> {
+        let mut batch = SchemaBatch::new();
+        keys.iter().try_for_each(|key| batch.delete::<S>(key))?;
+        self.commit(batch)
+    }
+
+    pub fn get_all<S: Schema>(&self) -> Result<Vec<(S::Key, S::Value)>, DbError> {
+        let mut iter = self.db.iter::<S>()?;
         iter.seek_to_first();
-        Ok(iter.collect::<Result<HashMap<HashValue, QuorumCert>>>()?)
+        Ok(iter.collect::<Result<Vec<(S::Key, S::Value)>, AptosDbError>>()?)
+    }
+
+    pub fn get<S: Schema>(&self, key: &S::Key) -> Result<Option<S::Value>, DbError> {
+        Ok(self.db.get::<S>(key)?)
     }
 }

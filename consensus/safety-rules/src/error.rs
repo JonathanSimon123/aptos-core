@@ -1,10 +1,12 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use aptos_crypto::HashValue;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Clone, Debug, Deserialize, Error, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Error, PartialEq, Eq, Serialize)]
 /// Different reasons for proposal rejection
 pub enum Error {
     #[error("Provided epoch, {0}, does not match expected epoch, {1}")]
@@ -29,6 +31,8 @@ pub enum Error {
     InvalidQuorumCertificate(String),
     #[error("{0} is not set, SafetyRules is not initialized")]
     NotInitialized(String),
+    #[error("Does not satisfy order vote rule. Block Round {0}, Highest Timeout Round {1}")]
+    NotSafeForOrderVote(u64, u64),
     #[error("Data not found in secure storage: {0}")]
     SecureStorageMissingDataError(String),
     #[error("Unexpected error returned by secure storage: {0}")]
@@ -55,6 +59,8 @@ pub enum Error {
     WaypointOutOfDate(u64, u64, u64, u64),
     #[error("Invalid Timeout: {0}")]
     InvalidTimeout(String),
+    #[error("Incorrect 1-chain Quorum Certificate provided for signing order votes. Quorum Certificate: {0}, block id: {1}")]
+    InvalidOneChainQuorumCertificate(HashValue, HashValue),
 }
 
 impl From<serde_json::Error> for Error {
@@ -64,6 +70,7 @@ impl From<serde_json::Error> for Error {
 }
 
 impl From<aptos_secure_net::Error> for Error {
+    #[allow(clippy::fallible_impl_from)]
     fn from(error: aptos_secure_net::Error) -> Self {
         Self::InternalError(error.to_string())
     }
@@ -82,11 +89,11 @@ impl From<aptos_secure_storage::Error> for Error {
                     "A permission error was thrown: {:?}. Maybe the storage token needs to be renewed?",
                     error
                 );
-            }
+            },
             aptos_secure_storage::Error::KeyVersionNotFound(_, _)
             | aptos_secure_storage::Error::KeyNotSet(_) => {
                 Self::SecureStorageMissingDataError(error.to_string())
-            }
+            },
             _ => Self::SecureStorageUnexpectedError(error.to_string()),
         }
     }

@@ -1,77 +1,79 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::{MempoolError, StateSyncError};
+use crate::{
+    error::StateSyncError, payload_manager::TPayloadManager,
+    pipeline::pipeline_phase::CountedRequest, state_computer::StateComputeResultFut,
+    transaction_deduper::TransactionDeduper, transaction_shuffler::TransactionShuffler,
+};
 use anyhow::Result;
+use aptos_consensus_types::{
+    block::Block, pipelined_block::PipelinedBlock, quorum_cert::QuorumCert,
+};
 use aptos_crypto::HashValue;
-use aptos_types::{epoch_state::EpochState, ledger_info::LedgerInfoWithSignatures};
-use consensus_types::{block::Block, common::Payload, executed_block::ExecutedBlock};
-use executor_types::{Error as ExecutionError, StateComputeResult};
-use futures::future::BoxFuture;
-use std::sync::Arc;
+use aptos_executor_types::ExecutorResult;
+use aptos_types::{
+    block_executor::config::BlockExecutorConfigFromOnchain, epoch_state::EpochState,
+    ledger_info::LedgerInfoWithSignatures, randomness::Randomness,
+};
+use std::{sync::Arc, time::Duration};
 
 pub type StateComputerCommitCallBackType =
-    Box<dyn FnOnce(&[Arc<ExecutedBlock>], LedgerInfoWithSignatures) + Send + Sync>;
-
-/// Retrieves and updates the status of transactions on demand (e.g., via talking with Mempool)
-#[async_trait::async_trait]
-pub trait TxnManager: Send + Sync {
-    /// Brings new transactions to be applied.
-    /// The `exclude_txns` list includes the transactions that are already pending in the
-    /// branch of blocks consensus is trying to extend.
-    ///
-    /// wait_callback is executed when there's no transactions available and it decides to wait.
-    /// pending_ordering indicates if we should long poll mempool or propose empty blocks to help commit pending txns
-    async fn pull_txns(
-        &self,
-        max_size: u64,
-        exclude: Vec<&Payload>,
-        wait_callback: BoxFuture<'static, ()>,
-        pending_ordering: bool,
-    ) -> Result<Payload, MempoolError>;
-
-    /// Notifies TxnManager about the txns which failed execution. (Committed txns is notified by
-    /// state sync.)
-    async fn notify_failed_txn(
-        &self,
-        block: &Block,
-        compute_result: &StateComputeResult,
-    ) -> Result<(), MempoolError>;
-
-    /// Helper to trace transactions after block is generated
-    fn trace_transactions(&self, _block: &Block) {}
-}
+    Box<dyn FnOnce(&[Arc<PipelinedBlock>], LedgerInfoWithSignatures) + Send + Sync>;
 
 /// While Consensus is managing proposed blocks, `StateComputer` is managing the results of the
 /// (speculative) execution of their payload.
 /// StateComputer is using proposed block ids for identifying the transactions.
 #[async_trait::async_trait]
 pub trait StateComputer: Send + Sync {
-    /// How to execute a sequence of transactions and obtain the next state. While some of the
-    /// transactions succeed, some of them can fail.
-    /// In case all the transactions are failed, new_state_id is equal to the previous state id.
-    async fn compute(
+    async fn schedule_compute(
         &self,
         // The block that will be computed.
-        block: &Block,
+        _block: &Block,
         // The parent block root hash.
-        parent_block_id: HashValue,
-    ) -> Result<StateComputeResult, ExecutionError>;
+        _parent_block_id: HashValue,
+        _randomness: Option<Randomness>,
+        _block_qc: Option<Arc<QuorumCert>>,
+        _lifetime_guard: CountedRequest<()>,
+    ) -> StateComputeResultFut {
+        unimplemented!();
+    }
 
     /// Send a successful commit. A future is fulfilled when the state is finalized.
     async fn commit(
         &self,
-        blocks: &[Arc<ExecutedBlock>],
+        blocks: &[Arc<PipelinedBlock>],
         finality_proof: LedgerInfoWithSignatures,
         callback: StateComputerCommitCallBackType,
-    ) -> Result<(), ExecutionError>;
+    ) -> ExecutorResult<()>;
+
+    /// Best effort state synchronization for the specified duration.
+    /// This function returns the latest synced ledger info after state syncing.
+    /// Note: it is possible that state sync may run longer than the specified
+    /// duration (e.g., if the node is very far behind).
+    async fn sync_for_duration(
+        &self,
+        duration: Duration,
+    ) -> Result<LedgerInfoWithSignatures, StateSyncError>;
 
     /// Best effort state synchronization to the given target LedgerInfo.
     /// In case of success (`Result::Ok`) the LI of storage is at the given target.
     /// In case of failure (`Result::Error`) the LI of storage remains unchanged, and the validator
     /// can assume there were no modifications to the storage made.
-    async fn sync_to(&self, target: LedgerInfoWithSignatures) -> Result<(), StateSyncError>;
+    async fn sync_to_target(&self, target: LedgerInfoWithSignatures) -> Result<(), StateSyncError>;
 
     // Reconfigure to execute transactions for a new epoch.
-    fn new_epoch(&self, epoch_state: &EpochState);
+    fn new_epoch(
+        &self,
+        epoch_state: &EpochState,
+        payload_manager: Arc<dyn TPayloadManager>,
+        transaction_shuffler: Arc<dyn TransactionShuffler>,
+        block_executor_onchain_config: BlockExecutorConfigFromOnchain,
+        transaction_deduper: Arc<dyn TransactionDeduper>,
+        randomness_enabled: bool,
+    );
+
+    // Reconfigure to clear epoch state at end of epoch.
+    fn end_epoch(&self);
 }
