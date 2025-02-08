@@ -1,8 +1,8 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    configurable_validator_signer::ConfigurableValidatorSigner,
     consensus_state::ConsensusState,
     counters,
     error::Error,
@@ -10,33 +10,29 @@ use crate::{
     persistent_safety_storage::PersistentSafetyStorage,
     t_safety_rules::TSafetyRules,
 };
-use aptos_crypto::{
-    ed25519::{Ed25519PublicKey, Ed25519Signature},
-    hash::{CryptoHash, HashValue},
-    traits::Signature,
-};
-use aptos_logger::prelude::*;
-use aptos_types::{
-    block_info::BlockInfo,
-    epoch_change::EpochChangeProof,
-    epoch_state::EpochState,
-    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-    waypoint::Waypoint,
-};
-use consensus_types::{
-    block::Block,
+use aptos_consensus_types::{
     block_data::BlockData,
     common::{Author, Round},
+    order_vote::OrderVote,
+    order_vote_proposal::OrderVoteProposal,
     quorum_cert::QuorumCert,
     safety_data::SafetyData,
-    timeout::Timeout,
     timeout_2chain::{TwoChainTimeout, TwoChainTimeoutCertificate},
     vote::Vote,
     vote_data::VoteData,
-    vote_proposal::MaybeSignedVoteProposal,
+    vote_proposal::VoteProposal,
+};
+use aptos_crypto::{bls12381, hash::CryptoHash};
+use aptos_logger::prelude::*;
+use aptos_types::{
+    epoch_change::EpochChangeProof,
+    epoch_state::EpochState,
+    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    validator_signer::ValidatorSigner,
+    waypoint::Waypoint,
 };
 use serde::Serialize;
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc};
 
 pub(crate) fn next_round(round: Round) -> Result<Round, Error> {
     u64::checked_add(round, 1).ok_or(Error::IncorrectRound(round))
@@ -45,33 +41,16 @@ pub(crate) fn next_round(round: Round) -> Result<Round, Error> {
 /// @TODO consider a cache of verified QCs to cut down on verification costs
 pub struct SafetyRules {
     pub(crate) persistent_storage: PersistentSafetyStorage,
-    pub(crate) execution_public_key: Option<Ed25519PublicKey>,
-    pub(crate) export_consensus_key: bool,
-    pub(crate) validator_signer: Option<ConfigurableValidatorSigner>,
+    pub(crate) validator_signer: Option<ValidatorSigner>,
     pub(crate) epoch_state: Option<EpochState>,
 }
 
 impl SafetyRules {
     /// Constructs a new instance of SafetyRules with the given persistent storage and the
     /// consensus private keys
-    pub fn new(
-        persistent_storage: PersistentSafetyStorage,
-        verify_vote_proposal_signature: bool,
-        export_consensus_key: bool,
-    ) -> Self {
-        let execution_public_key = if verify_vote_proposal_signature {
-            Some(
-                persistent_storage
-                    .execution_public_key()
-                    .expect("Unable to retrieve execution public key"),
-            )
-        } else {
-            None
-        };
+    pub fn new(persistent_storage: PersistentSafetyStorage) -> Self {
         Self {
             persistent_storage,
-            execution_public_key,
-            export_consensus_key,
             validator_signer: None,
             epoch_state: None,
         }
@@ -80,18 +59,8 @@ impl SafetyRules {
     /// Validity checks
     pub(crate) fn verify_proposal(
         &mut self,
-        maybe_signed_vote_proposal: &MaybeSignedVoteProposal,
+        vote_proposal: &VoteProposal,
     ) -> Result<VoteData, Error> {
-        let vote_proposal = &maybe_signed_vote_proposal.vote_proposal;
-        let execution_signature = maybe_signed_vote_proposal.signature.as_ref();
-
-        if let Some(public_key) = self.execution_public_key.as_ref() {
-            execution_signature
-                .ok_or(Error::VoteProposalSignatureNotFound)?
-                .verify(vote_proposal, public_key)
-                .map_err(|error| Error::InternalError(error.to_string()))?;
-        }
-
         let proposed_block = vote_proposal.block();
         let safety_data = self.persistent_storage.safety_data()?;
 
@@ -110,15 +79,43 @@ impl SafetyRules {
             .map_err(|error| Error::InvalidAccumulatorExtension(error.to_string()))
     }
 
+    pub(crate) fn verify_order_vote_proposal(
+        &mut self,
+        order_vote_proposal: &OrderVoteProposal,
+    ) -> Result<(), Error> {
+        let proposed_block = order_vote_proposal.block();
+        let safety_data = self.persistent_storage.safety_data()?;
+
+        self.verify_epoch(proposed_block.epoch(), &safety_data)?;
+
+        let qc = order_vote_proposal.quorum_cert();
+        if qc.certified_block() != order_vote_proposal.block_info() {
+            return Err(Error::InvalidOneChainQuorumCertificate(
+                qc.certified_block().id(),
+                order_vote_proposal.block_info().id(),
+            ));
+        }
+        if qc.certified_block().id() != proposed_block.id() {
+            return Err(Error::InvalidOneChainQuorumCertificate(
+                qc.certified_block().id(),
+                proposed_block.id(),
+            ));
+        }
+        self.verify_qc(qc)?;
+        Ok(())
+    }
+
     pub(crate) fn sign<T: Serialize + CryptoHash>(
         &self,
         message: &T,
-    ) -> Result<Ed25519Signature, Error> {
+    ) -> Result<bls12381::Signature, Error> {
         let signer = self.signer()?;
-        signer.sign(message, &self.persistent_storage)
+        signer
+            .sign(message)
+            .map_err(|err| Error::SerializationError(err.to_string()))
     }
 
-    pub(crate) fn signer(&self) -> Result<&ConfigurableValidatorSigner, Error> {
+    pub(crate) fn signer(&self) -> Result<&ValidatorSigner, Error> {
         self.validator_signer
             .as_ref()
             .ok_or_else(|| Error::NotInitialized("validator_signer".into()))
@@ -136,7 +133,7 @@ impl SafetyRules {
         let two_chain = qc.parent_block().round();
         if one_chain > safety_data.one_chain_round {
             safety_data.one_chain_round = one_chain;
-            info!(
+            trace!(
                 SafetyLogSchema::new(LogEntry::OneChainRound, LogEvent::Update)
                     .preferred_round(safety_data.one_chain_round)
             );
@@ -144,7 +141,7 @@ impl SafetyRules {
         }
         if two_chain > safety_data.preferred_round {
             safety_data.preferred_round = two_chain;
-            info!(
+            trace!(
                 SafetyLogSchema::new(LogEntry::PreferredRound, LogEvent::Update)
                     .preferred_round(safety_data.preferred_round)
             );
@@ -153,32 +150,18 @@ impl SafetyRules {
         updated
     }
 
-    /// Produces a LedgerInfo that either commits a block based upon the 3-chain
-    /// commit rule or an empty LedgerInfo for no commit. The 3-chain commit rule is: B0 and its
-    /// prefixes can be committed if there exist certified blocks B1 and B2 that satisfy:
-    /// 1) B0 <- B1 <- B2 <--
-    /// 2) round(B0) + 1 = round(B1), and
-    /// 3) round(B1) + 1 = round(B2).
-    fn construct_ledger_info(
+    pub(crate) fn update_highest_timeout_round(
         &self,
-        proposed_block: &Block,
-        consensus_data_hash: HashValue,
-    ) -> Result<LedgerInfo, Error> {
-        let block2 = proposed_block.round();
-        let block1 = proposed_block.quorum_cert().certified_block().round();
-        let block0 = proposed_block.quorum_cert().parent_block().round();
-
-        // verify 3-chain rule
-        let commit = next_round(block0)? == block1 && next_round(block1)? == block2;
-
-        // create a ledger info
-        let commit_info = if commit {
-            proposed_block.quorum_cert().parent_block().clone()
-        } else {
-            BlockInfo::empty()
-        };
-
-        Ok(LedgerInfo::new(commit_info, consensus_data_hash))
+        timeout: &TwoChainTimeout,
+        safety_data: &mut SafetyData,
+    ) {
+        if timeout.round() > safety_data.highest_timeout_round {
+            safety_data.highest_timeout_round = timeout.round();
+            trace!(
+                SafetyLogSchema::new(LogEntry::HighestTimeoutRound, LogEvent::Update)
+                    .highest_timeout_round(safety_data.highest_timeout_round)
+            );
+        }
     }
 
     /// Second voting rule
@@ -235,7 +218,7 @@ impl SafetyRules {
         }
 
         safety_data.last_voted_round = round;
-        info!(
+        trace!(
             SafetyLogSchema::new(LogEntry::LastVotedRound, LogEvent::Update)
                 .last_voted_round(safety_data.last_voted_round)
         );
@@ -258,7 +241,7 @@ impl SafetyRules {
         let waypoint = self.persistent_storage.waypoint()?;
         let safety_data = self.persistent_storage.safety_data()?;
 
-        info!(SafetyLogSchema::new(LogEntry::State, LogEvent::Update)
+        trace!(SafetyLogSchema::new(LogEntry::State, LogEvent::Update)
             .author(self.persistent_storage.author()?)
             .epoch(safety_data.epoch)
             .last_voted_round(safety_data.last_voted_round)
@@ -300,7 +283,7 @@ impl SafetyRules {
                     current_epoch,
                     epoch_state.epoch,
                 ));
-            }
+            },
             Ordering::Less => {
                 // start new epoch
                 self.persistent_storage.set_safety_data(SafetyData::new(
@@ -309,11 +292,12 @@ impl SafetyRules {
                     0,
                     0,
                     None,
+                    0,
                 ))?;
 
                 info!(SafetyLogSchema::new(LogEntry::Epoch, LogEvent::Update)
                     .epoch(epoch_state.epoch));
-            }
+            },
             Ordering::Equal => (),
         };
         self.epoch_state = Some(epoch_state.clone());
@@ -325,41 +309,26 @@ impl SafetyRules {
             Some(expected_key) => {
                 let current_key = self.signer().ok().map(|s| s.public_key());
                 if current_key == Some(expected_key.clone()) {
-                    debug!(
+                    info!(
                         SafetyLogSchema::new(LogEntry::KeyReconciliation, LogEvent::Success),
                         "in set",
                     );
                     Ok(())
-                } else if self.export_consensus_key {
+                } else {
                     // Try to export the consensus key directly from storage.
-                    match self
-                        .persistent_storage
-                        .consensus_key_for_version(expected_key)
-                    {
+                    match self.persistent_storage.consensus_sk_by_pk(expected_key) {
                         Ok(consensus_key) => {
-                            self.validator_signer = Some(ConfigurableValidatorSigner::new_signer(
-                                author,
-                                consensus_key,
-                            ));
+                            self.validator_signer =
+                                Some(ValidatorSigner::new(author, Arc::new(consensus_key)));
                             Ok(())
-                        }
+                        },
                         Err(Error::SecureStorageMissingDataError(error)) => {
                             Err(Error::ValidatorKeyNotFound(error))
-                        }
+                        },
                         Err(error) => Err(error),
                     }
-                } else {
-                    // Try to generate a signature over a test message to ensure the expected key
-                    // is actually held in storage.
-                    self.validator_signer = Some(ConfigurableValidatorSigner::new_handle(
-                        author,
-                        expected_key,
-                    ));
-                    self.sign(&Timeout::new(0, 0))
-                        .map(|_signature| ())
-                        .map_err(|error| Error::ValidatorKeyNotFound(error.to_string()))
                 }
-            }
+            },
         };
         initialize_result.map_err(|error| {
             info!(
@@ -370,45 +339,10 @@ impl SafetyRules {
         })
     }
 
-    fn guarded_construct_and_sign_vote(
+    fn guarded_sign_proposal(
         &mut self,
-        maybe_signed_vote_proposal: &MaybeSignedVoteProposal,
-    ) -> Result<Vote, Error> {
-        // Exit early if we cannot sign
-        self.signer()?;
-
-        let vote_data = self.verify_proposal(maybe_signed_vote_proposal)?;
-        let mut safety_data = self.persistent_storage.safety_data()?;
-
-        let proposed_block = maybe_signed_vote_proposal.vote_proposal.block();
-        // if already voted on this round, send back the previous vote
-        // note: this needs to happen after verifying the epoch as we just check the round here
-        if let Some(vote) = safety_data.last_vote.clone() {
-            if vote.vote_data().proposed().round() == proposed_block.round() {
-                return Ok(vote);
-            }
-        }
-
-        // Two voting rules
-        self.verify_and_update_preferred_round(proposed_block.quorum_cert(), &mut safety_data)?;
-        self.verify_and_update_last_vote_round(
-            proposed_block.block_data().round(),
-            &mut safety_data,
-        )?;
-
-        // Construct and sign vote
-        let author = self.signer()?.author();
-        let ledger_info = self.construct_ledger_info(proposed_block, vote_data.hash())?;
-        let signature = self.sign(&ledger_info)?;
-        let vote = Vote::new_with_signature(vote_data, author, ledger_info, signature);
-
-        safety_data.last_vote = Some(vote.clone());
-        self.persistent_storage.set_safety_data(safety_data)?;
-
-        Ok(vote)
-    }
-
-    fn guarded_sign_proposal(&mut self, block_data: &BlockData) -> Result<Ed25519Signature, Error> {
+        block_data: &BlockData,
+    ) -> Result<bls12381::Signature, Error> {
         self.signer()?;
         self.verify_author(block_data.author())?;
 
@@ -431,43 +365,26 @@ impl SafetyRules {
         Ok(signature)
     }
 
-    fn guarded_sign_timeout(&mut self, timeout: &Timeout) -> Result<Ed25519Signature, Error> {
-        self.signer()?;
-
-        let mut safety_data = self.persistent_storage.safety_data()?;
-        self.verify_epoch(timeout.epoch(), &safety_data)?;
-
-        if timeout.round() <= safety_data.preferred_round {
-            return Err(Error::IncorrectPreferredRound(
-                timeout.round(),
-                safety_data.preferred_round,
-            ));
-        }
-        if timeout.round() < safety_data.last_voted_round {
-            return Err(Error::IncorrectLastVotedRound(
-                timeout.round(),
-                safety_data.last_voted_round,
-            ));
-        }
-        if timeout.round() > safety_data.last_voted_round {
-            self.verify_and_update_last_vote_round(timeout.round(), &mut safety_data)?;
-            self.persistent_storage.set_safety_data(safety_data)?;
-        }
-
-        let signature = self.sign(timeout)?;
-        Ok(signature)
-    }
-
     fn guarded_sign_commit_vote(
         &mut self,
         ledger_info: LedgerInfoWithSignatures,
         new_ledger_info: LedgerInfo,
-    ) -> Result<Ed25519Signature, Error> {
+    ) -> Result<bls12381::Signature, Error> {
         self.signer()?;
 
         let old_ledger_info = ledger_info.ledger_info();
 
-        if !old_ledger_info.commit_info().is_ordered_only() {
+        if !old_ledger_info.commit_info().is_ordered_only()
+            // When doing fast forward sync, we pull the latest blocks and quorum certs from peers
+            // and store them in storage. We then compute the root ordered cert and root commit cert
+            // from storage and start the consensus from there. But given that we are not storing the
+            // ordered cert obtained from order votes in storage, instead of obtaining the root ordered cert
+            // from storage, we set root ordered cert to commit certificate.
+            // This means, the root ordered cert will not have a dummy executed_state_id in this case.
+            // To handle this, we do not raise error if the old_ledger_info.commit_info() matches with
+            // new_ledger_info.commit_info().
+            && old_ledger_info.commit_info() != new_ledger_info.commit_info()
+        {
             return Err(Error::InvalidOrderedLedgerInfo(old_ledger_info.to_string()));
         }
 
@@ -506,31 +423,17 @@ impl TSafetyRules for SafetyRules {
         run_and_log(cb, |log| log, LogEntry::Initialize)
     }
 
-    fn construct_and_sign_vote(
-        &mut self,
-        maybe_signed_vote_proposal: &MaybeSignedVoteProposal,
-    ) -> Result<Vote, Error> {
-        let round = maybe_signed_vote_proposal.vote_proposal.block().round();
-        let cb = || self.guarded_construct_and_sign_vote(maybe_signed_vote_proposal);
-        run_and_log(cb, |log| log.round(round), LogEntry::ConstructAndSignVote)
-    }
-
-    fn sign_proposal(&mut self, block_data: &BlockData) -> Result<Ed25519Signature, Error> {
+    fn sign_proposal(&mut self, block_data: &BlockData) -> Result<bls12381::Signature, Error> {
         let round = block_data.round();
         let cb = || self.guarded_sign_proposal(block_data);
         run_and_log(cb, |log| log.round(round), LogEntry::SignProposal)
-    }
-
-    fn sign_timeout(&mut self, timeout: &Timeout) -> Result<Ed25519Signature, Error> {
-        let cb = || self.guarded_sign_timeout(timeout);
-        run_and_log(cb, |log| log.round(timeout.round()), LogEntry::SignTimeout)
     }
 
     fn sign_timeout_with_qc(
         &mut self,
         timeout: &TwoChainTimeout,
         timeout_cert: Option<&TwoChainTimeoutCertificate>,
-    ) -> Result<Ed25519Signature, Error> {
+    ) -> Result<bls12381::Signature, Error> {
         let cb = || self.guarded_sign_timeout_with_qc(timeout, timeout_cert);
         run_and_log(
             cb,
@@ -541,13 +444,11 @@ impl TSafetyRules for SafetyRules {
 
     fn construct_and_sign_vote_two_chain(
         &mut self,
-        maybe_signed_vote_proposal: &MaybeSignedVoteProposal,
+        vote_proposal: &VoteProposal,
         timeout_cert: Option<&TwoChainTimeoutCertificate>,
     ) -> Result<Vote, Error> {
-        let round = maybe_signed_vote_proposal.vote_proposal.block().round();
-        let cb = || {
-            self.guarded_construct_and_sign_vote_two_chain(maybe_signed_vote_proposal, timeout_cert)
-        };
+        let round = vote_proposal.block().round();
+        let cb = || self.guarded_construct_and_sign_vote_two_chain(vote_proposal, timeout_cert);
         run_and_log(
             cb,
             |log| log.round(round),
@@ -555,11 +456,19 @@ impl TSafetyRules for SafetyRules {
         )
     }
 
+    fn construct_and_sign_order_vote(
+        &mut self,
+        order_vote_proposal: &OrderVoteProposal,
+    ) -> Result<OrderVote, Error> {
+        let cb = || self.guarded_construct_and_sign_order_vote(order_vote_proposal);
+        run_and_log(cb, |log| log, LogEntry::ConstructAndSignOrderVote)
+    }
+
     fn sign_commit_vote(
         &mut self,
         ledger_info: LedgerInfoWithSignatures,
         new_ledger_info: LedgerInfo,
-    ) -> Result<Ed25519Signature, Error> {
+    ) -> Result<bls12381::Signature, Error> {
         let cb = || self.guarded_sign_commit_vote(ledger_info, new_ledger_info);
         run_and_log(cb, |log| log, LogEntry::SignCommitVote)
     }
@@ -571,16 +480,16 @@ where
     L: for<'a> Fn(SafetyLogSchema<'a>) -> SafetyLogSchema<'a>,
 {
     let _timer = counters::start_timer("internal", log_entry.as_str());
-    debug!(log_cb(SafetyLogSchema::new(log_entry, LogEvent::Request)));
+    trace!(log_cb(SafetyLogSchema::new(log_entry, LogEvent::Request)));
     counters::increment_query(log_entry.as_str(), "request");
     callback()
         .map(|v| {
-            info!(log_cb(SafetyLogSchema::new(log_entry, LogEvent::Success)));
+            trace!(log_cb(SafetyLogSchema::new(log_entry, LogEvent::Success)));
             counters::increment_query(log_entry.as_str(), "success");
             v
         })
         .map_err(|err| {
-            error!(log_cb(SafetyLogSchema::new(log_entry, LogEvent::Error)).error(&err));
+            warn!(log_cb(SafetyLogSchema::new(log_entry, LogEvent::Error)).error(&err));
             counters::increment_query(log_entry.as_str(), "error");
             err
         })

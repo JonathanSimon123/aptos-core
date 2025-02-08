@@ -1,38 +1,68 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     access_path::AccessPath,
-    account_address::AccountAddress,
     account_config::CORE_CODE_ADDRESS,
     event::{EventHandle, EventKey},
+    state_store::{state_key::StateKey, StateView},
 };
 use anyhow::{format_err, Result};
-use move_deps::move_core_types::{
+use bytes::Bytes;
+use move_core_types::{
+    account_address::AccountAddress,
     ident_str,
     identifier::{IdentStr, Identifier},
     language_storage::{StructTag, TypeTag},
     move_resource::{MoveResource, MoveStructType},
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, fmt, fmt::Debug, str::FromStr, sync::Arc};
 
+mod approved_execution_hashes;
+mod aptos_features;
 mod aptos_version;
+mod chain_id;
+mod commit_history;
 mod consensus_config;
-mod registered_currencies;
+mod execution_config;
+mod gas_schedule;
+mod jwk_consensus_config;
+pub mod randomness_api_v0_config;
+mod randomness_config;
+mod timed_features;
+mod timestamp;
+mod transaction_fee;
 mod validator_set;
-mod vm_config;
-mod vm_publishing_option;
 
 pub use self::{
+    approved_execution_hashes::ApprovedExecutionHashes,
+    aptos_features::*,
     aptos_version::{
-        Version, APTOS_MAX_KNOWN_VERSION, APTOS_VERSION_2, APTOS_VERSION_3, APTOS_VERSION_4,
+        AptosVersion, APTOS_MAX_KNOWN_VERSION, APTOS_VERSION_2, APTOS_VERSION_3, APTOS_VERSION_4,
     },
-    consensus_config::{ConsensusConfigV1, ConsensusConfigV2, OnChainConsensusConfig},
-    registered_currencies::RegisteredCurrencies,
-    validator_set::ValidatorSet,
-    vm_config::VMConfig,
-    vm_publishing_option::VMPublishingOption,
+    commit_history::CommitHistoryResource,
+    consensus_config::{
+        AnchorElectionMode, ConsensusAlgorithmConfig, ConsensusConfigV1, DagConsensusConfigV1,
+        LeaderReputationType, OnChainConsensusConfig, ProposerAndVoterConfig, ProposerElectionType,
+        ValidatorTxnConfig, DEFAULT_WINDOW_SIZE,
+    },
+    execution_config::{
+        BlockGasLimitType, ExecutionConfigV1, ExecutionConfigV2, ExecutionConfigV4,
+        OnChainExecutionConfig, TransactionDeduperType, TransactionShufflerType,
+    },
+    gas_schedule::{DiffItem, GasSchedule, GasScheduleV2, StorageGasSchedule},
+    jwk_consensus_config::{
+        ConfigV1 as JWKConsensusConfigV1, OIDCProvider, OnChainJWKConsensusConfig,
+    },
+    randomness_config::{
+        OnChainRandomnessConfig, RandomnessConfigMoveStruct, RandomnessConfigSeqNum,
+    },
+    timed_features::{TimedFeatureFlag, TimedFeatureOverride, TimedFeatures, TimedFeaturesBuilder},
+    timestamp::CurrentTimeMicroseconds,
+    transaction_fee::TransactionFeeBurnCap,
+    validator_set::{ConsensusScheme, ValidatorSet},
 };
 
 /// To register an on-chain config in Rust:
@@ -41,12 +71,6 @@ pub use self::{
 
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ConfigID(&'static str, &'static str, &'static str);
-
-pub const CONFIG_ADDRESS_STR: &str = "0xA550C18";
-
-pub fn config_address() -> AccountAddress {
-    AccountAddress::from_hex_literal(CONFIG_ADDRESS_STR).expect("failed to get address")
-}
 
 impl ConfigID {
     pub fn name(&self) -> String {
@@ -64,24 +88,43 @@ impl fmt::Display for ConfigID {
     }
 }
 
-/// State sync will panic if the value of any config in this registry is uninitialized
-pub const ON_CHAIN_CONFIG_REGISTRY: &[ConfigID] = &[
-    VMConfig::CONFIG_ID,
-    ValidatorSet::CONFIG_ID,
-    VMPublishingOption::CONFIG_ID,
-    Version::CONFIG_ID,
-    OnChainConsensusConfig::CONFIG_ID,
-];
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct OnChainConfigPayload {
-    epoch: u64,
-    configs: Arc<HashMap<ConfigID, Vec<u8>>>,
+pub trait OnChainConfigProvider: Debug + Clone + Send + Sync + 'static {
+    fn get<T: OnChainConfig>(&self) -> Result<T>;
 }
 
-impl OnChainConfigPayload {
-    pub fn new(epoch: u64, configs: Arc<HashMap<ConfigID, Vec<u8>>>) -> Self {
-        Self { epoch, configs }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InMemoryOnChainConfig {
+    configs: HashMap<ConfigID, Vec<u8>>,
+}
+
+impl InMemoryOnChainConfig {
+    pub fn new(configs: HashMap<ConfigID, Vec<u8>>) -> Self {
+        Self { configs }
+    }
+}
+
+impl OnChainConfigProvider for InMemoryOnChainConfig {
+    fn get<T: OnChainConfig>(&self) -> Result<T> {
+        let bytes = self
+            .configs
+            .get(&T::CONFIG_ID)
+            .ok_or_else(|| format_err!("[on-chain cfg] config not in payload"))?;
+        T::deserialize_into_config(bytes)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OnChainConfigPayload<P: OnChainConfigProvider> {
+    epoch: u64,
+    provider: Arc<P>,
+}
+
+impl<P: OnChainConfigProvider> OnChainConfigPayload<P> {
+    pub fn new(epoch: u64, provider: P) -> Self {
+        Self {
+            epoch,
+            provider: Arc::new(provider),
+        }
     }
 
     pub fn epoch(&self) -> u64 {
@@ -89,44 +132,26 @@ impl OnChainConfigPayload {
     }
 
     pub fn get<T: OnChainConfig>(&self) -> Result<T> {
-        let bytes = self
-            .configs
-            .get(&T::CONFIG_ID)
-            .ok_or_else(|| format_err!("[on-chain cfg] config not in payload"))?;
-        T::deserialize_into_config(bytes)
-    }
-
-    pub fn configs(&self) -> &HashMap<ConfigID, Vec<u8>> {
-        &self.configs
-    }
-}
-
-impl fmt::Display for OnChainConfigPayload {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut config_ids = "".to_string();
-        for id in self.configs.keys() {
-            config_ids += &id.to_string();
-        }
-        write!(
-            f,
-            "OnChainConfigPayload [epoch: {}, configs: {}]",
-            self.epoch, config_ids
-        )
+        self.provider.get()
     }
 }
 
 /// Trait to be implemented by a storage type from which to read on-chain configs
 pub trait ConfigStorage {
-    fn fetch_config(&self, access_path: AccessPath) -> Option<Vec<u8>>;
+    fn fetch_config_bytes(&self, state_key: &StateKey) -> Option<Bytes>;
 }
 
 /// Trait to be implemented by a Rust struct representation of an on-chain config
 /// that is stored in storage as a serialized byte array
 pub trait OnChainConfig: Send + Sync + DeserializeOwned {
-    // aptos_root_address
-    const ADDRESS: &'static str = CONFIG_ADDRESS_STR;
-    const IDENTIFIER: &'static str;
-    const CONFIG_ID: ConfigID = ConfigID(Self::ADDRESS, Self::IDENTIFIER, Self::IDENTIFIER);
+    const ADDRESS: &'static str = "0x1";
+    const MODULE_IDENTIFIER: &'static str;
+    const TYPE_IDENTIFIER: &'static str;
+    const CONFIG_ID: ConfigID = ConfigID(
+        Self::ADDRESS,
+        Self::MODULE_IDENTIFIER,
+        Self::TYPE_IDENTIFIER,
+    );
 
     // Single-round BCS deserialization from bytes to `Self`
     // This is the expected deserialization pattern if the Rust representation lives natively in Move.
@@ -148,52 +173,72 @@ pub trait OnChainConfig: Send + Sync + DeserializeOwned {
         Self::deserialize_default_impl(bytes)
     }
 
+    /// TODO: This does not work if `T`'s reflection on the Move side is using resource groups.
     fn fetch_config<T>(storage: &T) -> Option<Self>
     where
-        T: ConfigStorage,
+        T: ConfigStorage + ?Sized,
     {
-        let access_path = access_path_for_config(Self::CONFIG_ID);
-        match storage.fetch_config(access_path) {
-            Some(bytes) => Self::deserialize_into_config(&bytes).ok(),
-            None => None,
-        }
+        Some(Self::fetch_config_and_bytes(storage)?.0)
+    }
+
+    /// Same as [Self::fetch_config], but also returns the underlying bytes that were used to
+    /// deserialize into config.
+    fn fetch_config_and_bytes<T>(storage: &T) -> Option<(Self, Bytes)>
+    where
+        T: ConfigStorage + ?Sized,
+    {
+        let state_key = StateKey::on_chain_config::<Self>().ok()?;
+        let bytes = storage.fetch_config_bytes(&state_key)?;
+        let config = Self::deserialize_into_config(&bytes).ok()?;
+        Some((config, bytes))
+    }
+
+    fn address() -> &'static AccountAddress {
+        &CORE_CODE_ADDRESS
+    }
+
+    fn struct_tag() -> StructTag {
+        struct_tag_for_config(Self::CONFIG_ID)
+    }
+}
+
+impl<S: StateView> ConfigStorage for S {
+    fn fetch_config_bytes(&self, state_key: &StateKey) -> Option<Bytes> {
+        self.get_state_value(state_key)
+            .ok()?
+            .map(|s| s.bytes().clone())
     }
 }
 
 pub fn new_epoch_event_key() -> EventKey {
-    EventKey::new_from_address(&config_address(), 5)
+    EventKey::new(2, CORE_CODE_ADDRESS)
 }
 
-pub fn struct_tag_for_config(config_name: Identifier) -> StructTag {
+pub fn new_epoch_event_type_tag() -> TypeTag {
+    TypeTag::from_str("0x1::reconfiguration::NewEpoch").expect("cannot fail")
+}
+
+pub fn access_path_for_config(config_id: ConfigID) -> anyhow::Result<AccessPath> {
+    let struct_tag = struct_tag_for_config(config_id);
+    Ok(AccessPath::new(
+        CORE_CODE_ADDRESS,
+        AccessPath::resource_path_vec(struct_tag)?,
+    ))
+}
+
+pub fn struct_tag_for_config(config_id: ConfigID) -> StructTag {
     StructTag {
-        address: CORE_CODE_ADDRESS,
-        module: ConfigurationResource::MODULE_NAME.to_owned(),
-        name: ident_str!("Reconfiguration").to_owned(),
-        type_params: vec![TypeTag::Struct(StructTag {
-            address: CORE_CODE_ADDRESS,
-            module: config_name.clone(),
-            name: config_name,
-            type_params: vec![],
-        })],
-    }
-}
-
-pub fn access_path_for_config(config_id: ConfigID) -> AccessPath {
-    let struct_tag = StructTag {
         address: CORE_CODE_ADDRESS,
         module: Identifier::new(config_id.1).expect("fail to make identifier"),
         name: Identifier::new(config_id.2).expect("fail to make identifier"),
-        type_params: vec![],
-    };
-    AccessPath::new(
-        config_address(),
-        AccessPath::resource_access_vec(struct_tag),
-    )
+        type_args: vec![],
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ConfigurationResource {
     epoch: u64,
+    /// Unix epoch timestamp (in microseconds) of the last reconfiguration time.
     last_reconfiguration_time: u64,
     events: EventHandle,
 }
@@ -203,7 +248,8 @@ impl ConfigurationResource {
         self.epoch
     }
 
-    pub fn last_reconfiguration_time(&self) -> u64 {
+    /// Return the last Unix epoch timestamp (in microseconds) of the last reconfiguration time.
+    pub fn last_reconfiguration_time_micros(&self) -> u64 {
         self.last_reconfiguration_time
     }
 
@@ -224,6 +270,11 @@ impl ConfigurationResource {
             events,
         }
     }
+
+    #[cfg(feature = "fuzzing")]
+    pub fn set_last_reconfiguration_time_for_test(&mut self, last_reconfiguration_time: u64) {
+        self.last_reconfiguration_time = last_reconfiguration_time;
+    }
 }
 
 #[cfg(feature = "fuzzing")]
@@ -232,14 +283,19 @@ impl Default for ConfigurationResource {
         Self {
             epoch: 0,
             last_reconfiguration_time: 0,
-            events: EventHandle::new_from_address(&crate::account_config::aptos_root_address(), 16),
+            events: EventHandle::new(EventKey::new(16, CORE_CODE_ADDRESS), 0),
         }
     }
 }
 
 impl MoveStructType for ConfigurationResource {
-    const MODULE_NAME: &'static IdentStr = ident_str!("Reconfiguration");
+    const MODULE_NAME: &'static IdentStr = ident_str!("reconfiguration");
     const STRUCT_NAME: &'static IdentStr = ident_str!("Configuration");
 }
 
 impl MoveResource for ConfigurationResource {}
+
+impl OnChainConfig for ConfigurationResource {
+    const MODULE_IDENTIFIER: &'static str = "reconfiguration";
+    const TYPE_IDENTIFIER: &'static str = "Configuration";
+}

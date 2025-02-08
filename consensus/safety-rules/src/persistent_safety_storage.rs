@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -6,16 +7,12 @@ use crate::{
     logging::{self, LogEntry, LogEvent},
     Error,
 };
-use aptos_crypto::{
-    ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature},
-    hash::CryptoHash,
-};
-use aptos_global_constants::{CONSENSUS_KEY, EXECUTION_KEY, OWNER_ACCOUNT, SAFETY_DATA, WAYPOINT};
+use aptos_consensus_types::{common::Author, safety_data::SafetyData};
+use aptos_crypto::{bls12381, PrivateKey};
+use aptos_global_constants::{CONSENSUS_KEY, OWNER_ACCOUNT, SAFETY_DATA, WAYPOINT};
 use aptos_logger::prelude::*;
-use aptos_secure_storage::{CryptoStorage, KVStorage, Storage};
+use aptos_secure_storage::{KVStorage, Storage};
 use aptos_types::waypoint::Waypoint;
-use consensus_types::{common::Author, safety_data::SafetyData};
-use serde::Serialize;
 
 /// SafetyRules needs an abstract storage interface to act as a common utility for storing
 /// persistent data to local disk, cloud, secrets managers, or even memory (for tests)
@@ -37,22 +34,16 @@ impl PersistentSafetyStorage {
     pub fn initialize(
         mut internal_store: Storage,
         author: Author,
-        consensus_private_key: Ed25519PrivateKey,
-        execution_private_key: Ed25519PrivateKey,
+        consensus_private_key: bls12381::PrivateKey,
         waypoint: Waypoint,
         enable_cached_safety_data: bool,
     ) -> Self {
         // Initialize the keys and accounts
-        Self::initialize_keys_and_accounts(
-            &mut internal_store,
-            author,
-            consensus_private_key,
-            execution_private_key,
-        )
-        .expect("Unable to initialize keys and accounts in storage");
+        Self::initialize_keys_and_accounts(&mut internal_store, author, consensus_private_key)
+            .expect("Unable to initialize keys and accounts in storage");
 
         // Create the new persistent safety storage
-        let safety_data = SafetyData::new(1, 0, 0, 0, None);
+        let safety_data = SafetyData::new(1, 0, 0, 0, None, 0);
         let mut persisent_safety_storage = Self {
             enable_cached_safety_data,
             cached_safety_data: Some(safety_data.clone()),
@@ -73,10 +64,9 @@ impl PersistentSafetyStorage {
     fn initialize_keys_and_accounts(
         internal_store: &mut Storage,
         author: Author,
-        consensus_private_key: Ed25519PrivateKey,
-        execution_private_key: Ed25519PrivateKey,
+        consensus_private_key: bls12381::PrivateKey,
     ) -> Result<(), Error> {
-        let result = internal_store.import_private_key(CONSENSUS_KEY, consensus_private_key);
+        let result = internal_store.set(CONSENSUS_KEY, consensus_private_key);
         // Attempting to re-initialize existing storage. This can happen in environments like
         // forge. Rather than be rigid here, leave it up to the developer to detect
         // inconsistencies or why they did not reset storage between rounds. Do not repeat the
@@ -87,7 +77,6 @@ impl PersistentSafetyStorage {
             return Ok(());
         }
 
-        internal_store.import_private_key(EXECUTION_KEY, execution_private_key)?;
         internal_store.set(OWNER_ACCOUNT, author)?;
         Ok(())
     }
@@ -107,33 +96,40 @@ impl PersistentSafetyStorage {
         Ok(self.internal_store.get(OWNER_ACCOUNT).map(|v| v.value)?)
     }
 
-    pub fn consensus_key_for_version(
+    pub fn default_consensus_sk(
         &self,
-        version: Ed25519PublicKey,
-    ) -> Result<Ed25519PrivateKey, Error> {
+    ) -> Result<bls12381::PrivateKey, aptos_secure_storage::Error> {
+        self.internal_store
+            .get::<bls12381::PrivateKey>(CONSENSUS_KEY)
+            .map(|v| v.value)
+    }
+
+    pub fn consensus_sk_by_pk(
+        &self,
+        pk: bls12381::PublicKey,
+    ) -> Result<bls12381::PrivateKey, Error> {
         let _timer = counters::start_timer("get", CONSENSUS_KEY);
-        Ok(self
+        let pk_hex = hex::encode(pk.to_bytes());
+        let explicit_storage_key = format!("{}_{}", CONSENSUS_KEY, pk_hex);
+        let explicit_sk = self
             .internal_store
-            .export_private_key_for_version(CONSENSUS_KEY, version)?)
-    }
-
-    pub fn execution_public_key(&self) -> Result<Ed25519PublicKey, Error> {
-        let _timer = counters::start_timer("get", EXECUTION_KEY);
-        Ok(self
-            .internal_store
-            .get_public_key(EXECUTION_KEY)
-            .map(|r| r.public_key)?)
-    }
-
-    pub fn sign<T: Serialize + CryptoHash>(
-        &self,
-        key_name: String,
-        key_version: Ed25519PublicKey,
-        message: &T,
-    ) -> Result<Ed25519Signature, Error> {
-        Ok(self
-            .internal_store
-            .sign_using_version(&key_name, key_version, message)?)
+            .get::<bls12381::PrivateKey>(explicit_storage_key.as_str())
+            .map(|v| v.value);
+        let default_sk = self.default_consensus_sk();
+        let key = match (explicit_sk, default_sk) {
+            (Ok(sk_0), _) => sk_0,
+            (Err(_), Ok(sk_1)) => sk_1,
+            (Err(_), Err(_)) => {
+                return Err(Error::ValidatorKeyNotFound("not found!".to_string()));
+            },
+        };
+        if key.public_key() != pk {
+            return Err(Error::SecureStorageMissingDataError(format!(
+                "Incorrect sk saved for {:?} the expected pk",
+                pk
+            )));
+        }
+        Ok(key)
     }
 
     pub fn safety_data(&mut self) -> Result<SafetyData, Error> {
@@ -156,17 +152,21 @@ impl PersistentSafetyStorage {
         let _timer = counters::start_timer("set", SAFETY_DATA);
         counters::set_state(counters::EPOCH, data.epoch as i64);
         counters::set_state(counters::LAST_VOTED_ROUND, data.last_voted_round as i64);
+        counters::set_state(
+            counters::HIGHEST_TIMEOUT_ROUND,
+            data.highest_timeout_round as i64,
+        );
         counters::set_state(counters::PREFERRED_ROUND, data.preferred_round as i64);
 
         match self.internal_store.set(SAFETY_DATA, data.clone()) {
             Ok(_) => {
                 self.cached_safety_data = Some(data);
                 Ok(())
-            }
+            },
             Err(error) => {
                 self.cached_safety_data = None;
                 Err(Error::SecureStorageUnexpectedError(error.to_string()))
-            }
+            },
         }
     }
 
@@ -185,7 +185,6 @@ impl PersistentSafetyStorage {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "testing"))]
     pub fn internal_store(&mut self) -> &mut Storage {
         &mut self.internal_store
     }
@@ -195,7 +194,7 @@ impl PersistentSafetyStorage {
 mod tests {
     use super::*;
     use crate::counters;
-    use aptos_crypto::{hash::HashValue, Uniform};
+    use aptos_crypto::hash::HashValue;
     use aptos_secure_storage::InMemoryStorage;
     use aptos_types::{
         block_info::BlockInfo, epoch_state::EpochState, ledger_info::LedgerInfo,
@@ -214,7 +213,6 @@ mod tests {
                 storage,
                 Author::random(),
                 consensus_private_key,
-                Ed25519PrivateKey::generate_for_testing(),
                 Waypoint::default(),
                 true,
             );
@@ -234,7 +232,7 @@ mod tests {
         assert_eq!(counters::get_state(counters::PREFERRED_ROUND), 0);
 
         safety_storage
-            .set_safety_data(SafetyData::new(9, 8, 1, 0, None))
+            .set_safety_data(SafetyData::new(9, 8, 1, 0, None, 0))
             .unwrap();
 
         let safety_data = safety_storage.safety_data().unwrap();

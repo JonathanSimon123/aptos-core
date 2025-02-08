@@ -1,8 +1,11 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::arc_with_non_send_sync)]
+
 use crate::{
-    account::{Account, AccountData, AccountRoleSpecifier},
+    account::{Account, AccountData},
     account_universe::{
         txn_one_account_result, AUTransactionGen, AccountPair, AccountPairGen, AccountUniverse,
     },
@@ -56,7 +59,8 @@ impl AUTransactionGen for CreateAccountGen {
                 self.new_account.clone(),
                 self.amount,
                 0,
-                AccountRoleSpecifier::default(),
+                false,
+                false,
             ));
         } else {
             gas_used = 0;
@@ -102,6 +106,7 @@ impl AUTransactionGen for CreateExistingAccountGen {
             TransactionStatus::Keep(ExecutionStatus::MoveAbort {
                 location: AbortLocation::Script,
                 code: 777_777,
+                info: None,
             })
         } else {
             // Not enough gas to get past the prologue.

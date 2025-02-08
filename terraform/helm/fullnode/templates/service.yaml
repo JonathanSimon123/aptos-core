@@ -13,9 +13,21 @@ spec:
     {{- include "aptos-fullnode.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/name: fullnode
   ports:
+  {{- if .Values.service.exposeApi }}
   - name: api
     port: 80
     targetPort: 8080
+  {{- end }}
+  {{- if .Values.service.exposeMetrics }}
+  - name: metrics
+    port: 9101
+    targetPort: 9101
+  {{- end }}
+  {{- if .Values.service.exposeAdmin }}
+  - name: admin
+    port: 9102
+    targetPort: 9102
+  {{- end }}
   - name: aptosnet
     port: 6182
   {{- with .Values.service }}

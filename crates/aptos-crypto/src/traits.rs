@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module provides a generic set of traits for dealing with cryptographic primitives.
@@ -13,7 +14,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::{fmt::Debug, hash::Hash};
 use thiserror::Error;
 
-/// An error type for key and signature validation issues, see [`ValidCryptoMaterial`][ValidCryptoMaterial].
+/// An error type for key and signature validation issues, see [`ValidCryptoMaterial`].
 ///
 /// This enum reflects there are two interesting causes of validation
 /// failure for the ingestion of key or signature material: deserialization errors
@@ -51,12 +52,12 @@ pub trait Length {
 ///
 /// A type family for material that knows how to serialize and
 /// deserialize, as well as validate byte-encoded material. The
-/// validation must be implemented as a [`TryFrom`][TryFrom] which
+/// validation must be implemented as a [`TryFrom`] which
 /// classifies its failures against the above
-/// [`CryptoMaterialError`][CryptoMaterialError].
+/// [`CryptoMaterialError`].
 ///
 /// This provides an implementation for a validation that relies on a
-/// round-trip to bytes and corresponding [`TryFrom`][TryFrom].
+/// round-trip to bytes and corresponding [`TryFrom`].
 pub trait ValidCryptoMaterial:
     // The for<'a> exactly matches the assumption "deserializable from any lifetime".
     for<'a> TryFrom<&'a [u8], Error=CryptoMaterialError> + Serialize + DeserializeOwned
@@ -65,9 +66,9 @@ pub trait ValidCryptoMaterial:
     fn to_bytes(&self) -> Vec<u8>;
 }
 
-/// An extension to to/from Strings for [`ValidCryptoMaterial`][ValidCryptoMaterial].
+/// An extension to to/from Strings for [`ValidCryptoMaterial`].
 ///
-/// Relies on [`hex`][::hex] for string encoding / decoding.
+/// Relies on [`hex`] for string encoding / decoding.
 /// No required fields, provides a default implementation.
 pub trait ValidCryptoMaterialStringExt: ValidCryptoMaterial {
     /// When trying to convert from bytes, we simply decode the string into
@@ -86,7 +87,7 @@ pub trait ValidCryptoMaterialStringExt: ValidCryptoMaterial {
 
     /// A function to encode into hex-string after serializing.
     fn to_encoded_string(&self) -> Result<String> {
-        Ok(format!("0x{}", ::hex::encode(&self.to_bytes())))
+        Ok(format!("0x{}", ::hex::encode(self.to_bytes())))
     }
 }
 
@@ -95,7 +96,7 @@ pub trait ValidCryptoMaterialStringExt: ValidCryptoMaterial {
 impl<T: ValidCryptoMaterial> ValidCryptoMaterialStringExt for T {}
 
 /// A type family for key material that should remain secret and has an
-/// associated type of the [`PublicKey`][PublicKey] family.
+/// associated type of the [`PublicKey`] family.
 pub trait PrivateKey: Sized {
     /// We require public / private types to be coupled, i.e. their
     /// associated type is each other.
@@ -112,7 +113,7 @@ pub trait PrivateKey: Sized {
 /// This trait has a requirement on a `pub(crate)` marker trait meant to
 /// specifically limit its implementations to the present crate.
 ///
-/// A trait for a [`ValidCryptoMaterial`][ValidCryptoMaterial] which knows how to sign a
+/// A trait for a [`ValidCryptoMaterial`] which knows how to sign a
 /// message, and return an associated `Signature` type.
 pub trait SigningKey:
     PrivateKey<PublicKeyMaterial = <Self as SigningKey>::VerifyingKeyMaterial>
@@ -130,7 +131,10 @@ pub trait SigningKey:
     ///
     /// Note: this assumes serialization is infallible. See crates::bcs::ser
     /// for a discussion of this assumption.
-    fn sign<T: CryptoHash + Serialize>(&self, message: &T) -> Self::SignatureMaterial;
+    fn sign<T: CryptoHash + Serialize>(
+        &self,
+        message: &T,
+    ) -> Result<Self::SignatureMaterial, CryptoMaterialError>;
 
     /// Signs a non-hash input message. For testing only.
     #[cfg(any(test, feature = "fuzzing"))]
@@ -144,16 +148,17 @@ pub trait SigningKey:
 
 /// Returns the signing message for the given message.
 /// It is used by `SigningKey#sign` function.
-pub fn signing_message<T: CryptoHash + Serialize>(message: &T) -> Vec<u8> {
+pub fn signing_message<T: CryptoHash + Serialize>(
+    message: &T,
+) -> Result<Vec<u8>, CryptoMaterialError> {
     let mut bytes = <T::Hasher as CryptoHasher>::seed().to_vec();
     bcs::serialize_into(&mut bytes, &message)
-        .map_err(|_| CryptoMaterialError::SerializationError)
-        .expect("Serialization of signable material should not fail.");
-    bytes
+        .map_err(|_| CryptoMaterialError::SerializationError)?;
+    Ok(bytes)
 }
 
 /// A type for key material that can be publicly shared, and in asymmetric
-/// fashion, can be obtained from a [`PrivateKey`][PrivateKey]
+/// fashion, can be obtained from a [`PrivateKey`]
 /// reference.
 /// This convertibility requirement ensures the existence of a
 /// deterministic, canonical public key construction from a private key.
@@ -214,7 +219,7 @@ pub trait VerifyingKey:
 /// verify.
 ///
 /// This trait simply requires an association to some type of the
-/// [`PublicKey`][PublicKey] family of which we are the `SignatureMaterial`.
+/// [`PublicKey`] family of which we are the `SignatureMaterial`.
 ///
 /// This trait has a requirement on a `pub(crate)` marker trait meant to
 /// specifically limit its implementations to the present crate.
@@ -223,7 +228,7 @@ pub trait VerifyingKey:
 /// checks signature material passed as `&[u8]` and only returns Ok when
 /// that material de-serializes to a signature of the expected concrete
 /// scheme. This would be done as an extension trait of
-/// [`Signature`][Signature].
+/// [`Signature`].
 pub trait Signature:
     for<'a> TryFrom<&'a [u8], Error = CryptoMaterialError>
     + Sized
@@ -271,11 +276,9 @@ pub trait Signature:
 }
 
 /// A type family for schemes which know how to generate key material from
-/// a cryptographically-secure [`CryptoRng`][::rand::CryptoRng].
+/// a cryptographically-secure [`CryptoRng`].
 pub trait Uniform {
-    /// Generate key material from an RNG. This should generally not be used for production
-    /// purposes even with a good source of randomness. When possible use hardware crypto to generate and
-    /// store private keys.
+    /// Generate key material from a cryptographically-secure RNG.
     fn generate<R>(rng: &mut R) -> Self
     where
         R: RngCore + CryptoRng;
@@ -302,7 +305,11 @@ pub trait Genesis: PrivateKey {
 pub(crate) mod private {
     pub trait Sealed {}
 
-    // Implement for the ed25519, multi-ed25519 signatures
+    impl Sealed for crate::bls12381::PrivateKey {}
+    impl Sealed for crate::bls12381::PublicKey {}
+    impl Sealed for crate::bls12381::Signature {}
+    impl Sealed for crate::bls12381::ProofOfPossession {}
+
     impl Sealed for crate::ed25519::Ed25519PrivateKey {}
     impl Sealed for crate::ed25519::Ed25519PublicKey {}
     impl Sealed for crate::ed25519::Ed25519Signature {}
@@ -310,4 +317,12 @@ pub(crate) mod private {
     impl Sealed for crate::multi_ed25519::MultiEd25519PrivateKey {}
     impl Sealed for crate::multi_ed25519::MultiEd25519PublicKey {}
     impl Sealed for crate::multi_ed25519::MultiEd25519Signature {}
+
+    impl Sealed for crate::secp256r1_ecdsa::PrivateKey {}
+    impl Sealed for crate::secp256r1_ecdsa::PublicKey {}
+    impl Sealed for crate::secp256r1_ecdsa::Signature {}
+
+    impl Sealed for crate::secp256k1_ecdsa::PrivateKey {}
+    impl Sealed for crate::secp256k1_ecdsa::PublicKey {}
+    impl Sealed for crate::secp256k1_ecdsa::Signature {}
 }

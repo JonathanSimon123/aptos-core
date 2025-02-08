@@ -1,26 +1,39 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::core_mempool::{CoreMempool, TimelineState, TxnPointer};
+use crate::{
+    core_mempool::{CoreMempool, TimelineState},
+    network::{BroadcastPeerPriority, MempoolSyncMsg},
+};
 use anyhow::{format_err, Result};
-use aptos_config::config::NodeConfig;
+use aptos_compression::client::CompressionClient;
+use aptos_config::config::{NodeConfig, MAX_APPLICATION_MESSAGE_SIZE};
+use aptos_consensus_types::common::{TransactionInProgress, TransactionSummary};
 use aptos_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
 use aptos_types::{
     account_address::AccountAddress,
-    account_config::AccountSequenceInfo,
     chain_id::ChainId,
     mempool_status::MempoolStatusCode,
-    transaction::{RawTransaction, Script, SignedTransaction},
+    transaction::{RawTransaction, Script, SignedTransaction, TransactionArgument},
 };
 use once_cell::sync::Lazy;
 use rand::{rngs::StdRng, SeedableRng};
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub(crate) fn setup_mempool() -> (CoreMempool, ConsensusMock) {
-    (
-        CoreMempool::new(&NodeConfig::random()),
-        ConsensusMock::new(),
-    )
+    let mut config = NodeConfig::generate_random_config();
+    config.mempool.broadcast_buckets = vec![0];
+    (CoreMempool::new(&config), ConsensusMock::new())
+}
+
+pub(crate) fn setup_mempool_with_broadcast_buckets(
+    buckets: Vec<u64>,
+) -> (CoreMempool, ConsensusMock) {
+    let mut config = NodeConfig::generate_random_config();
+    config.mempool.broadcast_buckets = buckets;
+    (CoreMempool::new(&config), ConsensusMock::new())
 }
 
 static ACCOUNTS: Lazy<Vec<AccountAddress>> = Lazy::new(|| {
@@ -32,31 +45,84 @@ static ACCOUNTS: Lazy<Vec<AccountAddress>> = Lazy::new(|| {
     ]
 });
 
-#[derive(Clone)]
+static SMALL_SCRIPT: Lazy<Script> = Lazy::new(|| Script::new(vec![], vec![], vec![]));
+
+static LARGE_SCRIPT: Lazy<Script> = Lazy::new(|| {
+    let mut args = vec![];
+    for _ in 0..200 {
+        args.push(TransactionArgument::Address(AccountAddress::random()));
+    }
+    Script::new(vec![], vec![], args)
+});
+
+static HUGE_SCRIPT: Lazy<Script> = Lazy::new(|| {
+    let mut args = vec![];
+    for _ in 0..200_000 {
+        args.push(TransactionArgument::Address(AccountAddress::random()));
+    }
+    Script::new(vec![], vec![], args)
+});
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TestTransaction {
-    pub(crate) address: usize,
+    pub(crate) address: AccountAddress,
     pub(crate) sequence_number: u64,
     pub(crate) gas_price: u64,
-    pub(crate) account_seqno_type: AccountSequenceInfo,
+    pub(crate) account_seqno: u64,
+    pub(crate) script: Option<Script>,
 }
 
 impl TestTransaction {
-    pub(crate) const fn new(address: usize, sequence_number: u64, gas_price: u64) -> Self {
+    pub(crate) fn new(address: usize, sequence_number: u64, gas_price: u64) -> Self {
+        Self {
+            address: TestTransaction::get_address(address),
+            sequence_number,
+            gas_price,
+            account_seqno: 0,
+            script: None,
+        }
+    }
+
+    pub(crate) fn new_with_large_script(
+        address: usize,
+        sequence_number: u64,
+        gas_price: u64,
+    ) -> Self {
+        Self {
+            address: TestTransaction::get_address(address),
+            sequence_number,
+            gas_price,
+            account_seqno: 0,
+            script: Some(LARGE_SCRIPT.clone()),
+        }
+    }
+
+    pub(crate) fn new_with_huge_script(
+        address: usize,
+        sequence_number: u64,
+        gas_price: u64,
+    ) -> Self {
+        Self {
+            address: TestTransaction::get_address(address),
+            sequence_number,
+            gas_price,
+            account_seqno: 0,
+            script: Some(HUGE_SCRIPT.clone()),
+        }
+    }
+
+    pub(crate) fn new_with_address(
+        address: AccountAddress,
+        sequence_number: u64,
+        gas_price: u64,
+    ) -> Self {
         Self {
             address,
             sequence_number,
             gas_price,
-            account_seqno_type: AccountSequenceInfo::Sequential(0),
+            account_seqno: 0,
+            script: None,
         }
-    }
-
-    pub(crate) fn crsn(mut self, min_nonce: u64) -> Self {
-        // Default CRSN size to 128
-        self.account_seqno_type = AccountSequenceInfo::CRSN {
-            min_nonce,
-            size: 128,
-        };
-        self
     }
 
     pub(crate) fn make_signed_transaction_with_expiration_time(
@@ -70,11 +136,11 @@ impl TestTransaction {
         &self,
         max_gas_amount: u64,
     ) -> SignedTransaction {
-        self.make_signed_transaction_impl(max_gas_amount, u64::max_value())
+        self.make_signed_transaction_impl(max_gas_amount, u64::MAX)
     }
 
     pub(crate) fn make_signed_transaction(&self) -> SignedTransaction {
-        self.make_signed_transaction_impl(100, u64::max_value())
+        self.make_signed_transaction_impl(100, u64::MAX)
     }
 
     fn make_signed_transaction_impl(
@@ -83,9 +149,9 @@ impl TestTransaction {
         exp_timestamp_secs: u64,
     ) -> SignedTransaction {
         let raw_txn = RawTransaction::new_script(
-            TestTransaction::get_address(self.address),
+            self.address,
             self.sequence_number,
-            Script::new(vec![], vec![], vec![]),
+            self.script.clone().unwrap_or(SMALL_SCRIPT.clone()),
             max_gas_amount,
             self.gas_price,
             exp_timestamp_secs,
@@ -115,28 +181,42 @@ pub(crate) fn add_txns_to_mempool(
         let txn = transaction.make_signed_transaction();
         pool.add_txn(
             txn.clone(),
-            0,
             txn.gas_unit_price(),
-            transaction.account_seqno_type,
+            transaction.account_seqno,
             TimelineState::NotReady,
+            false,
+            None,
+            Some(BroadcastPeerPriority::Primary),
         );
         transactions.push(txn);
     }
     transactions
 }
 
-pub(crate) fn add_txn(pool: &mut CoreMempool, transaction: TestTransaction) -> Result<()> {
-    add_signed_txn(pool, transaction.make_signed_transaction())
+pub(crate) fn txn_bytes_len(transaction: TestTransaction) -> u64 {
+    let txn = transaction.make_signed_transaction();
+    txn.txn_bytes_len() as u64
+}
+
+pub(crate) fn add_txn(
+    pool: &mut CoreMempool,
+    transaction: TestTransaction,
+) -> Result<SignedTransaction> {
+    let txn = transaction.make_signed_transaction();
+    add_signed_txn(pool, txn.clone())?;
+    Ok(txn)
 }
 
 pub(crate) fn add_signed_txn(pool: &mut CoreMempool, transaction: SignedTransaction) -> Result<()> {
     match pool
         .add_txn(
             transaction.clone(),
-            0,
             transaction.gas_unit_price(),
-            AccountSequenceInfo::Sequential(0),
+            0,
             TimelineState::NotReady,
+            false,
+            None,
+            Some(BroadcastPeerPriority::Primary),
         )
         .code
     {
@@ -150,44 +230,45 @@ pub(crate) fn batch_add_signed_txn(
     transactions: Vec<SignedTransaction>,
 ) -> Result<()> {
     for txn in transactions.into_iter() {
-        if let Err(e) = add_signed_txn(pool, txn) {
-            return Err(e);
-        }
+        add_signed_txn(pool, txn)?
     }
     Ok(())
 }
 
 // Helper struct that keeps state between `.get_block` calls. Imitates work of Consensus.
-pub struct ConsensusMock(HashSet<TxnPointer>);
+pub struct ConsensusMock(BTreeMap<TransactionSummary, TransactionInProgress>);
 
 impl ConsensusMock {
     pub(crate) fn new() -> Self {
-        Self(HashSet::new())
+        Self(BTreeMap::new())
     }
 
     pub(crate) fn get_block(
         &mut self,
         mempool: &mut CoreMempool,
-        block_size: u64,
+        max_txns: u64,
+        max_bytes: u64,
     ) -> Vec<SignedTransaction> {
-        let block = mempool.get_block(block_size, self.0.clone());
-        self.0 = self
-            .0
-            .union(
-                &block
-                    .iter()
-                    .map(|t| (t.sender(), t.sequence_number()))
-                    .collect(),
-            )
-            .cloned()
-            .collect();
+        let block = mempool.get_batch(max_txns, max_bytes, true, self.0.clone());
+        block.iter().for_each(|t| {
+            let txn_summary =
+                TransactionSummary::new(t.sender(), t.sequence_number(), t.committed_hash());
+            let txn_info = TransactionInProgress::new(t.gas_unit_price());
+            self.0.insert(txn_summary, txn_info);
+        });
         block
     }
 }
 
-pub(crate) fn exist_in_metrics_cache(mempool: &CoreMempool, txn: &SignedTransaction) -> bool {
-    mempool
-        .metrics_cache
-        .get(&(txn.sender(), txn.sequence_number()))
-        .is_some()
+/// Decompresses and deserializes the raw message bytes into a message struct
+pub fn decompress_and_deserialize(message_bytes: &Vec<u8>) -> MempoolSyncMsg {
+    bcs::from_bytes(
+        &aptos_compression::decompress(
+            message_bytes,
+            CompressionClient::Mempool,
+            MAX_APPLICATION_MESSAGE_SIZE,
+        )
+        .unwrap(),
+    )
+    .unwrap()
 }

@@ -1,67 +1,293 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    ledger_info::LedgerInfo,
-    proof::{SparseMerkleRangeProof, StateStoreValueProof},
-    state_store::state_key::StateKey,
-    transaction::Version,
+    on_chain_config::CurrentTimeMicroseconds, proof::SparseMerkleRangeProof,
+    state_store::state_key::StateKey, transaction::Version,
 };
-use anyhow::ensure;
-use aptos_crypto::{
-    hash::{CryptoHash, CryptoHasher, SPARSE_MERKLE_PLACEHOLDER_HASH},
-    HashValue,
-};
-use aptos_crypto_derive::CryptoHasher;
-use serde::{Deserialize, Serialize};
+use aptos_crypto::{hash::SPARSE_MERKLE_PLACEHOLDER_HASH, HashValue};
+use aptos_crypto_derive::{BCSCryptoHash, CryptoHasher};
+use bytes::Bytes;
+#[cfg(any(test, feature = "fuzzing"))]
+use proptest::{arbitrary::Arbitrary, prelude::*};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-#[derive(
-    Clone,
-    Debug,
-    Default,
-    CryptoHasher,
-    Eq,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    Ord,
-    PartialOrd,
-    Hash,
-)]
-#[cfg_attr(any(test, feature = "fuzzing"), derive(proptest_derive::Arbitrary))]
+#[derive(Deserialize, Serialize)]
+#[serde(rename = "StateValueMetadata")]
+pub enum PersistedStateValueMetadata {
+    V0 {
+        deposit: u64,
+        creation_time_usecs: u64,
+    },
+    V1 {
+        slot_deposit: u64,
+        bytes_deposit: u64,
+        creation_time_usecs: u64,
+    },
+}
+
+impl PersistedStateValueMetadata {
+    pub fn into_in_mem_form(self) -> StateValueMetadata {
+        match self {
+            PersistedStateValueMetadata::V0 {
+                deposit,
+                creation_time_usecs,
+            } => StateValueMetadata::new_impl(deposit, 0, creation_time_usecs),
+            PersistedStateValueMetadata::V1 {
+                slot_deposit,
+                bytes_deposit,
+                creation_time_usecs,
+            } => StateValueMetadata::new_impl(slot_deposit, bytes_deposit, creation_time_usecs),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+struct StateValueMetadataInner {
+    slot_deposit: u64,
+    bytes_deposit: u64,
+    creation_time_usecs: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct StateValueMetadata {
+    inner: Option<StateValueMetadataInner>,
+}
+
+impl StateValueMetadata {
+    pub fn into_persistable(self) -> Option<PersistedStateValueMetadata> {
+        self.inner.map(|inner| {
+            let StateValueMetadataInner {
+                slot_deposit,
+                bytes_deposit,
+                creation_time_usecs,
+            } = inner;
+            if bytes_deposit == 0 {
+                PersistedStateValueMetadata::V0 {
+                    deposit: slot_deposit,
+                    creation_time_usecs,
+                }
+            } else {
+                PersistedStateValueMetadata::V1 {
+                    slot_deposit,
+                    bytes_deposit,
+                    creation_time_usecs,
+                }
+            }
+        })
+    }
+
+    pub fn new(
+        slot_deposit: u64,
+        bytes_deposit: u64,
+        creation_time_usecs: &CurrentTimeMicroseconds,
+    ) -> Self {
+        Self::new_impl(
+            slot_deposit,
+            bytes_deposit,
+            creation_time_usecs.microseconds,
+        )
+    }
+
+    pub fn legacy(slot_deposit: u64, creation_time_usecs: &CurrentTimeMicroseconds) -> Self {
+        Self::new(slot_deposit, 0, creation_time_usecs)
+    }
+
+    pub fn placeholder(creation_time_usecs: &CurrentTimeMicroseconds) -> Self {
+        Self::legacy(0, creation_time_usecs)
+    }
+
+    pub fn none() -> Self {
+        Self { inner: None }
+    }
+
+    fn new_impl(slot_deposit: u64, bytes_deposit: u64, creation_time_usecs: u64) -> Self {
+        Self {
+            inner: Some(StateValueMetadataInner {
+                slot_deposit,
+                bytes_deposit,
+                creation_time_usecs,
+            }),
+        }
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.inner.is_none()
+    }
+
+    fn inner(&self) -> Option<&StateValueMetadataInner> {
+        self.inner.as_ref()
+    }
+
+    pub fn creation_time_usecs(&self) -> u64 {
+        self.inner().map_or(0, |v1| v1.creation_time_usecs)
+    }
+
+    pub fn slot_deposit(&self) -> u64 {
+        self.inner().map_or(0, |v1| v1.slot_deposit)
+    }
+
+    pub fn bytes_deposit(&self) -> u64 {
+        self.inner().map_or(0, |v1| v1.bytes_deposit)
+    }
+
+    pub fn total_deposit(&self) -> u64 {
+        self.slot_deposit() + self.bytes_deposit()
+    }
+
+    pub fn maybe_upgrade(&mut self) -> &mut Self {
+        *self = Self::new_impl(
+            self.slot_deposit(),
+            self.bytes_deposit(),
+            self.creation_time_usecs(),
+        );
+        self
+    }
+
+    fn expect_upgraded(&mut self) -> &mut StateValueMetadataInner {
+        self.inner.as_mut().expect("State metadata is None.")
+    }
+
+    pub fn set_slot_deposit(&mut self, amount: u64) {
+        self.expect_upgraded().slot_deposit = amount;
+    }
+
+    pub fn set_bytes_deposit(&mut self, amount: u64) {
+        self.expect_upgraded().bytes_deposit = amount;
+    }
+}
+
+#[derive(BCSCryptoHash, CryptoHasher, Deserialize, Serialize)]
+#[serde(rename = "StateValue")]
+enum PersistedStateValue {
+    V0(Bytes),
+    WithMetadata {
+        data: Bytes,
+        metadata: PersistedStateValueMetadata,
+    },
+}
+
+impl PersistedStateValue {
+    fn into_in_mem_form(self) -> StateValue {
+        match self {
+            PersistedStateValue::V0(data) => StateValue::new_legacy(data),
+            PersistedStateValue::WithMetadata { data, metadata } => {
+                StateValue::new_with_metadata(data, metadata.into_in_mem_form())
+            },
+        }
+    }
+}
+
+#[derive(BCSCryptoHash, Clone, CryptoHasher, Debug, Eq, PartialEq)]
 pub struct StateValue {
-    pub maybe_bytes: Option<Vec<u8>>,
-    hash: HashValue,
+    data: Bytes,
+    metadata: StateValueMetadata,
 }
 
 impl StateValue {
-    fn new(maybe_bytes: Option<Vec<u8>>) -> Self {
-        let mut hasher = StateValueHasher::default();
-        let hash = if let Some(bytes) = &maybe_bytes {
-            hasher.update(bytes);
-            hasher.finish()
-        } else {
-            HashValue::zero()
-        };
-        Self { maybe_bytes, hash }
-    }
-
-    pub fn empty() -> Self {
-        StateValue::new(None)
+    fn to_persistable_form(&self) -> PersistedStateValue {
+        let Self { data, metadata } = self.clone();
+        let metadata = metadata.into_persistable();
+        match metadata {
+            None => PersistedStateValue::V0(data),
+            Some(metadata) => PersistedStateValue::WithMetadata { data, metadata },
+        }
     }
 }
 
+#[cfg(any(test, feature = "fuzzing"))]
+impl Arbitrary for StateValue {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        any::<Vec<u8>>()
+            .prop_map(|bytes| StateValue::new_legacy(bytes.into()))
+            .boxed()
+    }
+}
+
+impl<'de> Deserialize<'de> for StateValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(PersistedStateValue::deserialize(deserializer)?.into_in_mem_form())
+    }
+}
+
+impl Serialize for StateValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.to_persistable_form().serialize(serializer)
+    }
+}
+
+impl StateValue {
+    pub fn new_legacy(bytes: Bytes) -> Self {
+        Self::new_with_metadata(bytes, StateValueMetadata::none())
+    }
+
+    pub fn new_with_metadata(data: Bytes, metadata: StateValueMetadata) -> Self {
+        Self { data, metadata }
+    }
+
+    pub fn size(&self) -> usize {
+        self.bytes().len()
+    }
+
+    pub fn bytes(&self) -> &Bytes {
+        &self.data
+    }
+
+    /// Applies a bytes-to-bytes transformation on the state value contents,
+    /// leaving the state value metadata untouched.
+    pub fn map_bytes<F: FnOnce(Bytes) -> anyhow::Result<Bytes>>(
+        self,
+        f: F,
+    ) -> anyhow::Result<StateValue> {
+        Ok(Self::new_with_metadata(f(self.data)?, self.metadata))
+    }
+
+    pub fn into_bytes(self) -> Bytes {
+        self.data
+    }
+
+    pub fn set_bytes(&mut self, data: Bytes) {
+        self.data = data;
+    }
+
+    pub fn metadata(&self) -> &StateValueMetadata {
+        &self.metadata
+    }
+
+    pub fn metadata_mut(&mut self) -> &mut StateValueMetadata {
+        &mut self.metadata
+    }
+
+    pub fn into_metadata(self) -> StateValueMetadata {
+        self.metadata
+    }
+
+    pub fn unpack(self) -> (StateValueMetadata, Bytes) {
+        let Self { data, metadata } = self;
+        (metadata, data)
+    }
+}
+
+// #[cfg(any(test, feature = "fuzzing"))]
 impl From<Vec<u8>> for StateValue {
     fn from(bytes: Vec<u8>) -> Self {
-        StateValue::new(Some(bytes))
+        StateValue::new_legacy(bytes.into())
     }
 }
 
-impl CryptoHash for StateValue {
-    type Hasher = StateValueHasher;
-
-    fn hash(&self) -> HashValue {
-        self.hash
+#[cfg(any(test, feature = "fuzzing"))]
+impl From<Bytes> for StateValue {
+    fn from(bytes: Bytes) -> Self {
+        StateValue::new_legacy(bytes)
     }
 }
 
@@ -78,9 +304,9 @@ pub struct StateValueChunkWithProof {
     pub last_index: u64,      // The last hashed state index in chunk
     pub first_key: HashValue, // The first hashed state key in chunk
     pub last_key: HashValue,  // The last hashed state key in chunk
-    pub raw_values: Vec<(StateKey, StateKeyAndValue)>, // The hashed state key and and raw state key and value.
+    pub raw_values: Vec<(StateKey, StateValue)>, // The hashed state key and and raw state value.
     pub proof: SparseMerkleRangeProof, // The proof to ensure the chunk is in the hashed states
-    pub root_hash: HashValue,          // The root hash of the sparse merkle tree for this chunk
+    pub root_hash: HashValue, // The root hash of the sparse merkle tree for this chunk
 }
 
 impl StateValueChunkWithProof {
@@ -94,82 +320,26 @@ impl StateValueChunkWithProof {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Indicates a state value becomes stale since `stale_since_version`.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(proptest_derive::Arbitrary))]
-pub struct StateValueWithProof {
-    /// The transaction version at which this account state is seen.
+pub struct StaleStateValueIndex {
+    /// The version since when the node is overwritten and becomes stale.
+    pub stale_since_version: Version,
+    /// The version identifying the value associated with this record.
     pub version: Version,
-    /// Value represents the value in state store. If this field is not set, it
-    /// means the key does not exist.
-    pub value: Option<StateValue>,
-    /// The proof the client can use to authenticate the value.
-    pub proof: StateStoreValueProof,
+    /// The `StateKey` identifying the value associated with this record.
+    pub state_key: StateKey,
 }
 
-impl StateValueWithProof {
-    /// Constructor.
-    pub fn new(version: Version, value: Option<StateValue>, proof: StateStoreValueProof) -> Self {
-        Self {
-            version,
-            value,
-            proof,
-        }
-    }
-
-    /// Verifies the state store value with the proof, both carried by `self`.
-    ///
-    /// Two things are ensured if no error is raised:
-    ///   1. This value exists in the ledger represented by `ledger_info`.
-    ///   2. It belongs to state_key and is seen at the time the transaction at version
-    /// `state_version` is just committed. To make sure this is the latest state, pass in
-    /// `ledger_info.version()` as `state_version`.
-    pub fn verify(
-        &self,
-        ledger_info: &LedgerInfo,
-        version: Version,
-        state_key: StateKey,
-    ) -> anyhow::Result<()> {
-        ensure!(
-            self.version == version,
-            "State version ({}) is not expected ({}).",
-            self.version,
-            version,
-        );
-
-        self.proof
-            .verify(ledger_info, version, state_key.hash(), self.value.as_ref())
-    }
-}
-
-#[derive(
-    Clone, Debug, CryptoHasher, Eq, PartialEq, Serialize, Deserialize, Ord, PartialOrd, Hash,
-)]
+/// Indicates a state value becomes stale since `stale_since_version`.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(proptest_derive::Arbitrary))]
-pub struct StateKeyAndValue {
-    pub key: StateKey,
-    pub value: StateValue,
-}
-
-impl StateKeyAndValue {
-    pub fn new(key: StateKey, value: StateValue) -> Self {
-        Self { key, value }
-    }
-}
-
-impl CryptoHash for StateKeyAndValue {
-    type Hasher = StateKeyAndValueHasher;
-
-    fn hash(&self) -> HashValue {
-        self.value.hash
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::state_store::state_value::StateValue;
-
-    #[test]
-    fn test_empty_state_value() {
-        StateValue::new(None);
-    }
+pub struct StaleStateValueByKeyHashIndex {
+    /// The version since when the node is overwritten and becomes stale.
+    pub stale_since_version: Version,
+    /// The version identifying the value associated with this record.
+    pub version: Version,
+    /// The hash of `StateKey` identifying the value associated with this record.
+    pub state_key_hash: HashValue,
 }

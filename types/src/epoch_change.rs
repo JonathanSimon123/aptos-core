@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -133,13 +134,18 @@ impl Arbitrary for EpochChangeProof {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{block_info::BlockInfo, epoch_state::EpochState, waypoint::Waypoint};
+    use crate::{
+        aggregate_signature::{AggregateSignature, PartialSignatures},
+        block_info::BlockInfo,
+        epoch_state::EpochState,
+        waypoint::Waypoint,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn verify_epoch_change_proof() {
         use crate::{ledger_info::LedgerInfo, validator_verifier::random_validator_verifier};
         use aptos_crypto::hash::HashValue;
-        use std::collections::BTreeMap;
 
         let all_epoch: Vec<u64> = (1..=10).collect();
         let mut valid_ledger_info = vec![];
@@ -147,12 +153,14 @@ mod tests {
 
         // We generate end-epoch ledger info for epoch 1 to 10, each signed by the current
         // validator set and carrying the next epoch info.
-        let (mut current_signers, mut current_verifier) = random_validator_verifier(1, None, true);
+        let (mut current_signers, current_verifier) = random_validator_verifier(1, None, true);
+        let mut current_verifier = Arc::new(current_verifier);
         let mut current_version = 123;
         for epoch in &all_epoch {
             validator_verifier.push(current_verifier.clone());
             let (next_signers, next_verifier) =
                 random_validator_verifier((*epoch + 1) as usize, None, true);
+            let next_verifier = Arc::new(next_verifier);
             let epoch_state = EpochState {
                 epoch: *epoch + 1,
                 verifier: next_verifier.clone(),
@@ -169,11 +177,21 @@ mod tests {
                 ),
                 HashValue::zero(),
             );
-            let signatures = current_signers
-                .iter()
-                .map(|s| (s.author(), s.sign(&ledger_info)))
-                .collect();
-            valid_ledger_info.push(LedgerInfoWithSignatures::new(ledger_info, signatures));
+            let partial_signatures = PartialSignatures::new(
+                current_signers
+                    .iter()
+                    .map(|s| (s.author(), s.sign(&ledger_info).unwrap()))
+                    .collect(),
+            );
+
+            let aggregated_signature = current_verifier
+                .aggregate_signatures(partial_signatures.signatures_iter())
+                .unwrap();
+
+            valid_ledger_info.push(LedgerInfoWithSignatures::new(
+                ledger_info,
+                aggregated_signature,
+            ));
             current_signers = next_signers;
             current_verifier = next_verifier;
             current_version += 1;
@@ -193,7 +211,7 @@ mod tests {
         assert!(proof_2
             .verify(&EpochState {
                 epoch: all_epoch[2],
-                verifier: validator_verifier[2].clone()
+                verifier: validator_verifier[2].clone(),
             })
             .is_ok());
 
@@ -201,7 +219,7 @@ mod tests {
         assert!(proof_1
             .verify(&EpochState {
                 epoch: all_epoch[4],
-                verifier: validator_verifier[4].clone()
+                verifier: validator_verifier[4].clone(),
             })
             .is_ok());
 
@@ -210,7 +228,7 @@ mod tests {
         assert!(proof_3
             .verify(&EpochState {
                 epoch: all_epoch[0],
-                verifier: validator_verifier[0].clone()
+                verifier: validator_verifier[0].clone(),
             })
             .is_err());
 
@@ -221,7 +239,7 @@ mod tests {
         assert!(proof_4
             .verify(&EpochState {
                 epoch: all_epoch[3],
-                verifier: validator_verifier[3].clone()
+                verifier: validator_verifier[3].clone(),
             })
             .is_err());
 
@@ -232,7 +250,7 @@ mod tests {
         assert!(proof_5
             .verify(&EpochState {
                 epoch: all_epoch[9],
-                verifier: validator_verifier[9].clone()
+                verifier: validator_verifier[9].clone(),
             })
             .is_err());
 
@@ -240,14 +258,14 @@ mod tests {
         let proof_6 = EpochChangeProof::new(
             vec![LedgerInfoWithSignatures::new(
                 valid_ledger_info[0].ledger_info().clone(),
-                BTreeMap::new(),
+                AggregateSignature::empty(),
             )],
             /* more = */ false,
         );
         assert!(proof_6
             .verify(&EpochState {
                 epoch: all_epoch[0],
-                verifier: validator_verifier[0].clone()
+                verifier: validator_verifier[0].clone(),
             })
             .is_err());
 

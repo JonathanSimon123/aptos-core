@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -7,22 +8,26 @@ use crate::{
     quorum_cert::QuorumCert,
 };
 use anyhow::{bail, ensure, format_err};
-use aptos_crypto::{ed25519::Ed25519Signature, hash::CryptoHash, HashValue};
+use aptos_bitvec::BitVec;
+use aptos_crypto::{bls12381, hash::CryptoHash, HashValue};
 use aptos_infallible::duration_since_epoch;
 use aptos_types::{
     account_address::AccountAddress,
     block_info::BlockInfo,
     block_metadata::BlockMetadata,
+    block_metadata_ext::BlockMetadataExt,
     epoch_state::EpochState,
     ledger_info::LedgerInfo,
-    transaction::{Transaction, Version},
+    randomness::Randomness,
+    transaction::{SignedTransaction, Transaction, Version},
     validator_signer::ValidatorSigner,
+    validator_txn::ValidatorTransaction,
     validator_verifier::ValidatorVerifier,
 };
 use mirai_annotations::debug_checked_verify_eq;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{
-    collections::BTreeMap,
+    convert::TryFrom,
     fmt::{self, Display, Formatter},
     iter::once,
 };
@@ -46,7 +51,7 @@ pub struct Block {
     block_data: BlockData,
     /// Signature that the hash of this block has been authored by the owner of the private key,
     /// this is only set within Proposal blocks
-    signature: Option<Ed25519Signature>,
+    signature: Option<bls12381::Signature>,
 }
 
 impl fmt::Debug for Block {
@@ -57,15 +62,18 @@ impl fmt::Debug for Block {
 
 impl Display for Block {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        let nil_marker = if self.is_nil_block() { " (NIL)" } else { "" };
+        let author = self
+            .author()
+            .map(|addr| format!("{}", addr))
+            .unwrap_or_else(|| "(NIL)".to_string());
         write!(
             f,
-            "[id: {}{}, epoch: {}, round: {:02}, parent_id: {}, timestamp: {}]",
+            "[id: {}, author: {}, epoch: {}, round: {:02}, parent_id: {}, timestamp: {}]",
             self.id,
-            nil_marker,
+            author,
             self.epoch(),
             self.round(),
-            self.quorum_cert().certified_block().id(),
+            self.parent_id(),
             self.timestamp_usecs(),
         )
     }
@@ -91,11 +99,28 @@ impl Block {
     }
 
     pub fn parent_id(&self) -> HashValue {
-        self.block_data.quorum_cert().certified_block().id()
+        self.block_data.parent_id()
     }
 
     pub fn payload(&self) -> Option<&Payload> {
         self.block_data.payload()
+    }
+
+    pub fn payload_size(&self) -> usize {
+        match self.block_data.payload() {
+            None => 0,
+            Some(payload) => match payload {
+                Payload::InQuorumStore(pos) => pos.proofs.len(),
+                Payload::DirectMempool(_txns) => 0,
+                Payload::InQuorumStoreWithLimit(pos) => pos.proof_with_data.proofs.len(),
+                Payload::QuorumStoreInlineHybrid(inline_batches, proof_with_data, _) => {
+                    inline_batches.len() + proof_with_data.proofs.len()
+                },
+                Payload::OptQuorumStore(opt_quorum_store_payload) => {
+                    opt_quorum_store_payload.num_txns()
+                },
+            },
+        }
     }
 
     pub fn quorum_cert(&self) -> &QuorumCert {
@@ -106,7 +131,7 @@ impl Block {
         self.block_data.round()
     }
 
-    pub fn signature(&self) -> Option<&Ed25519Signature> {
+    pub fn signature(&self) -> Option<&bls12381::Signature> {
         self.signature.as_ref()
     }
 
@@ -164,7 +189,7 @@ impl Block {
     pub fn new_for_testing(
         id: HashValue,
         block_data: BlockData,
-        signature: Option<Ed25519Signature>,
+        signature: Option<bls12381::Signature>,
     ) -> Self {
         Block {
             id,
@@ -175,10 +200,45 @@ impl Block {
 
     /// The NIL blocks are special: they're not carrying any real payload and are generated
     /// independently by different validators just to fill in the round with some QC.
-    pub fn new_nil(round: Round, quorum_cert: QuorumCert) -> Self {
-        let block_data = BlockData::new_nil(round, quorum_cert);
+    pub fn new_nil(
+        round: Round,
+        quorum_cert: QuorumCert,
+        failed_authors: Vec<(Round, Author)>,
+    ) -> Self {
+        let block_data = BlockData::new_nil(round, quorum_cert, failed_authors);
 
         Block {
+            id: block_data.hash(),
+            block_data,
+            signature: None,
+        }
+    }
+
+    pub fn new_for_dag(
+        epoch: u64,
+        round: Round,
+        timestamp: u64,
+        validator_txns: Vec<ValidatorTransaction>,
+        payload: Payload,
+        author: Author,
+        failed_authors: Vec<(Round, Author)>,
+        parent_block_id: HashValue,
+        parents_bitvec: BitVec,
+        node_digests: Vec<HashValue>,
+    ) -> Self {
+        let block_data = BlockData::new_for_dag(
+            epoch,
+            round,
+            timestamp,
+            validator_txns,
+            payload,
+            author,
+            failed_authors,
+            parent_block_id,
+            parents_bitvec,
+            node_digests,
+        );
+        Self {
             id: block_data.hash(),
             block_data,
             signature: None,
@@ -191,10 +251,34 @@ impl Block {
         timestamp_usecs: u64,
         quorum_cert: QuorumCert,
         validator_signer: &ValidatorSigner,
-    ) -> Self {
+        failed_authors: Vec<(Round, Author)>,
+    ) -> anyhow::Result<Self> {
         let block_data = BlockData::new_proposal(
             payload,
             validator_signer.author(),
+            failed_authors,
+            round,
+            timestamp_usecs,
+            quorum_cert,
+        );
+
+        Self::new_proposal_from_block_data(block_data, validator_signer)
+    }
+
+    pub fn new_proposal_ext(
+        validator_txns: Vec<ValidatorTransaction>,
+        payload: Payload,
+        round: Round,
+        timestamp_usecs: u64,
+        quorum_cert: QuorumCert,
+        validator_signer: &ValidatorSigner,
+        failed_authors: Vec<(Round, Author)>,
+    ) -> anyhow::Result<Self> {
+        let block_data = BlockData::new_proposal_ext(
+            validator_txns,
+            payload,
+            validator_signer.author(),
+            failed_authors,
             round,
             timestamp_usecs,
             quorum_cert,
@@ -206,14 +290,16 @@ impl Block {
     pub fn new_proposal_from_block_data(
         block_data: BlockData,
         validator_signer: &ValidatorSigner,
-    ) -> Self {
-        let signature = validator_signer.sign(&block_data);
-        Self::new_proposal_from_block_data_and_signature(block_data, signature)
+    ) -> anyhow::Result<Self> {
+        let signature = validator_signer.sign(&block_data)?;
+        Ok(Self::new_proposal_from_block_data_and_signature(
+            block_data, signature,
+        ))
     }
 
     pub fn new_proposal_from_block_data_and_signature(
         block_data: BlockData,
-        signature: Ed25519Signature,
+        signature: bls12381::Signature,
     ) -> Self {
         Block {
             id: block_data.hash(),
@@ -222,12 +308,16 @@ impl Block {
         }
     }
 
+    pub fn validator_txns(&self) -> Option<&Vec<ValidatorTransaction>> {
+        self.block_data.validator_txns()
+    }
+
     /// Verifies that the proposal and the QC are correctly signed.
     /// If this is the genesis block, we skip these checks.
     pub fn validate_signature(&self, validator: &ValidatorVerifier) -> anyhow::Result<()> {
         match self.block_data.block_type() {
             BlockType::Genesis => bail!("We should not accept genesis from others"),
-            BlockType::NilBlock => self.quorum_cert().verify(validator),
+            BlockType::NilBlock { .. } => self.quorum_cert().verify(validator),
             BlockType::Proposal { author, .. } => {
                 let signature = self
                     .signature
@@ -235,7 +325,16 @@ impl Block {
                     .ok_or_else(|| format_err!("Missing signature in Proposal"))?;
                 validator.verify(*author, &self.block_data, signature)?;
                 self.quorum_cert().verify(validator)
-            }
+            },
+            BlockType::ProposalExt(proposal_ext) => {
+                let signature = self
+                    .signature
+                    .as_ref()
+                    .ok_or_else(|| format_err!("Missing signature in Proposal"))?;
+                validator.verify(*proposal_ext.author(), &self.block_data, signature)?;
+                self.quorum_cert().verify(validator)
+            },
+            BlockType::DAGBlock { .. } => bail!("We should not accept DAG block from others"),
         }
     }
 
@@ -261,6 +360,38 @@ impl Block {
                 "Reconfiguration suffix should not carry payload"
             );
         }
+
+        if let Some(payload) = self.payload() {
+            payload.verify_epoch(self.epoch())?;
+        }
+
+        if let Some(failed_authors) = self.block_data().failed_authors() {
+            // when validating for being well formed,
+            // allow for missing failed authors,
+            // for whatever reason (from different max configuration, etc),
+            // but don't allow anything that shouldn't be there.
+            //
+            // we validate the full correctness of this field in round_manager.process_proposal()
+            let succ_round = self.round() + u64::from(self.is_nil_block());
+            let skipped_rounds = succ_round.checked_sub(parent.round() + 1);
+            ensure!(
+                skipped_rounds.is_some(),
+                "Block round is smaller than block's parent round"
+            );
+            ensure!(
+                failed_authors.len() <= skipped_rounds.unwrap() as usize,
+                "Block has more failed authors than missed rounds"
+            );
+            let mut bound = parent.round();
+            for (round, _) in failed_authors {
+                ensure!(
+                    bound < *round && *round < succ_round,
+                    "Incorrect round in failed authors"
+                );
+                bound = *round;
+            }
+        }
+
         if self.is_nil_block() || parent.has_reconfiguration() {
             ensure!(
                 self.timestamp_usecs() == parent.timestamp_usecs(),
@@ -293,69 +424,87 @@ impl Block {
         Ok(())
     }
 
-    pub fn transactions_to_execute(&self, validators: &[AccountAddress]) -> Vec<Transaction> {
-        std::iter::once(Transaction::BlockMetadata(
-            self.new_block_metadata(validators),
-        ))
-        .chain(
-            self.payload()
-                .unwrap_or(&Vec::new())
-                .iter()
-                .cloned()
-                .map(Transaction::UserTransaction)
-                .chain(once(Transaction::StateCheckpoint)),
-        )
-        .collect()
+    pub fn combine_to_input_transactions(
+        validator_txns: Vec<ValidatorTransaction>,
+        txns: Vec<SignedTransaction>,
+        metadata: BlockMetadataExt,
+    ) -> Vec<Transaction> {
+        once(Transaction::from(metadata))
+            .chain(
+                validator_txns
+                    .into_iter()
+                    .map(Transaction::ValidatorTransaction),
+            )
+            .chain(txns.into_iter().map(Transaction::UserTransaction))
+            .collect()
     }
 
-    fn new_block_metadata(&self, validators: &[AccountAddress]) -> BlockMetadata {
+    fn previous_bitvec(&self) -> BitVec {
+        if let BlockType::DAGBlock { parents_bitvec, .. } = self.block_data.block_type() {
+            parents_bitvec.clone()
+        } else {
+            self.quorum_cert().ledger_info().get_voters_bitvec().clone()
+        }
+    }
+
+    pub fn new_block_metadata(&self, validators: &[AccountAddress]) -> BlockMetadata {
         BlockMetadata::new(
             self.id(),
             self.epoch(),
             self.round(),
-            // A bitmap of voters
-            Self::voters_to_bitmap(validators, self.quorum_cert().ledger_info().signatures()),
-            // For nil block, we use 0x0 which is convention for nil address in move.
             self.author().unwrap_or(AccountAddress::ZERO),
+            self.previous_bitvec().into(),
+            // For nil block, we use 0x0 which is convention for nil address in move.
+            self.block_data()
+                .failed_authors()
+                .map_or(vec![], |failed_authors| {
+                    Self::failed_authors_to_indices(validators, failed_authors)
+                }),
             self.timestamp_usecs(),
         )
     }
 
-    fn voters_to_bitmap<T>(
+    pub fn new_metadata_with_randomness(
+        &self,
         validators: &[AccountAddress],
-        voters: &BTreeMap<AccountAddress, T>,
-    ) -> Vec<bool> {
-        validators
-            .iter()
-            .map(|address| voters.contains_key(address))
-            .collect()
+        randomness: Option<Randomness>,
+    ) -> BlockMetadataExt {
+        BlockMetadataExt::new_v1(
+            self.id(),
+            self.epoch(),
+            self.round(),
+            self.author().unwrap_or(AccountAddress::ZERO),
+            self.previous_bitvec().into(),
+            // For nil block, we use 0x0 which is convention for nil address in move.
+            self.block_data()
+                .failed_authors()
+                .map_or(vec![], |failed_authors| {
+                    Self::failed_authors_to_indices(validators, failed_authors)
+                }),
+            self.timestamp_usecs(),
+            randomness,
+        )
     }
-}
 
-#[cfg(test)]
-mod test {
-    use crate::block::Block;
-    use aptos_types::account_address::AccountAddress;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn test_voters_to_bitmap() {
-        let validators: Vec<_> = (0..4)
-            .into_iter()
-            .map(|_| AccountAddress::random())
-            .collect();
-        let expected_voter_bitmap = vec![true, true, false, true];
-
-        let voters: BTreeMap<_, _> = validators
+    fn failed_authors_to_indices(
+        validators: &[AccountAddress],
+        failed_authors: &[(Round, Author)],
+    ) -> Vec<u32> {
+        failed_authors
             .iter()
-            .zip(expected_voter_bitmap.iter())
-            .filter_map(|(&validator, &voted)| if voted { Some((validator, 0)) } else { None })
-            .collect();
-
-        assert_eq!(
-            expected_voter_bitmap,
-            Block::voters_to_bitmap(&validators, &voters)
-        );
+            .map(|(_round, failed_author)| {
+                validators
+                    .iter()
+                    .position(|&v| v == *failed_author)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Failed author {} not in validator list {:?}",
+                            *failed_author, validators
+                        )
+                    })
+            })
+            .map(|index| u32::try_from(index).expect("Index is out of bounds for u32"))
+            .collect()
     }
 }
 
@@ -368,7 +517,7 @@ impl<'de> Deserialize<'de> for Block {
         #[serde(rename = "Block")]
         struct BlockWithoutId {
             block_data: BlockData,
-            signature: Option<Ed25519Signature>,
+            signature: Option<bls12381::Signature>,
         }
 
         let BlockWithoutId {

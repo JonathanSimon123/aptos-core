@@ -1,8 +1,8 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use aptos_types::{transaction::SignedTransaction, vm_status::VMStatus};
-use language_e2e_tests::{
+use aptos_language_e2e_tests::{
     account::Account,
     common_transactions::create_account_txn,
     execution_strategies::{
@@ -16,11 +16,30 @@ use language_e2e_tests::{
         types::Executor,
     },
 };
+use aptos_types::{
+    transaction::{ExecutionStatus, SignedTransaction, TransactionStatus},
+    vm_status::VMStatus,
+};
 
 fn txn(seq_num: u64) -> SignedTransaction {
     let account = Account::new();
     let aptos_root = Account::new_aptos_root();
-    create_account_txn(&aptos_root, &account, seq_num + 1)
+    create_account_txn(&aptos_root, &account, seq_num)
+}
+
+fn execute_and_assert_success<T>(
+    exec: &mut impl Executor<Txn = T>,
+    block: Vec<T>,
+    num_txns: usize,
+) {
+    let output = exec.execute_block(block).unwrap();
+    output.iter().for_each(|txn_output| {
+        assert_eq!(
+            txn_output.status(),
+            &TransactionStatus::Keep(ExecutionStatus::Success)
+        );
+    });
+    assert_eq!(output.len(), num_txns);
 }
 
 #[test]
@@ -31,7 +50,7 @@ fn test_execution_strategies() {
         println!("===========================================================================");
         let big_block = (0..10).map(txn).collect();
         let mut exec = BasicExecutor::new();
-        exec.execute_block(big_block).unwrap();
+        execute_and_assert_success(&mut exec, big_block, 10);
     }
 
     {
@@ -40,7 +59,7 @@ fn test_execution_strategies() {
         println!("===========================================================================");
         let big_block = (0..10).map(txn).collect();
         let mut exec = RandomExecutor::from_os_rng();
-        exec.execute_block(big_block).unwrap();
+        execute_and_assert_success(&mut exec, big_block, 10);
     }
 
     {
@@ -67,7 +86,7 @@ fn test_execution_strategies() {
         block1.append(&mut block);
 
         let mut exec = GuidedExecutor::new(PartitionedGuidedStrategy);
-        exec.execute_block(block1).unwrap();
+        execute_and_assert_success(&mut exec, block1, 42);
     }
 
     {
@@ -96,7 +115,7 @@ fn test_execution_strategies() {
         let mut exec = MultiExecutor::<AnnotatedTransaction, VMStatus>::new();
         exec.add_executor(GuidedExecutor::new(PartitionedGuidedStrategy));
         exec.add_executor(GuidedExecutor::new(UnPartitionedGuidedStrategy));
-        exec.execute_block(block1).unwrap();
+        execute_and_assert_success(&mut exec, block1, 42);
     }
 
     {
@@ -109,6 +128,6 @@ fn test_execution_strategies() {
         exec.add_executor(RandomExecutor::from_os_rng());
         exec.add_executor(RandomExecutor::from_os_rng());
         exec.add_executor(RandomExecutor::from_os_rng());
-        exec.execute_block(block).unwrap();
+        execute_and_assert_success(&mut exec, block, 10);
     }
 }
