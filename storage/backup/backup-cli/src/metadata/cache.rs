@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -7,52 +8,83 @@ use crate::{
     storage::{BackupStorage, FileHandle},
     utils::{error_notes::ErrorNotes, stream::StreamX},
 };
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use aptos_logger::prelude::*;
 use aptos_temppath::TempPath;
 use async_trait::async_trait;
-use futures::stream::poll_fn;
-use once_cell::sync::Lazy;
+use clap::Parser;
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
-use structopt::StructOpt;
 use tokio::{
     fs::{create_dir_all, read_dir, remove_file, OpenOptions},
     io::{AsyncRead, AsyncReadExt},
 };
-use tokio_stream::StreamExt;
+use tokio_stream::{wrappers::ReadDirStream, StreamExt};
 
-static TEMP_METADATA_CACHE_DIR: Lazy<TempPath> = Lazy::new(|| {
-    let dir = TempPath::new();
-    dir.create_as_dir()
-        .expect("Temp metadata dir should create.");
-    dir
-});
-
-#[derive(StructOpt)]
+#[derive(Clone, Parser)]
 pub struct MetadataCacheOpt {
-    #[structopt(
+    #[clap(
         long = "metadata-cache-dir",
-        parse(from_os_str),
-        help = "[Defaults to temporary dir] Metadata cache dir."
+        value_parser,
+        help = "Metadata cache dir. If specified and shared across runs, \
+        metadata files in cache won't be downloaded again from backup source, speeding up tool \
+        boot up significantly. Cache content can be messed up if used across the devnet, \
+        the testnet and the mainnet, hence it [Defaults to temporary dir]."
     )]
     dir: Option<PathBuf>,
 }
 
 impl MetadataCacheOpt {
-    // in cache we save things other than the cached files.
+    // in case we save things other than the cached files.
     const SUB_DIR: &'static str = "cache";
 
-    fn cache_dir(&self) -> PathBuf {
+    pub fn new(dir: Option<impl AsRef<Path>>) -> Self {
+        Self {
+            dir: dir.map(|dir| dir.as_ref().to_path_buf()),
+        }
+    }
+
+    pub(crate) fn cache_dir(&self) -> PathBuf {
         self.dir
             .clone()
-            .unwrap_or_else(|| TEMP_METADATA_CACHE_DIR.path().to_path_buf())
+            .unwrap_or_else(|| TempPath::new().path().to_path_buf())
             .join(Self::SUB_DIR)
     }
+}
+
+/// Try to load the identity metadata, if not present, try to write one in.
+pub async fn initialize_identity(storage: &Arc<dyn BackupStorage>) -> Result<()> {
+    let metadata = Metadata::new_random_identity();
+    storage
+        .save_metadata_line(&metadata.name(), &metadata.to_text_line()?)
+        .await?;
+    Ok(())
+}
+
+async fn download_file(
+    storage_ref: &dyn BackupStorage,
+    file_handle: &FileHandle,
+    local_tmp_file: &Path,
+) -> Result<()> {
+    tokio::io::copy(
+        &mut storage_ref
+            .open_for_read(file_handle)
+            .await
+            .err_notes(file_handle)?,
+        &mut OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(local_tmp_file)
+            .await
+            .err_notes(local_tmp_file)?,
+    )
+    .await
+    .map_err(|e| anyhow!("Failed to download file: {}", e))?;
+    Ok(())
 }
 
 /// Sync local cache folder with remote storage, and load all metadata entries from the cache.
@@ -66,29 +98,32 @@ pub async fn sync_and_load(
     create_dir_all(&cache_dir).await.err_notes(&cache_dir)?; // create if not present already
 
     // List cached metadata files.
-    let mut dir = read_dir(&cache_dir).await.err_notes(&cache_dir)?;
-    let local_entries = poll_fn(|ctx| {
-        ::std::task::Poll::Ready(match futures::ready!(dir.poll_next_entry(ctx)) {
-            Ok(Some(entry)) => Some(Ok(entry)),
-            Ok(None) => None,
-            Err(err) => Some(Err(err)),
+    let dir = read_dir(&cache_dir).await.err_notes(&cache_dir)?;
+    let local_hashes_vec: Vec<String> = ReadDirStream::new(dir)
+        .filter_map(|entry| match entry {
+            Ok(e) => {
+                let path = e.path();
+                let file_name = path.file_name()?.to_str()?;
+                Some(file_name.to_string())
+            },
+            Err(_) => None,
         })
-    })
-    .collect::<tokio::io::Result<Vec<_>>>()
-    .await?;
-    let local_hashes = local_entries
-        .iter()
-        .map(|e| {
-            e.file_name()
-                .into_string()
-                .map_err(|s| anyhow!("into_string() failed for file name {:?}", s))
-        })
-        .collect::<Result<HashSet<_>>>()?;
-
+        .collect()
+        .await;
+    let local_hashes: HashSet<_> = local_hashes_vec.into_iter().collect();
     // List remote metadata files.
-    let remote_file_handles = storage.list_metadata_files().await?;
+    let mut remote_file_handles = storage.list_metadata_files().await?;
+    if remote_file_handles.is_empty() {
+        initialize_identity(&storage).await.context(
+            "\
+            Backup storage appears empty and failed to put in identity metadata, \
+            no point to go on. If you believe there is content in the backup, check authentication.\
+            ",
+        )?;
+        remote_file_handles = storage.list_metadata_files().await?;
+    }
     let remote_file_handle_by_hash: HashMap<_, _> = remote_file_handles
-        .into_iter()
+        .iter()
         .map(|file_handle| (file_handle.file_handle_hash(), file_handle))
         .collect();
     let remote_hashes: HashSet<_> = remote_file_handle_by_hash.keys().cloned().collect();
@@ -101,39 +136,48 @@ pub async fn sync_and_load(
     let up_to_date_local_hashes = local_hashes.intersection(&remote_hashes);
 
     for h in stale_local_hashes {
-        let file = cache_dir.join(&*h);
+        let file = cache_dir.join(h);
         remove_file(&file).await.err_notes(&file)?;
+        info!(file_name = h, "Deleted stale metadata file in cache.");
     }
 
-    NUM_META_MISS.set(new_remote_hashes.len() as i64);
+    let num_new_files = new_remote_hashes.len();
+    NUM_META_MISS.set(num_new_files as i64);
     NUM_META_DOWNLOAD.set(0);
-    let futs = new_remote_hashes.iter().map(|h| {
+    let futs = new_remote_hashes.iter().enumerate().map(|(i, h)| {
         let fh_by_h_ref = &remote_file_handle_by_hash;
-        let storage_ref = &storage;
+        let storage_ref = storage.as_ref();
         let cache_dir_ref = &cache_dir;
 
         async move {
             let file_handle = fh_by_h_ref.get(*h).expect("In map.");
             let local_file = cache_dir_ref.join(*h);
             let local_tmp_file = cache_dir_ref.join(format!(".{}", *h));
-            // download to tmp file ".xxxxxx"
-            tokio::io::copy(
-                &mut storage_ref
-                    .open_for_read(file_handle)
-                    .await
-                    .err_notes(file_handle)?,
-                &mut OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&local_tmp_file)
-                    .await
-                    .err_notes(&local_file)?,
-            )
-            .await?;
-            // rename to target file only if successful; stale tmp file caused by failure will be
-            // reclaimed on next run
-            tokio::fs::rename(local_tmp_file, local_file).await?;
-            NUM_META_DOWNLOAD.inc();
+
+            match download_file(storage_ref, file_handle, &local_tmp_file).await {
+                Ok(_) => {
+                    // rename to target file only if successful; stale tmp file caused by failure will be
+                    // reclaimed on next run
+                    tokio::fs::rename(local_tmp_file.clone(), local_file)
+                        .await
+                        .err_notes(local_tmp_file)?;
+                    info!(
+                        file_handle = file_handle,
+                        processed = i + 1,
+                        total = num_new_files,
+                        "Metadata file downloaded."
+                    );
+                    NUM_META_DOWNLOAD.inc();
+                },
+                Err(e) => {
+                    warn!(
+                        file_handle = file_handle,
+                        error = %e,
+                        "Ignoring metadata file download error -- can be compactor removing files."
+                    )
+                },
+            }
+
             Ok(())
         }
     });
@@ -145,10 +189,11 @@ pub async fn sync_and_load(
         .collect::<Result<Vec<_>>>()
         .await?;
 
+    info!("Loading all metadata files to memory.");
     // Load metadata from synced cache files.
     let mut metadata_vec = Vec::new();
     for h in new_remote_hashes.into_iter().chain(up_to_date_local_hashes) {
-        let cached_file = cache_dir.join(&*h);
+        let cached_file = cache_dir.join(h);
         metadata_vec.extend(
             OpenOptions::new()
                 .read(true)
@@ -162,10 +207,11 @@ pub async fn sync_and_load(
         )
     }
     info!(
-        "Metadata cache loaded in {:.2} seconds.",
-        timer.elapsed().as_secs_f64()
+        total_time = timer.elapsed().as_secs(),
+        "Metadata cache loaded.",
     );
-    Ok(metadata_vec.into())
+
+    Ok(MetadataView::new(metadata_vec, remote_file_handles))
 }
 
 trait FileHandleHash {

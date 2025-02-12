@@ -1,7 +1,7 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
-use move_deps::move_core_types::{
+use move_core_types::{
     ident_str,
     identifier::IdentStr,
     move_resource::{MoveResource, MoveStructType},
@@ -14,7 +14,7 @@ pub struct TimestampResource {
 }
 
 impl MoveStructType for TimestampResource {
-    const MODULE_NAME: &'static IdentStr = ident_str!("Timestamp");
+    const MODULE_NAME: &'static IdentStr = ident_str!("timestamp");
     const STRUCT_NAME: &'static IdentStr = ident_str!("CurrentTimeMicroseconds");
 }
 

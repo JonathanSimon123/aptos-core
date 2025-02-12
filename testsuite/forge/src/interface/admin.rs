@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{ChainInfo, CoreContext, Test};
@@ -12,19 +13,19 @@ use reqwest::Url;
 /// of the validators or full nodes running on the network.
 pub trait AdminTest: Test {
     /// Executes the test against the given context.
-    fn run<'t>(&self, ctx: &mut AdminContext<'t>) -> Result<()>;
+    fn run(&self, ctx: &mut AdminContext<'_>) -> Result<()>;
 }
 
 #[derive(Debug)]
 pub struct AdminContext<'t> {
     core: CoreContext,
 
-    chain_info: ChainInfo<'t>,
+    chain_info: ChainInfo,
     pub report: &'t mut TestReport,
 }
 
 impl<'t> AdminContext<'t> {
-    pub fn new(core: CoreContext, chain_info: ChainInfo<'t>, report: &'t mut TestReport) -> Self {
+    pub fn new(core: CoreContext, chain_info: ChainInfo, report: &'t mut TestReport) -> Self {
         Self {
             core,
             chain_info,
@@ -44,7 +45,7 @@ impl<'t> AdminContext<'t> {
         RestClient::new(Url::parse(self.chain_info.rest_api()).unwrap())
     }
 
-    pub fn chain_info(&mut self) -> &mut ChainInfo<'t> {
+    pub fn chain_info(&mut self) -> &mut ChainInfo {
         &mut self.chain_info
     }
 

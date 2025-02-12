@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use aptos_crypto_derive::{BCSCryptoHash, CryptoHasher};
@@ -38,6 +39,13 @@ impl VoteData {
         Self { proposed, parent }
     }
 
+    pub fn dummy() -> Self {
+        Self {
+            proposed: BlockInfo::empty(),
+            parent: BlockInfo::empty(),
+        }
+    }
+
     /// Returns block information associated to the block being extended by the proposal.
     pub fn parent(&self) -> &BlockInfo {
         &self.parent
@@ -70,5 +78,10 @@ impl VoteData {
             "Proposed version is less than parent version",
         );
         Ok(())
+    }
+
+    /// Is the vote for a NIL block.
+    pub fn is_for_nil(&self) -> bool {
+        self.proposed().timestamp_usecs() == self.parent().timestamp_usecs()
     }
 }

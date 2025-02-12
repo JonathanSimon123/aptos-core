@@ -5,17 +5,20 @@ variable "region" {
 
 variable "era" {
   description = "Chain era, used to start a clean chain"
-  default = 1
+  type        = number
+  default     = 1
 }
 
 variable "chain_id" {
   description = "Aptos chain ID"
-  default = "TESTING"
+  type        = string
+  default     = "TESTING"
 }
 
 variable "chain_name" {
   description = "Aptos chain name"
-  default = "testnet"
+  type        = string
+  default     = "testnet"
 }
 
 variable "validator_name" {
@@ -25,26 +28,31 @@ variable "validator_name" {
 
 variable "image_tag" {
   description = "Docker image tag for Aptos node"
+  type        = string
   default     = "devnet"
 }
 
 variable "zone_name" {
   description = "Zone name of Azure DNS domain to create records in"
+  type        = string
   default     = ""
 }
 
 variable "zone_resource_group" {
   description = "Azure resource group name of the DNS zone"
+  type        = string
   default     = ""
 }
 
 variable "record_name" {
   description = "DNS record name to use (<workspace> is replaced with the TF workspace name)"
+  type        = string
   default     = "<workspace>.aptos"
 }
 
 variable "helm_chart" {
   description = "Path to aptos-validator Helm chart file"
+  type        = string
   default     = ""
 }
 
@@ -56,16 +64,13 @@ variable "helm_values" {
 
 variable "helm_values_file" {
   description = "Path to file containing values for Helm chart"
+  type        = string
   default     = ""
-}
-
-variable "helm_force_update" {
-  description = "Force Terraform to update the Helm deployment"
-  default     = true
 }
 
 variable "k8s_api_sources" {
   description = "List of CIDR subnets which can access the Kubernetes API endpoint"
+  type        = list(string)
   default     = ["0.0.0.0/0"]
 }
 
@@ -77,54 +82,42 @@ variable "node_pool_sizes" {
 
 variable "k8s_viewer_groups" {
   description = "List of AD Group IDs to configure as Kubernetes viewers"
-  type = list(string)
-  default = []
+  type        = list(string)
+  default     = []
 }
 
 variable "k8s_debugger_groups" {
   description = "List of AD Group IDs to configure as Kubernetes debuggers"
-  type = list(string)
-  default = []
+  type        = list(string)
+  default     = []
 }
 
 variable "utility_instance_type" {
   description = "Instance type used for utilities"
-  default     = "Standard_B2s"
+  type        = string
+  default     = "Standard_B8ms"
 }
 
 variable "utility_instance_num" {
   description = "Number of instances for utilities"
+  type        = number
   default     = 1
 }
 
 variable "validator_instance_type" {
   description = "Instance type used for validator and fullnodes"
+  type        = string
   default     = "Standard_F4s_v2"
 }
 
 variable "validator_instance_num" {
   description = "Number of instances used for validator and fullnodes"
+  type        = string
   default     = 2
 }
 
-variable "enable_logger" {
-  description = "Enable logger helm chart"
+variable "validator_instance_enable_taint" {
+  description = "Whether to taint the instances in the validator nodegroup"
+  type        = bool
   default     = false
-}
-
-variable "logger_helm_values" {
-  description = "Map of values to pass to logger Helm"
-  type        = any
-  default     = {}
-}
-
-variable "enable_monitoring" {
-  description = "Enable monitoring helm chart"
-  default     = false
-}
-
-variable "monitoring_helm_values" {
-  description = "Map of values to pass to monitoring Helm"
-  type        = any
-  default     = {}
 }

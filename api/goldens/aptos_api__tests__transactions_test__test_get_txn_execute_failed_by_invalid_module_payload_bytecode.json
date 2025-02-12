@@ -1,63 +1,44 @@
 {
-  "type": "user_transaction",
   "version": "2",
   "hash": "",
-  "state_root_hash": "",
+  "state_change_hash": "",
   "event_root_hash": "",
+  "state_checkpoint_hash": null,
   "gas_used": "1",
   "success": false,
-  "vm_status": "Transaction Executed and Committed with Error MALFORMED",
+  "vm_status": "MALFORMED",
   "accumulator_root_hash": "",
   "changes": [
     {
-      "type": "write_resource",
       "address": "0xa550c18",
       "state_key_hash": "",
       "data": {
-        "type": "0x1::Account::Account",
+        "type": "0x1::account::Account",
         "data": {
-          "authentication_key": "0x7deeccb1080854f499ec8b4c1b213b82c5e34b925cf6875fec02d4b77adbd2d6",
-          "self_address": "0xa550c18",
-          "sequence_number": "1"
-        }
-      }
-    },
-    {
-      "type": "write_resource",
-      "address": "0xa550c18",
-      "state_key_hash": "",
-      "data": {
-        "type": "0x1::Coin::CoinStore<0x1::TestCoin::TestCoin>",
-        "data": {
-          "coin": {
-            "value": "18446744073709551614"
-          },
-          "deposit_events": {
-            "counter": "1",
+          "authentication_key": "0xcef8ffd1ab9017e96132df8a56b22de39a8155e1c3fc32affbbf93eb624b532a",
+          "coin_register_events": {
+            "counter": "0",
             "guid": {
-              "guid": {
-                "id": {
-                  "addr": "0xa550c18",
-                  "creation_num": "1"
-                }
-              },
-              "len_bytes": 40
+              "id": {
+                "addr": "0xa550c18",
+                "creation_num": "0"
+              }
             }
           },
-          "withdraw_events": {
-            "counter": "1",
-            "guid": {
-              "guid": {
-                "id": {
-                  "addr": "0xa550c18",
-                  "creation_num": "2"
-                }
-              },
-              "len_bytes": 40
+          "rotation_capability_offer": {
+            "for": {
+              "vec": []
+            }
+          },
+          "sequence_number": "1",
+          "signer_capability_offer": {
+            "for": {
+              "vec": []
             }
           }
         }
-      }
+      },
+      "type": "write_resource"
     }
   ],
   "sender": "0xa550c18",
@@ -66,19 +47,20 @@
   "gas_unit_price": "0",
   "expiration_timestamp_secs": "18446744073709551615",
   "payload": {
-    "type": "module_bundle_payload",
     "modules": [
       {
         "bytecode": "0xa11ceb0b030000",
         "abi": null
       }
-    ]
+    ],
+    "type": "module_bundle_payload"
   },
   "signature": {
-    "type": "ed25519_signature",
-    "public_key": "0xb9c6ee1630ef3e711144a648db06bbb2284f7274cfbee53ffcee503cc1a49200",
-    "signature": "0x6d1556be30e6534c61d3c9cc8b0831c5a6365db8e11bd928c49a9934555be8d7884af1355b800950c7e5a59bb618505c5847248b5cd8a359d49d40fe02afd003"
+    "public_key": "0x14418f867a0bd6d42abb2daa50cd68a5a869ce208282481f57504f630510d0d3",
+    "signature": "0x68b631ebc8f0737065731193bec7f0ff4c88501eb251b14a666e798a0c662d31be1f220a953d3ba10fc869b7cc1062b6d809555d49f89a1798db9fa9a6e4c20b",
+    "type": "ed25519_signature"
   },
   "events": [],
-  "timestamp": "1"
+  "timestamp": "500000",
+  "type": "user_transaction"
 }

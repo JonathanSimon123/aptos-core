@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -114,9 +115,11 @@ use unions::*;
 pub fn silent_display(source: TokenStream) -> TokenStream {
     let ast: DeriveInput = syn::parse(source).expect("Incorrect macro input");
     let name = &ast.ident;
+    let (impl_generics, ty_generics, where_clause) = ast.generics.split_for_impl();
+
     let gen = quote! {
         // In order to ensure that secrets are never leaked, Display is elided
-        impl ::std::fmt::Display for #name {
+        impl #impl_generics ::std::fmt::Display for #name #ty_generics #where_clause {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 write!(f, "<elided secret for {}>", stringify!(#name))
             }
@@ -129,9 +132,11 @@ pub fn silent_display(source: TokenStream) -> TokenStream {
 pub fn silent_debug(source: TokenStream) -> TokenStream {
     let ast: DeriveInput = syn::parse(source).expect("Incorrect macro input");
     let name = &ast.ident;
+    let (impl_generics, ty_generics, where_clause) = ast.generics.split_for_impl();
+
     let gen = quote! {
         // In order to ensure that secrets are never leaked, Debug is elided
-        impl ::std::fmt::Debug for #name {
+        impl #impl_generics ::std::fmt::Debug for #name #ty_generics #where_clause {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 write!(f, "<elided secret for {}>", stringify!(#name))
             }
@@ -140,12 +145,17 @@ pub fn silent_debug(source: TokenStream) -> TokenStream {
     gen.into()
 }
 
+#[proc_macro_attribute]
+pub fn key_name(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
 /// Deserialize from a human readable format where applicable
 #[proc_macro_derive(DeserializeKey)]
 pub fn deserialize_key(source: TokenStream) -> TokenStream {
     let ast: DeriveInput = syn::parse(source).expect("Incorrect macro input");
     let name = &ast.ident;
-    let name_string = name.to_string();
+    let name_string = find_key_name(&ast, name.to_string());
     let gen = quote! {
         impl<'de> ::serde::Deserialize<'de> for #name {
             fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
@@ -160,7 +170,7 @@ pub fn deserialize_key(source: TokenStream) -> TokenStream {
                     // In order to preserve the Serde data model and help analysis tools,
                     // make sure to wrap our value in a container with the same name
                     // as the original type.
-                    #[derive(::serde::Deserialize)]
+                    #[derive(::serde::Deserialize, Debug)]
                     #[serde(rename = #name_string)]
                     struct Value<'a>(&'a [u8]);
 
@@ -180,7 +190,7 @@ pub fn deserialize_key(source: TokenStream) -> TokenStream {
 pub fn serialize_key(source: TokenStream) -> TokenStream {
     let ast: DeriveInput = syn::parse(source).expect("Incorrect macro input");
     let name = &ast.ident;
-    let name_string = name.to_string();
+    let name_string = find_key_name(&ast, name.to_string());
     let gen = quote! {
         impl ::serde::Serialize for #name {
             fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -202,6 +212,27 @@ pub fn serialize_key(source: TokenStream) -> TokenStream {
         }
     };
     gen.into()
+}
+
+fn find_key_name(ast: &DeriveInput, name: String) -> String {
+    for attr in ast.attrs.iter() {
+        let ident = attr.path.get_ident();
+        let name = ident.map(|ident| ident.to_string());
+        if name == Some("key_name".into()) {
+            let list = attr.parse_meta().unwrap();
+            let meta = match list {
+                syn::Meta::List(meta) => meta,
+                _ => panic!("Expected a List"),
+            };
+            let token = match meta.nested.first().expect("Missing value") {
+                syn::NestedMeta::Lit(syn::Lit::Str(token)) => token,
+                _ => panic!("Expected LitStr"),
+            };
+            return token.token().to_string().trim_matches('\"').to_string();
+        }
+    }
+
+    name
 }
 
 #[proc_macro_derive(Deref)]
@@ -235,7 +266,7 @@ pub fn derive_enum_valid_crypto_material(input: TokenStream) -> TokenStream {
         Data::Enum(ref variants) => impl_enum_valid_crypto_material(name, variants),
         Data::Struct(_) | Data::Union(_) => {
             panic!("#[derive(ValidCryptoMaterial)] is only defined for enums")
-        }
+        },
     }
 }
 
@@ -249,7 +280,7 @@ pub fn derive_enum_publickey(input: TokenStream) -> TokenStream {
         Data::Enum(ref variants) => impl_enum_publickey(name, private_key_type, variants),
         Data::Struct(_) | Data::Union(_) => {
             panic!("#[derive(PublicKey)] is only defined for enums")
-        }
+        },
     }
 }
 
@@ -263,7 +294,7 @@ pub fn derive_enum_privatekey(input: TokenStream) -> TokenStream {
         Data::Enum(ref variants) => impl_enum_privatekey(name, public_key_type, variants),
         Data::Struct(_) | Data::Union(_) => {
             panic!("#[derive(PrivateKey)] is only defined for enums")
-        }
+        },
     }
 }
 
@@ -277,10 +308,10 @@ pub fn derive_enum_verifyingkey(input: TokenStream) -> TokenStream {
     match ast.data {
         Data::Enum(ref variants) => {
             impl_enum_verifyingkey(name, private_key_type, signature_type, variants)
-        }
+        },
         Data::Struct(_) | Data::Union(_) => {
             panic!("#[derive(PrivateKey)] is only defined for enums")
-        }
+        },
     }
 }
 
@@ -294,10 +325,10 @@ pub fn derive_enum_signingkey(input: TokenStream) -> TokenStream {
     match ast.data {
         Data::Enum(ref variants) => {
             impl_enum_signingkey(name, public_key_type, signature_type, variants)
-        }
+        },
         Data::Struct(_) | Data::Union(_) => {
             panic!("#[derive(PrivateKey)] is only defined for enums")
-        }
+        },
     }
 }
 
@@ -311,10 +342,10 @@ pub fn derive_enum_signature(input: TokenStream) -> TokenStream {
     match ast.data {
         Data::Enum(ref variants) => {
             impl_enum_signature(name, public_key_type, private_key_type, variants)
-        }
+        },
         Data::Struct(_) | Data::Union(_) => {
             panic!("#[derive(PrivateKey)] is only defined for enums")
-        }
+        },
     }
 }
 
@@ -343,7 +374,7 @@ pub fn hasher_dispatch(input: TokenStream) -> TokenStream {
         quote!()
     } else {
         let args = proc_macro2::TokenStream::from_iter(
-            std::iter::repeat(quote!(())).take(item.generics.params.len()),
+            std::iter::repeat(quote!((),)).take(item.generics.params.len()),
         );
         quote!(<#args>)
     };

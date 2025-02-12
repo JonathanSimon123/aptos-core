@@ -1,13 +1,24 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
-use anyhow::Result;
-use aptos_state_view::StateView;
-use aptos_types::{access_path::AccessPath, state_store::state_key::StateKey};
-use move_deps::move_core_types::language_storage::ModuleId;
-use std::collections::HashMap;
+use aptos_types::{
+    executable::ModulePath,
+    state_store::{
+        errors::StateViewError, state_key::StateKey, state_storage_usage::StateStorageUsage,
+        state_value::StateValue, TStateView,
+    },
+    write_set::WriteOp,
+};
+use aptos_vm_types::module_write_set::ModuleWrite;
+use bytes::Bytes;
+use claims::assert_some;
+use move_core_types::language_storage::ModuleId;
+use std::collections::{BTreeMap, HashMap};
+
+type Result<T, E = StateViewError> = std::result::Result<T, E>;
 
 // `StateView` has no data given we are creating the genesis
 pub(crate) struct GenesisStateView {
@@ -22,19 +33,33 @@ impl GenesisStateView {
     }
 
     pub(crate) fn add_module(&mut self, module_id: &ModuleId, blob: &[u8]) {
-        self.state_data.insert(
-            StateKey::AccessPath(AccessPath::from(module_id)),
-            blob.to_vec(),
-        );
+        self.state_data
+            .insert(StateKey::module_id(module_id), blob.to_vec());
+    }
+
+    pub(crate) fn add_module_write_ops(
+        &mut self,
+        module_write_ops: BTreeMap<StateKey, ModuleWrite<WriteOp>>,
+    ) {
+        for (state_key, write) in module_write_ops {
+            assert!(state_key.is_module_path());
+            let bytes = assert_some!(write.write_op().bytes(), "Modules cannot be deleted");
+            self.state_data.insert(state_key, bytes.to_vec());
+        }
     }
 }
 
-impl StateView for GenesisStateView {
-    fn get_state_value(&self, state_key: &StateKey) -> Result<Option<Vec<u8>>> {
-        Ok(self.state_data.get(state_key).cloned())
+impl TStateView for GenesisStateView {
+    type Key = StateKey;
+
+    fn get_state_value(&self, state_key: &StateKey) -> Result<Option<StateValue>> {
+        Ok(self
+            .state_data
+            .get(state_key)
+            .map(|bytes| StateValue::new_legacy(Bytes::copy_from_slice(bytes))))
     }
 
-    fn is_genesis(&self) -> bool {
-        true
+    fn get_usage(&self) -> Result<StateStorageUsage> {
+        Ok(StateStorageUsage::zero())
     }
 }

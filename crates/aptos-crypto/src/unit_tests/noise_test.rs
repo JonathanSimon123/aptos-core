@@ -1,16 +1,14 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
-
-use std::{fs::File, io::BufReader, path::PathBuf};
 
 use crate::{
     noise::{handshake_init_msg_len, handshake_resp_msg_len, NoiseConfig, MAX_SIZE_NOISE_MSG},
     test_utils::TEST_SEED,
     x25519, Uniform as _,
 };
-
 use rand::SeedableRng;
 use serde::*;
+use std::{fs::File, io::BufReader, path::PathBuf};
 
 #[test]
 fn simple_handshake() {
@@ -141,12 +139,15 @@ fn test_vectors() {
         fn next_u32(&mut self) -> u32 {
             unreachable!()
         }
+
         fn next_u64(&mut self) -> u64 {
             unreachable!()
         }
+
         fn fill_bytes(&mut self, dest: &mut [u8]) {
             dest.copy_from_slice(&self.ephemeral);
         }
+
         fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), rand::Error> {
             unreachable!()
         }
@@ -339,7 +340,7 @@ fn wrong_buffer_sizes() {
             &mut first_message_bad,
         );
 
-        assert!(matches!(res, Err(_)));
+        assert!(res.is_err());
 
         // try again with payload too large (should fail)
         let mut large_buffer = vec![0u8; MAX_SIZE_NOISE_MSG + 3];
@@ -352,7 +353,7 @@ fn wrong_buffer_sizes() {
             &mut large_buffer,
         );
 
-        assert!(matches!(res, Err(_)));
+        assert!(res.is_err());
 
         // try again with buffer too large (should work)
         let mut first_message_good = vec![0u8; handshake_init_msg_len(payload.len()) + 1];
@@ -380,7 +381,7 @@ fn wrong_buffer_sizes() {
                 &mut second_message_small,
             );
 
-            assert!(matches!(res, Err(_)));
+            assert!(res.is_err());
 
             // with first message too large (shouldn't work)
             let res = responder.respond_to_client_and_finalize(
@@ -391,7 +392,7 @@ fn wrong_buffer_sizes() {
                 &mut second_message_large,
             );
 
-            assert!(matches!(res, Err(_)));
+            assert!(res.is_err());
 
             // with incorrect prologue (should fail)
             let res = responder.respond_to_client_and_finalize(
@@ -402,7 +403,7 @@ fn wrong_buffer_sizes() {
                 &mut second_message_large,
             );
 
-            assert!(matches!(res, Err(_)));
+            assert!(res.is_err());
 
             // with payload too large (should fail)
             let mut large_buffer = vec![0u8; MAX_SIZE_NOISE_MSG + 3];
@@ -415,7 +416,7 @@ fn wrong_buffer_sizes() {
                 &mut large_buffer,
             );
 
-            assert!(matches!(res, Err(_)));
+            assert!(res.is_err());
 
             // with correct first message and buffer too large (should work)
             let (_, responder_session) = responder
@@ -433,7 +434,7 @@ fn wrong_buffer_sizes() {
             // with first message too large
             let res = responder.parse_client_init_message(b"", &first_message_good);
 
-            assert!(matches!(res, Err(_)));
+            assert!(res.is_err());
 
             // with first message too small
             let res = responder.parse_client_init_message(
@@ -441,7 +442,7 @@ fn wrong_buffer_sizes() {
                 &first_message_good[..first_message_good.len() - 2],
             );
 
-            assert!(matches!(res, Err(_)));
+            assert!(res.is_err());
 
             // with wrong prologue
             let res = responder.parse_client_init_message(
@@ -449,7 +450,7 @@ fn wrong_buffer_sizes() {
                 &first_message_good[..first_message_good.len() - 1],
             );
 
-            assert!(matches!(res, Err(_)));
+            assert!(res.is_err());
 
             // with first message of correct length
             let (_, handshake_state, _) = responder
@@ -464,7 +465,7 @@ fn wrong_buffer_sizes() {
                 &mut second_message_small,
             );
 
-            assert!(matches!(res, Err(_)));
+            assert!(res.is_err());
 
             // with payload too large (should fail)
             let mut large_buffer = vec![0u8; MAX_SIZE_NOISE_MSG + 3];
@@ -476,7 +477,7 @@ fn wrong_buffer_sizes() {
                 &mut large_buffer,
             );
 
-            assert!(matches!(res, Err(_)));
+            assert!(res.is_err());
 
             // write to buffer too big (should work)
             let responder_session = responder
@@ -494,7 +495,7 @@ fn wrong_buffer_sizes() {
         // initiator parses the response too large (should fail)
         let res = initiator.finalize_connection(initiator_state.clone(), &second_message_large);
 
-        assert!(matches!(res, Err(_)));
+        assert!(res.is_err());
 
         // initiator parses the response too small (should fail)
         let res = initiator.finalize_connection(
@@ -502,7 +503,7 @@ fn wrong_buffer_sizes() {
             &second_message_large[..second_message_large.len() - 2],
         );
 
-        assert!(matches!(res, Err(_)));
+        assert!(res.is_err());
 
         // initiator parses response of correct size
         let (_, mut initiator_session) = initiator
@@ -521,11 +522,11 @@ fn wrong_buffer_sizes() {
 
         // message too short to have auth tag
         let res = responder_session.read_message_in_place(&mut message);
-        assert!(matches!(res, Err(_)));
+        assert!(res.is_err());
 
         // session should be unusable now
         message.extend_from_slice(&auth_tag);
         let res = responder_session.read_message_in_place(&mut message);
-        assert!(matches!(res, Err(_)));
+        assert!(res.is_err());
     }
 }

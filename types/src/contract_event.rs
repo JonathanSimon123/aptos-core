@@ -1,60 +1,176 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    account_config::{DepositEvent, NewBlockEvent, NewEpochEvent, WithdrawEvent},
+    account_config::{
+        DepositEvent, NewBlockEvent, NewEpochEvent, WithdrawEvent, NEW_EPOCH_EVENT_MOVE_TYPE_TAG,
+        NEW_EPOCH_EVENT_V2_MOVE_TYPE_TAG,
+    },
+    dkg::DKGStartEvent,
     event::EventKey,
-    ledger_info::LedgerInfo,
-    proof::EventProof,
+    jwks::ObservedJWKsUpdated,
     transaction::Version,
 };
-use anyhow::{ensure, Context, Error, Result};
-use aptos_crypto::hash::CryptoHash;
+use anyhow::{bail, Error, Result};
 use aptos_crypto_derive::{BCSCryptoHash, CryptoHasher};
-use move_deps::move_core_types::{language_storage::TypeTag, move_resource::MoveStructType};
-
+use move_core_types::{
+    ident_str,
+    language_storage::{StructTag, TypeTag, CORE_CODE_ADDRESS},
+    move_resource::MoveStructType,
+};
+use once_cell::sync::Lazy;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
-use serde::{Deserialize, Serialize};
-use std::{convert::TryFrom, ops::Deref};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::{convert::TryFrom, ops::Deref, str::FromStr};
+
+pub static FEE_STATEMENT_EVENT_TYPE: Lazy<TypeTag> = Lazy::new(|| {
+    TypeTag::Struct(Box::new(StructTag {
+        address: CORE_CODE_ADDRESS,
+        module: ident_str!("transaction_fee").to_owned(),
+        name: ident_str!("FeeStatement").to_owned(),
+        type_args: vec![],
+    }))
+});
+
+/// This trait is used by block executor to abstractly represent an event,
+/// and update its data.
+pub trait TransactionEvent {
+    fn get_event_data(&self) -> &[u8];
+    fn set_event_data(&mut self, event_data: Vec<u8>);
+}
 
 /// Support versioning of the data structure.
 #[derive(Hash, Clone, Eq, PartialEq, Serialize, Deserialize, CryptoHasher, BCSCryptoHash)]
 pub enum ContractEvent {
-    V0(ContractEventV0),
+    V1(ContractEventV1),
+    V2(ContractEventV2),
+}
+
+impl TransactionEvent for ContractEvent {
+    fn get_event_data(&self) -> &[u8] {
+        match self {
+            ContractEvent::V1(event) => event.event_data(),
+            ContractEvent::V2(event) => event.event_data(),
+        }
+    }
+
+    fn set_event_data(&mut self, event_data: Vec<u8>) {
+        match self {
+            ContractEvent::V1(event) => event.event_data = event_data,
+            ContractEvent::V2(event) => event.event_data = event_data,
+        }
+    }
 }
 
 impl ContractEvent {
-    pub fn new(
+    pub fn new_v1(
         key: EventKey,
         sequence_number: u64,
         type_tag: TypeTag,
         event_data: Vec<u8>,
     ) -> Self {
-        ContractEvent::V0(ContractEventV0::new(
+        ContractEvent::V1(ContractEventV1::new(
             key,
             sequence_number,
             type_tag,
             event_data,
         ))
     }
-}
 
-// Temporary hack to avoid massive changes, it won't work when new variant comes and needs proper
-// dispatch at that time.
-impl Deref for ContractEvent {
-    type Target = ContractEventV0;
+    pub fn new_v2(type_tag: TypeTag, event_data: Vec<u8>) -> Self {
+        ContractEvent::V2(ContractEventV2::new(type_tag, event_data))
+    }
 
-    fn deref(&self) -> &Self::Target {
+    pub fn new_v2_with_type_tag_str(type_tag_str: &str, event_data: Vec<u8>) -> Self {
+        ContractEvent::V2(ContractEventV2::new(
+            TypeTag::from_str(type_tag_str).unwrap(),
+            event_data,
+        ))
+    }
+
+    pub fn event_key(&self) -> Option<&EventKey> {
         match self {
-            ContractEvent::V0(event) => event,
+            ContractEvent::V1(event) => Some(event.key()),
+            ContractEvent::V2(_event) => None,
         }
+    }
+
+    pub fn event_data(&self) -> &[u8] {
+        match self {
+            ContractEvent::V1(event) => event.event_data(),
+            ContractEvent::V2(event) => event.event_data(),
+        }
+    }
+
+    pub fn type_tag(&self) -> &TypeTag {
+        match self {
+            ContractEvent::V1(event) => &event.type_tag,
+            ContractEvent::V2(event) => &event.type_tag,
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        match self {
+            ContractEvent::V1(event) => event.size(),
+            ContractEvent::V2(event) => event.size(),
+        }
+    }
+
+    pub fn is_v1(&self) -> bool {
+        matches!(self, ContractEvent::V1(_))
+    }
+
+    pub fn is_v2(&self) -> bool {
+        matches!(self, ContractEvent::V2(_))
+    }
+
+    pub fn v1(&self) -> Result<&ContractEventV1> {
+        Ok(match self {
+            ContractEvent::V1(event) => event,
+            ContractEvent::V2(_event) => bail!("This is a module event"),
+        })
+    }
+
+    pub fn v2(&self) -> Result<&ContractEventV2> {
+        Ok(match self {
+            ContractEvent::V1(_event) => bail!("This is a instance event"),
+            ContractEvent::V2(event) => event,
+        })
+    }
+
+    pub fn try_v2(&self) -> Option<&ContractEventV2> {
+        match self {
+            ContractEvent::V1(_event) => None,
+            ContractEvent::V2(event) => Some(event),
+        }
+    }
+
+    pub fn try_v2_typed<T: DeserializeOwned>(&self, event_type: &TypeTag) -> Result<Option<T>> {
+        if let Some(v2) = self.try_v2() {
+            if &v2.type_tag == event_type {
+                return Ok(Some(bcs::from_bytes(&v2.event_data)?));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn is_new_epoch_event(&self) -> bool {
+        self.type_tag() == NEW_EPOCH_EVENT_MOVE_TYPE_TAG.deref()
+            || self.type_tag() == NEW_EPOCH_EVENT_V2_MOVE_TYPE_TAG.deref()
+    }
+
+    pub fn expect_new_block_event(&self) -> Result<NewBlockEvent> {
+        NewBlockEvent::try_from_bytes(self.event_data())
     }
 }
 
 /// Entry produced via a call to the `emit_event` builtin.
 #[derive(Hash, Clone, Eq, PartialEq, Serialize, Deserialize, CryptoHasher)]
-pub struct ContractEventV0 {
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+pub struct ContractEventV1 {
     /// The unique key that the event was emitted to
     key: EventKey,
     /// The number of messages that have been emitted to the path previously
@@ -66,7 +182,7 @@ pub struct ContractEventV0 {
     event_data: Vec<u8>,
 }
 
-impl ContractEventV0 {
+impl ContractEventV1 {
     pub fn new(
         key: EventKey,
         sequence_number: u64,
@@ -96,53 +212,13 @@ impl ContractEventV0 {
     pub fn type_tag(&self) -> &TypeTag {
         &self.type_tag
     }
-}
 
-impl TryFrom<&ContractEvent> for NewBlockEvent {
-    type Error = Error;
-
-    fn try_from(event: &ContractEvent) -> Result<Self> {
-        if event.type_tag != TypeTag::Struct(Self::struct_tag()) {
-            anyhow::bail!("Expected NewBlockEvent")
-        }
-        Self::try_from_bytes(&event.event_data)
+    pub fn size(&self) -> usize {
+        self.key.size() + 8 /* u64 */ + bcs::serialized_size(&self.type_tag).unwrap() + self.event_data.len()
     }
 }
 
-impl TryFrom<&ContractEvent> for NewEpochEvent {
-    type Error = Error;
-
-    fn try_from(event: &ContractEvent) -> Result<Self> {
-        if event.type_tag != TypeTag::Struct(Self::struct_tag()) {
-            anyhow::bail!("Expected NewEpochEvent")
-        }
-        Self::try_from_bytes(&event.event_data)
-    }
-}
-
-impl TryFrom<&ContractEvent> for WithdrawEvent {
-    type Error = Error;
-
-    fn try_from(event: &ContractEvent) -> Result<Self> {
-        if event.type_tag != TypeTag::Struct(WithdrawEvent::struct_tag()) {
-            anyhow::bail!("Expected Sent Payment")
-        }
-        Self::try_from_bytes(&event.event_data)
-    }
-}
-
-impl TryFrom<&ContractEvent> for DepositEvent {
-    type Error = Error;
-
-    fn try_from(event: &ContractEvent) -> Result<Self> {
-        if event.type_tag != TypeTag::Struct(DepositEvent::struct_tag()) {
-            anyhow::bail!("Expected Received Payment")
-        }
-        Self::try_from_bytes(&event.event_data)
-    }
-}
-
-impl std::fmt::Debug for ContractEvent {
+impl std::fmt::Debug for ContractEventV1 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -155,19 +231,168 @@ impl std::fmt::Debug for ContractEvent {
     }
 }
 
+/// Entry produced via a call to the `emit` builtin.
+#[derive(Hash, Clone, Eq, PartialEq, Serialize, Deserialize, CryptoHasher)]
+pub struct ContractEventV2 {
+    /// The type of the data
+    type_tag: TypeTag,
+    /// The data payload of the event
+    #[serde(with = "serde_bytes")]
+    event_data: Vec<u8>,
+}
+
+impl ContractEventV2 {
+    pub fn new(type_tag: TypeTag, event_data: Vec<u8>) -> Self {
+        Self {
+            type_tag,
+            event_data,
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        bcs::serialized_size(&self.type_tag).unwrap() + self.event_data.len()
+    }
+
+    pub fn type_tag(&self) -> &TypeTag {
+        &self.type_tag
+    }
+
+    pub fn event_data(&self) -> &[u8] {
+        &self.event_data
+    }
+}
+
+impl std::fmt::Debug for ContractEventV2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ModuleEvent {{ type: {:?}, event_data: {:?} }}",
+            self.type_tag,
+            hex::encode(&self.event_data)
+        )
+    }
+}
+
+impl TryFrom<&ContractEvent> for NewBlockEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        match event {
+            ContractEvent::V1(event) => {
+                if event.type_tag != TypeTag::Struct(Box::new(Self::struct_tag())) {
+                    bail!("Expected NewBlockEvent")
+                }
+                Self::try_from_bytes(&event.event_data)
+            },
+            ContractEvent::V2(_) => bail!("This is a module event"),
+        }
+    }
+}
+
+impl TryFrom<&ContractEvent> for DKGStartEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        match event {
+            ContractEvent::V1(_) => {
+                bail!("conversion to dkg start event failed with wrong contract event version");
+            },
+            ContractEvent::V2(event) => {
+                if event.type_tag != TypeTag::Struct(Box::new(Self::struct_tag())) {
+                    bail!("conversion to dkg start event failed with wrong type tag")
+                }
+                bcs::from_bytes(&event.event_data).map_err(Into::into)
+            },
+        }
+    }
+}
+
+impl TryFrom<&ContractEvent> for NewEpochEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        if event.is_new_epoch_event() {
+            Self::try_from_bytes(event.event_data())
+        } else {
+            bail!("Expected NewEpochEvent")
+        }
+    }
+}
+
+impl TryFrom<&ContractEvent> for WithdrawEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        match event {
+            ContractEvent::V1(event) => {
+                if event.type_tag != TypeTag::Struct(Box::new(Self::struct_tag())) {
+                    bail!("Expected Sent Payment")
+                }
+                Self::try_from_bytes(&event.event_data)
+            },
+            ContractEvent::V2(_) => bail!("This is a module event"),
+        }
+    }
+}
+
+impl TryFrom<&ContractEvent> for DepositEvent {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        match event {
+            ContractEvent::V1(event) => {
+                if event.type_tag != TypeTag::Struct(Box::new(Self::struct_tag())) {
+                    bail!("Expected Received Payment")
+                }
+                Self::try_from_bytes(&event.event_data)
+            },
+            ContractEvent::V2(_) => bail!("This is a module event"),
+        }
+    }
+}
+
+impl TryFrom<&ContractEvent> for ObservedJWKsUpdated {
+    type Error = Error;
+
+    fn try_from(event: &ContractEvent) -> Result<Self> {
+        match event {
+            ContractEvent::V1(_) => {
+                bail!("conversion to `ObservedJWKsUpdated` failed with wrong event version")
+            },
+            ContractEvent::V2(v2) => {
+                if v2.type_tag != TypeTag::Struct(Box::new(Self::struct_tag())) {
+                    bail!("conversion to `ObservedJWKsUpdated` failed with wrong type tag");
+                }
+                bcs::from_bytes(&v2.event_data).map_err(Into::into)
+            },
+        }
+    }
+}
+
+impl std::fmt::Debug for ContractEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ContractEvent::V1(event) => event.fmt(f),
+            ContractEvent::V2(event) => event.fmt(f),
+        }
+    }
+}
+
 impl std::fmt::Display for ContractEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Ok(payload) = WithdrawEvent::try_from(self) {
+            let v1 = self.v1().unwrap();
             write!(
                 f,
                 "ContractEvent {{ key: {}, index: {:?}, type: {:?}, event_data: {:?} }}",
-                self.key, self.sequence_number, self.type_tag, payload,
+                v1.key, v1.sequence_number, v1.type_tag, payload,
             )
         } else if let Ok(payload) = DepositEvent::try_from(self) {
+            let v1 = self.v1().unwrap();
             write!(
                 f,
                 "ContractEvent {{ key: {}, index: {:?}, type: {:?}, event_data: {:?} }}",
-                self.key, self.sequence_number, self.type_tag, payload,
+                v1.key, v1.sequence_number, v1.type_tag, payload,
             )
         } else {
             write!(f, "{:?}", self)
@@ -177,270 +402,27 @@ impl std::fmt::Display for ContractEvent {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
-pub struct EventWithProof {
-    pub transaction_version: u64, // Should be `Version`
-    pub event_index: u64,
+pub struct EventWithVersion {
+    pub transaction_version: Version,
     pub event: ContractEvent,
-    pub proof: EventProof,
 }
 
-impl std::fmt::Display for EventWithProof {
+impl std::fmt::Display for EventWithVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "EventWithProof {{ \n\ttransaction_version: {}, \n\tevent_index: {}, \
-             \n\tevent: {}, \n\tproof: {:?} \n}}",
-            self.transaction_version, self.event_index, self.event, self.proof
+            "EventWithVersion {{ \n\ttransaction_version: {}, \n\tevent: {} \n}}",
+            self.transaction_version, self.event
         )
     }
 }
 
-impl EventWithProof {
+impl EventWithVersion {
     /// Constructor.
-    pub fn new(
-        transaction_version: Version,
-        event_index: u64,
-        event: ContractEvent,
-        proof: EventProof,
-    ) -> Self {
+    pub fn new(transaction_version: Version, event: ContractEvent) -> Self {
         Self {
             transaction_version,
-            event_index,
             event,
-            proof,
         }
-    }
-
-    /// Verifies the event with the proof, both carried by `self`.
-    ///
-    /// Two things are ensured if no error is raised:
-    ///   1. This event exists in the ledger represented by `ledger_info`.
-    ///   2. And this event has the same `event_key`, `sequence_number`, `transaction_version`,
-    /// and `event_index` as indicated in the parameter list. If any of these parameter is unknown
-    /// to the call site and is supposed to be informed by this struct, get it from the struct
-    /// itself, such as: `event_with_proof.event.access_path()`, `event_with_proof.event_index()`,
-    /// etc.
-    pub fn verify(
-        &self,
-        ledger_info: &LedgerInfo,
-        event_key: &EventKey,
-        sequence_number: u64,
-        transaction_version: Version,
-        event_index: u64,
-    ) -> Result<()> {
-        ensure!(
-            self.event.key() == event_key,
-            "Event key ({}) not expected ({}).",
-            self.event.key(),
-            *event_key,
-        );
-        ensure!(
-            self.event.sequence_number == sequence_number,
-            "Sequence number ({}) not expected ({}).",
-            self.event.sequence_number(),
-            sequence_number,
-        );
-        ensure!(
-            self.transaction_version == transaction_version,
-            "Transaction version ({}) not expected ({}).",
-            self.transaction_version,
-            transaction_version,
-        );
-        ensure!(
-            self.event_index == event_index,
-            "Event index ({}) not expected ({}).",
-            self.event_index,
-            event_index,
-        );
-
-        self.proof.verify(
-            ledger_info,
-            self.event.hash(),
-            transaction_version,
-            event_index,
-        )?;
-
-        Ok(())
-    }
-}
-
-/// The response type for `get_event_by_version_with_proof`, which contains lower
-/// and upper bound events surrounding the requested version along with proofs
-/// for each event.
-///
-/// ### Why do we need two events?
-///
-/// If we could always get the event count _at the requested event_version_, we
-/// could return only the lower bound event. With the event count we could verify
-/// that the returned event is actually the latest event at the historical ledger
-/// view just by checking that `event.sequence_number == event_count`.
-///
-/// Unfortunately, the event count is only (verifiably) accessible via the
-/// on-chain state. While we can easily acquire the event count near the chain
-/// HEAD, historical event counts (at versions below HEAD for more than the prune
-/// window) may be inaccessible after most non-archival fullnodes have pruned past
-/// that version.
-///
-/// ### Including the Upper Bound Event
-///
-/// In contrast, if we also return the upper bound event, then we can always
-/// verify the request even if the version is past the prune window and we don't
-/// know the event_count (at event_version). The upper bound event lets us prove
-/// that there is no untransmitted event that is actually closer to the requested
-/// event_version than the lower bound.
-///
-/// For example, consider the case where there are three events at versions 10,
-/// 20, and 30. A client asks for the latest event at or below version 25. If we
-/// just returned the lower bound event, then a malicious server could return
-/// the event at version 10; the client would not be able to distinguish this
-/// response from the correct response without the event count (2) at version 25.
-///
-/// If we also return the upper bound event (the event at version 30), the client
-/// can verify that the upper bound is the next event after the lower bound and
-/// that the upper bound comes after their requested version. This proves that
-/// the lower bound is actually the latest event at or below their requested
-/// version.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
-pub struct EventByVersionWithProof {
-    pub lower_bound_incl: Option<EventWithProof>,
-    pub upper_bound_excl: Option<EventWithProof>,
-}
-
-impl EventByVersionWithProof {
-    pub fn new(
-        lower_bound_incl: Option<EventWithProof>,
-        upper_bound_excl: Option<EventWithProof>,
-    ) -> Self {
-        Self {
-            lower_bound_incl,
-            upper_bound_excl,
-        }
-    }
-
-    /// Verify that the `lower_bound_incl` [`EventWithProof`] is the latest event
-    /// at or below the requested `event_version`.
-    ///
-    /// The `ledger_info` is the client's latest know ledger info (will be near
-    /// chain HEAD if the client is synced).
-    ///
-    /// The `latest_event_count` is the event count at the `ledger_info` version
-    /// (not the `event_version`) and is needed to verify the empty event stream
-    /// and version after last event cases. In some select instances
-    /// (e.g. [`NewBlockEvent`]s) we can determine these cases more efficiently
-    /// and so this parameter is left optional.
-    pub fn verify(
-        &self,
-        ledger_info: &LedgerInfo,
-        event_key: &EventKey,
-        latest_event_count: Option<u64>,
-        event_version: Version,
-    ) -> Result<()> {
-        ensure!(
-            event_version <= ledger_info.version(),
-            "request event_version {} must be <= LedgerInfo version {}",
-            event_version,
-            ledger_info.version(),
-        );
-
-        // If the verifier didn't provide a latest_event_count, choose a value
-        // that will pass the checks in each case.
-        let latest_event_count = latest_event_count.unwrap_or_else(|| {
-            let upper = self.upper_bound_excl.as_ref();
-            let lower = self.lower_bound_incl.as_ref();
-            upper /* (None, Some), (Some, Some) */
-                .or(lower) /* (Some, None) */
-                .map(|proof| proof.event.sequence_number.saturating_add(1))
-                .unwrap_or(0) /* (None, None) */
-        });
-
-        match (&self.lower_bound_incl, &self.upper_bound_excl) {
-            // no events at all yet
-            (None, None) => {
-                ensure!(latest_event_count == 0);
-            }
-            // event_version comes before first ever event, so in the range: [0, event_0.version)
-            //
-            // event_version
-            //      v
-            // |---------|
-            //            (event_0)----->(event_1)---->
-            (None, Some(first_event)) => {
-                let txn_version = first_event.transaction_version;
-                let seq_num = first_event.event.sequence_number;
-                ensure!(event_version < txn_version);
-                ensure!(seq_num == 0);
-                ensure!(latest_event_count > 0);
-
-                first_event
-                    .verify(
-                        ledger_info,
-                        event_key,
-                        seq_num,
-                        first_event.transaction_version,
-                        first_event.event_index,
-                    )
-                    .context("failed to verify first event")?;
-            }
-            // event_version is between two events, specifically, it must be in
-            // the range: [event_i.version, event_{i+1}.version)
-            //
-            //              event_version
-            //                    v
-            //            |---------------|
-            //      ----->(event_{i})----->(event_{i+1})----->
-            (Some(lower_bound_incl), Some(upper_bound_excl)) => {
-                ensure!(lower_bound_incl.transaction_version <= event_version);
-                ensure!(event_version < upper_bound_excl.transaction_version);
-
-                let start_seq_num = lower_bound_incl.event.sequence_number;
-                let end_seq_num = upper_bound_excl.event.sequence_number;
-                ensure!(start_seq_num.saturating_add(1) == end_seq_num);
-                ensure!(latest_event_count > end_seq_num);
-
-                lower_bound_incl
-                    .verify(
-                        ledger_info,
-                        event_key,
-                        start_seq_num,
-                        lower_bound_incl.transaction_version,
-                        lower_bound_incl.event_index,
-                    )
-                    .context("failed to verify lower bound event")?;
-                upper_bound_excl
-                    .verify(
-                        ledger_info,
-                        event_key,
-                        end_seq_num,
-                        upper_bound_excl.transaction_version,
-                        upper_bound_excl.event_index,
-                    )
-                    .context("failed to verify upper bound event")?;
-            }
-            // event_version is after the latest event, meaning it's in the range:
-            // (event_N.version, ledger_version]
-            //
-            //                         event_version
-            //                               v
-            //                       |----------------->
-            //      ----->(event_{N})
-            (Some(latest_event), None) => {
-                let txn_version = latest_event.transaction_version;
-                let seq_num = latest_event.event.sequence_number;
-                ensure!(txn_version <= event_version);
-                ensure!(seq_num.saturating_add(1) == latest_event_count);
-                latest_event
-                    .verify(
-                        ledger_info,
-                        event_key,
-                        seq_num,
-                        txn_version,
-                        latest_event.event_index,
-                    )
-                    .context("failed to verify latest event")?;
-            }
-        }
-
-        Ok(())
     }
 }

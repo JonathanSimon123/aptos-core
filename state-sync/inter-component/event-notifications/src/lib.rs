@@ -1,32 +1,34 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
-
+use anyhow::{anyhow, Result};
+use aptos_channels::{aptos_channel, message_queues::QueueStyle};
 use aptos_id_generator::{IdGenerator, U64IdGenerator};
 use aptos_infallible::RwLock;
-use aptos_state_view::account_with_state_view::AsAccountWithStateView;
+use aptos_storage_interface::{
+    state_store::state_view::db_state_view::DbStateViewAtVersion, DbReader, DbReaderWriter,
+};
 use aptos_types::{
-    account_view::AccountView,
     contract_event::ContractEvent,
     event::EventKey,
-    move_resource::MoveStorage,
-    on_chain_config,
-    on_chain_config::{config_address, ConfigID, OnChainConfigPayload},
+    on_chain_config::{
+        ConfigurationResource, OnChainConfig, OnChainConfigPayload, OnChainConfigProvider,
+    },
+    state_store::state_key::StateKey,
     transaction::Version,
 };
-use channel::{aptos_channel, message_queues::QueueStyle};
 use futures::{channel::mpsc::SendError, stream::FusedStream, Stream};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     iter::FromIterator,
-    ops::Deref,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
-use storage_interface::{state_view::DbStateViewAtVersion, DbReaderWriter};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -36,9 +38,9 @@ mod tests;
 // consumed, they will be dropped (oldest messages first). The remaining messages
 // will be retrieved using FIFO ordering.
 const EVENT_NOTIFICATION_CHANNEL_SIZE: usize = 100;
-const RECONFIG_NOTIFICATION_CHANNEL_SIZE: usize = 1;
+const RECONFIG_NOTIFICATION_CHANNEL_SIZE: usize = 1; // Note: this should be 1 to ensure only the latest reconfig is consumed
 
-#[derive(Clone, Debug, Deserialize, Error, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Error, PartialEq, Eq, Serialize)]
 pub enum Error {
     #[error("Cannot subscribe to zero event keys!")]
     CannotSubscribeToZeroEventKeys,
@@ -74,6 +76,7 @@ pub trait EventNotificationSender: Send {
 pub struct EventSubscriptionService {
     // Event subscription registry
     event_key_subscriptions: HashMap<EventKey, HashSet<SubscriptionId>>,
+    event_v2_tag_subscriptions: HashMap<String, HashSet<SubscriptionId>>,
     subscription_id_to_event_subscription: HashMap<SubscriptionId, EventSubscription>,
 
     // Reconfig subscription registry
@@ -82,20 +85,17 @@ pub struct EventSubscriptionService {
     // Database to fetch on-chain configuration data
     storage: Arc<RwLock<DbReaderWriter>>,
 
-    // The list of all on-chain configurations used to notify subscribers
-    config_registry: Vec<ConfigID>,
-
     // Internal subscription ID generator
     subscription_id_generator: U64IdGenerator,
 }
 
 impl EventSubscriptionService {
-    pub fn new(config_registry: &[ConfigID], storage: Arc<RwLock<DbReaderWriter>>) -> Self {
+    pub fn new(storage: Arc<RwLock<DbReaderWriter>>) -> Self {
         Self {
             event_key_subscriptions: HashMap::new(),
+            event_v2_tag_subscriptions: HashMap::new(),
             subscription_id_to_event_subscription: HashMap::new(),
             reconfig_subscriptions: HashMap::new(),
-            config_registry: config_registry.to_vec(),
             storage,
             subscription_id_generator: U64IdGenerator::new(),
         }
@@ -111,8 +111,9 @@ impl EventSubscriptionService {
     pub fn subscribe_to_events(
         &mut self,
         event_keys: Vec<EventKey>,
+        event_v2_tags: Vec<String>,
     ) -> Result<EventNotificationListener, Error> {
-        if event_keys.is_empty() {
+        if event_keys.is_empty() && event_v2_tags.is_empty() {
             return Err(Error::CannotSubscribeToZeroEventKeys);
         }
 
@@ -131,10 +132,10 @@ impl EventSubscriptionService {
             .subscription_id_to_event_subscription
             .insert(subscription_id, event_subscription)
         {
-            panic!(
+            return Err(Error::UnexpectedErrorEncountered(format!(
                 "Duplicate event subscription found! This should not occur! ID: {}, subscription: {:?}",
                 subscription_id, old_subscription
-            );
+            )));
         }
 
         // Update the event key subscriptions to include the new subscription
@@ -144,7 +145,17 @@ impl EventSubscriptionService {
                 .and_modify(|subscriptions| {
                     subscriptions.insert(subscription_id);
                 })
-                .or_insert_with(|| HashSet::from_iter(vec![subscription_id].iter().cloned()));
+                .or_insert_with(|| HashSet::from_iter([subscription_id].iter().cloned()));
+        }
+
+        // Update the event v2 tag subscriptions to include the new subscription
+        for event_tag in event_v2_tags {
+            self.event_v2_tag_subscriptions
+                .entry(event_tag)
+                .and_modify(|subscriptions| {
+                    subscriptions.insert(subscription_id);
+                })
+                .or_insert_with(|| HashSet::from_iter([subscription_id].iter().cloned()));
         }
 
         Ok(EventNotificationListener {
@@ -158,7 +169,9 @@ impl EventSubscriptionService {
     /// begins. Note: if the notification buffer fills up too quickly, older
     /// notifications will be dropped. As such, it is the responsibility of the
     /// subscriber to ensure notifications are processed in a timely manner.
-    pub fn subscribe_to_reconfigurations(&mut self) -> Result<ReconfigNotificationListener, Error> {
+    pub fn subscribe_to_reconfigurations(
+        &mut self,
+    ) -> Result<ReconfigNotificationListener<DbBackedOnChainConfig>, Error> {
         let (notification_sender, notification_receiver) =
             aptos_channel::new(QueueStyle::KLAST, RECONFIG_NOTIFICATION_CHANNEL_SIZE, None);
 
@@ -169,14 +182,15 @@ impl EventSubscriptionService {
         };
 
         // Store the new subscription
-        if let Some(old_subscription) = self
+        if self
             .reconfig_subscriptions
             .insert(subscription_id, reconfig_subscription)
+            .is_some()
         {
-            panic!(
-                "Duplicate reconfiguration subscription found! This should not occur! ID: {}, subscription: {:?}",
-                subscription_id, old_subscription
-            );
+            return Err(Error::UnexpectedErrorEncountered(format!(
+                "Duplicate reconfiguration subscription found! This should not occur! ID: {}",
+                subscription_id,
+            )));
         }
 
         Ok(ReconfigNotificationListener {
@@ -200,10 +214,15 @@ impl EventSubscriptionService {
         let mut event_subscription_ids_to_notify = HashSet::new();
 
         for event in events.iter() {
-            let event_key = event.key();
-
             // Process all subscriptions for the current event
-            if let Some(subscription_ids) = self.event_key_subscriptions.get(event_key) {
+            let maybe_subscription_ids = match event {
+                ContractEvent::V1(evt) => self.event_key_subscriptions.get(evt.key()),
+                ContractEvent::V2(evt) => {
+                    let tag = evt.type_tag().to_string();
+                    self.event_v2_tag_subscriptions.get(&tag)
+                },
+            };
+            if let Some(subscription_ids) = maybe_subscription_ids {
                 // Add the event to the subscription's pending event buffer
                 // and store the subscriptions that will need to notified once all
                 // events have been processed.
@@ -221,7 +240,7 @@ impl EventSubscriptionService {
             }
 
             // Take note if a reconfiguration (new epoch) has occurred
-            if *event_key == on_chain_config::new_epoch_event_key() {
+            if event.is_new_epoch_event() {
                 reconfig_event_found = true;
             }
         }
@@ -260,28 +279,10 @@ impl EventSubscriptionService {
     /// Note: We cannot assume that all configs will exist on-chain. As such, we
     /// must fetch each resource one at a time. Reconfig subscribers must be able
     /// to handle on-chain configs not existing in a reconfiguration notification.
-    fn read_on_chain_configs(&self, version: Version) -> Result<OnChainConfigPayload, Error> {
-        // Build a map from config ID to the config value found on-chain
-        let mut config_id_to_config = HashMap::new();
-        for config_id in self.config_registry.iter() {
-            if let Ok(config) = self
-                .storage
-                .read()
-                .reader
-                .deref()
-                .fetch_config_by_version(*config_id, version)
-            {
-                if let Some(old_entry) = config_id_to_config.insert(*config_id, config.clone()) {
-                    panic!(
-                        "Unexpected config values for duplicate config id found! Key: {}, Value: {:?}!",
-                        config_id, old_entry
-                    );
-                }
-            }
-        }
-
-        let config_address = config_address();
-
+    fn read_on_chain_configs(
+        &self,
+        version: Version,
+    ) -> Result<OnChainConfigPayload<DbBackedOnChainConfig>, Error> {
         let db_state_view = &self
             .storage
             .read()
@@ -293,16 +294,7 @@ impl EventSubscriptionService {
                     error
                 ))
             })?;
-        let config_address_account_view = db_state_view.as_account_with_state_view(&config_address);
-
-        let epoch = config_address_account_view
-            .get_configuration_resource()
-            .map_err(|error| {
-                Error::UnexpectedErrorEncountered(format!(
-                    "Failed to fetch Configuration resource {:?}",
-                    error
-                ))
-            })?
+        let epoch = ConfigurationResource::fetch_config(&db_state_view)
             .ok_or_else(|| {
                 Error::UnexpectedErrorEncountered("Configuration resource does not exist!".into())
             })?
@@ -311,7 +303,7 @@ impl EventSubscriptionService {
         // Return the new on-chain config payload (containing all found configs at this version).
         Ok(OnChainConfigPayload::new(
             epoch,
-            Arc::new(config_id_to_config),
+            DbBackedOnChainConfig::new(self.storage.read().reader.clone(), version),
         ))
     }
 }
@@ -347,7 +339,7 @@ type SubscriptionId = u64;
 #[derive(Debug)]
 struct EventSubscription {
     pub event_buffer: Vec<ContractEvent>,
-    pub notification_sender: channel::aptos_channel::Sender<(), EventNotification>,
+    pub notification_sender: aptos_channels::aptos_channel::Sender<(), EventNotification>,
 }
 
 impl EventSubscription {
@@ -369,16 +361,16 @@ impl EventSubscription {
 
 /// A single reconfig subscription, holding the channel to send the
 /// corresponding notifications.
-#[derive(Debug)]
 struct ReconfigSubscription {
-    pub notification_sender: channel::aptos_channel::Sender<(), ReconfigNotification>,
+    pub notification_sender:
+        aptos_channels::aptos_channel::Sender<(), ReconfigNotification<DbBackedOnChainConfig>>,
 }
 
 impl ReconfigSubscription {
     fn notify_subscriber_of_configs(
         &mut self,
         version: Version,
-        on_chain_configs: OnChainConfigPayload,
+        on_chain_configs: OnChainConfigPayload<DbBackedOnChainConfig>,
     ) -> Result<(), Error> {
         let reconfig_notification = ReconfigNotification {
             version,
@@ -391,6 +383,42 @@ impl ReconfigSubscription {
     }
 }
 
+#[derive(Clone)]
+pub struct DbBackedOnChainConfig {
+    pub reader: Arc<dyn DbReader>,
+    pub version: Version,
+}
+
+impl DbBackedOnChainConfig {
+    pub fn new(reader: Arc<dyn DbReader>, version: Version) -> Self {
+        Self { reader, version }
+    }
+}
+
+impl OnChainConfigProvider for DbBackedOnChainConfig {
+    fn get<T: OnChainConfig>(&self) -> Result<T> {
+        let bytes = self
+            .reader
+            .get_state_value_by_version(&StateKey::on_chain_config::<T>()?, self.version)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "no config {} found in aptos root account state",
+                    T::CONFIG_ID
+                )
+            })?
+            .bytes()
+            .clone();
+
+        T::deserialize_into_config(&bytes)
+    }
+}
+
+impl fmt::Debug for DbBackedOnChainConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DbBackedOnChainConfig {{ version: {:?} }}", self.version)
+    }
+}
+
 /// A notification for events.
 #[derive(Debug)]
 pub struct EventNotification {
@@ -400,21 +428,21 @@ pub struct EventNotification {
 
 /// A notification for reconfigurations.
 #[derive(Debug)]
-pub struct ReconfigNotification {
+pub struct ReconfigNotification<P: OnChainConfigProvider> {
     pub version: Version,
-    pub on_chain_configs: OnChainConfigPayload,
+    pub on_chain_configs: OnChainConfigPayload<P>,
 }
 
 /// A subscription listener for on-chain events.
 pub type EventNotificationListener = NotificationListener<EventNotification>;
 
 /// A subscription listener for reconfigurations.
-pub type ReconfigNotificationListener = NotificationListener<ReconfigNotification>;
+pub type ReconfigNotificationListener<P> = NotificationListener<ReconfigNotification<P>>;
 
 /// The component responsible for listening to subscription notifications.
 #[derive(Debug)]
 pub struct NotificationListener<T> {
-    pub notification_receiver: channel::aptos_channel::Receiver<(), T>,
+    pub notification_receiver: aptos_channels::aptos_channel::Receiver<(), T>,
 }
 
 impl<T> Stream for NotificationListener<T> {

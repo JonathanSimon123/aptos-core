@@ -1,65 +1,100 @@
 [package]
 name = "aptos-node"
-version = "0.1.0"
-authors = ["Aptos Labs <opensource@aptoslabs.com>"]
 description = "Aptos node"
-repository = "https://github.com/aptos-labs/aptos-core"
-homepage = "https://aptoslabs.com"
-license = "Apache-2.0"
-publish = false
-edition = "2018"
+version = "0.0.0-main"
+
+# Workspace inherited keys
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
 
 [dependencies]
-bcs = "0.1.3"
-fail = "0.5.0"
-futures = "0.3.21"
-hex = "0.4.3"
-jemallocator = { version = "0.3.2", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
-rand = "0.8.5"
-structopt = "0.3.21"
-tokio = { version = "1.18.2", features = ["full"] }
-tokio-stream = "0.1.8"
+anyhow = { workspace = true }
+aptos-admin-service = { workspace = true }
+aptos-api = { workspace = true }
+aptos-backup-service = { workspace = true }
+aptos-build-info = { workspace = true }
+aptos-cached-packages = { workspace = true }
+aptos-channels = { workspace = true }
+aptos-config = { workspace = true }
+aptos-consensus = { workspace = true }
+aptos-consensus-notifications = { workspace = true }
+aptos-crash-handler = { workspace = true }
+aptos-crypto = { workspace = true }
+aptos-data-client = { workspace = true }
+aptos-data-streaming-service = { workspace = true }
+aptos-db = { workspace = true }
+aptos-db-indexer = { workspace = true }
+aptos-dkg-runtime = { workspace = true }
+aptos-event-notifications = { workspace = true }
+aptos-executor = { workspace = true }
+aptos-framework = { workspace = true }
+aptos-genesis = { workspace = true }
+aptos-indexer = { workspace = true, optional = true }
+aptos-indexer-grpc-fullnode = { workspace = true }
+aptos-indexer-grpc-table-info = { workspace = true }
+aptos-infallible = { workspace = true }
+aptos-inspection-service = { workspace = true }
+aptos-jwk-consensus = { workspace = true }
+aptos-logger = { workspace = true, features = ["node-identity"] }
+aptos-mempool = { workspace = true }
+aptos-mempool-notifications = { workspace = true }
+aptos-network = { workspace = true }
+aptos-network-benchmark = { workspace = true }
+aptos-network-builder = { workspace = true }
+aptos-node-identity = { workspace = true }
+aptos-peer-monitoring-service-client = { workspace = true }
+aptos-peer-monitoring-service-server = { workspace = true }
+aptos-peer-monitoring-service-types = { workspace = true }
+aptos-runtimes = { workspace = true }
+aptos-state-sync-driver = { workspace = true }
+aptos-storage-interface = { workspace = true }
+aptos-storage-service-client = { workspace = true }
+aptos-storage-service-notifications = { workspace = true }
+aptos-storage-service-server = { workspace = true }
+aptos-storage-service-types = { workspace = true }
+aptos-telemetry = { workspace = true }
+aptos-temppath = { workspace = true }
+aptos-time-service = { workspace = true }
+aptos-types = { workspace = true }
+aptos-validator-transaction-pool = { workspace = true }
+aptos-vm = { workspace = true }
+aptos-vm-environment = { workspace = true }
+bcs = { workspace = true }
+clap = { workspace = true }
+either = { workspace = true }
+fail = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+num_cpus = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+rlimit = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
 
-aptos-api = { path = "../api" }
-aptos-config = { path = "../config" }
-aptos-crypto = { path = "../crates/aptos-crypto" }
-aptos-data-client = { path = "../state-sync/aptos-data-client" }
-aptos-genesis-tool = { path = "../config/management/genesis", features = ["testing"] }
-aptos-infallible = { path = "../crates/aptos-infallible" }
-aptos-logger = { path = "../crates/aptos-logger" }
-aptos-mempool = { path = "../mempool" }
-aptos-metrics = { path = "../crates/aptos-metrics" }
-aptos-secure-storage = { path = "../secure/storage" }
-aptos-state-view = { path = "../storage/state-view" }
-aptos-telemetry = { path = "../crates/aptos-telemetry" }
-aptos-temppath = { path = "../crates/aptos-temppath" }
-aptos-time-service = { path = "../crates/aptos-time-service" }
-aptos-types = { path = "../types" }
-aptos-vm = { path = "../aptos-move/aptos-vm" }
-aptos-workspace-hack = { path = "../crates/aptos-workspace-hack" }
-aptosdb = { path = "../storage/aptosdb" }
-backup-service = { path = "../storage/backup/backup-service" }
-cached-framework-packages = { path = "../aptos-move/framework/cached-packages" }
-consensus = { path = "../consensus" }
-consensus-notifications = { path = "../state-sync/inter-component/consensus-notifications" }
-crash-handler = { path = "../crates/crash-handler" }
-data-streaming-service = { path = "../state-sync/state-sync-v2/data-streaming-service" }
-debug-interface = { path = "../crates/debug-interface" }
-event-notifications = { path = "../state-sync/inter-component/event-notifications" }
-executor = { path = "../execution/executor" }
-executor-types = { path = "../execution/executor-types" }
-framework = { path = "../aptos-move/framework" }
-mempool-notifications = { path = "../state-sync/inter-component/mempool-notifications" }
-network = { path = "../network" }
-network-builder = { path = "../network/builder" }
-state-sync-multiplexer = { path = "../state-sync/state-sync-v2/state-sync-multiplexer" }
-state-sync-v1 = { path = "../state-sync/state-sync-v1" }
-storage-interface = { path = "../storage/storage-interface" }
-storage-service = { path = "../storage/storage-service" }
-storage-service-client = { path = "../state-sync/storage-service/client" }
-storage-service-server = { path = "../state-sync/storage-service/server" }
+[target.'cfg(unix)'.dependencies]
+jemallocator = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rstack-self = { workspace = true }
 
 [features]
-default = []
 assert-private-keys-not-cloneable = ["aptos-crypto/assert-private-keys-not-cloneable"]
-failpoints = ["fail/failpoints", "consensus/failpoints", "executor/failpoints", "aptos-mempool/failpoints", "aptos-api/failpoints"]
+check-vm-features = []
+consensus-only-perf-test = ["aptos-executor/consensus-only-perf-test", "aptos-mempool/consensus-only-perf-test", "aptos-db/consensus-only-perf-test"]
+default = []
+failpoints = ["fail/failpoints", "aptos-consensus/failpoints", "aptos-executor/failpoints", "aptos-mempool/failpoints", "aptos-api/failpoints", "aptos-config/failpoints"]
+indexer = ["aptos-indexer"]
+tokio-console = ["aptos-logger/tokio-console", "aptos-config/tokio-console"]
+smoke-test = ["aptos-jwk-consensus/smoke-test", "aptos-dkg-runtime/smoke-test"]
+
+[package.metadata.cargo-machete]
+ignored = ["aptos-crypto"]

@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 /// This module provides various indexes used by Mempool.
@@ -6,16 +7,20 @@ use crate::core_mempool::transaction::{MempoolTransaction, SequenceInfo, Timelin
 use crate::{
     counters,
     logging::{LogEntry, LogSchema},
+    shared_mempool::types::{MultiBucketTimelineIndexIds, TimelineIndexIdentifier},
 };
+use aptos_consensus_types::common::TransactionSummary;
+use aptos_crypto::HashValue;
 use aptos_logger::prelude::*;
 use aptos_types::account_address::AccountAddress;
 use rand::seq::SliceRandom;
 use std::{
     cmp::Ordering,
     collections::{btree_set::Iter, BTreeMap, BTreeSet, HashMap},
+    hash::Hash,
     iter::Rev,
     ops::Bound,
-    time::Duration,
+    time::{Duration, Instant, SystemTime},
 };
 
 pub type AccountTransactions = BTreeMap<u64, MempoolTransaction>;
@@ -55,8 +60,10 @@ impl PriorityIndex {
         OrderedQueueKey {
             gas_ranking_score: txn.ranking_score,
             expiration_time: txn.expiration_time,
+            insertion_time: txn.insertion_info.insertion_time,
             address: txn.get_sender(),
             sequence_number: txn.sequence_info,
+            hash: txn.get_committed_hash(),
         }
     }
 
@@ -73,8 +80,10 @@ impl PriorityIndex {
 pub struct OrderedQueueKey {
     pub gas_ranking_score: u64,
     pub expiration_time: Duration,
+    pub insertion_time: SystemTime,
     pub address: AccountAddress,
     pub sequence_number: SequenceInfo,
+    pub hash: HashValue,
 }
 
 impl PartialOrd for OrderedQueueKey {
@@ -86,21 +95,27 @@ impl PartialOrd for OrderedQueueKey {
 impl Ord for OrderedQueueKey {
     fn cmp(&self, other: &OrderedQueueKey) -> Ordering {
         match self.gas_ranking_score.cmp(&other.gas_ranking_score) {
-            Ordering::Equal => {}
+            Ordering::Equal => {},
             ordering => return ordering,
         }
-        match self.expiration_time.cmp(&other.expiration_time).reverse() {
-            Ordering::Equal => {}
+        match self.insertion_time.cmp(&other.insertion_time).reverse() {
+            Ordering::Equal => {},
             ordering => return ordering,
         }
         match self.address.cmp(&other.address) {
-            Ordering::Equal => {}
+            Ordering::Equal => {},
             ordering => return ordering,
         }
-        self.sequence_number
+        match self
+            .sequence_number
             .transaction_sequence_number
             .cmp(&other.sequence_number.transaction_sequence_number)
             .reverse()
+        {
+            Ordering::Equal => {},
+            ordering => return ordering,
+        }
+        self.hash.cmp(&other.hash)
     }
 }
 
@@ -156,6 +171,10 @@ impl TTLIndex {
         }
     }
 
+    pub(crate) fn iter(&self) -> Iter<TTLOrderingKey> {
+        self.data.iter()
+    }
+
     pub(crate) fn size(&self) -> usize {
         self.data.len()
     }
@@ -177,7 +196,7 @@ impl Ord for TTLOrderingKey {
         match self.expiration_time.cmp(&other.expiration_time) {
             Ordering::Equal => {
                 (&self.address, self.sequence_number).cmp(&(&other.address, other.sequence_number))
-            }
+            },
             ordering => ordering,
         }
     }
@@ -192,7 +211,7 @@ impl Ord for TTLOrderingKey {
 /// logical reference to transaction content in main storage.
 pub struct TimelineIndex {
     timeline_id: u64,
-    timeline: BTreeMap<u64, (AccountAddress, u64)>,
+    timeline: BTreeMap<u64, (AccountAddress, u64, Instant)>,
 }
 
 impl TimelineIndex {
@@ -204,20 +223,28 @@ impl TimelineIndex {
     }
 
     /// Read all transactions from the timeline since <timeline_id>.
+    /// At most `count` transactions will be returned.
+    /// If `before` is set, only transactions inserted before this time will be returned.
     pub(crate) fn read_timeline(
         &self,
         timeline_id: u64,
         count: usize,
+        before: Option<Instant>,
     ) -> Vec<(AccountAddress, u64)> {
         let mut batch = vec![];
-        for (_id, &(address, sequence_number)) in self
+        for (_id, &(address, sequence_number, insertion_time)) in self
             .timeline
             .range((Bound::Excluded(timeline_id), Bound::Unbounded))
         {
-            batch.push((address, sequence_number));
+            if let Some(before) = before {
+                if insertion_time >= before {
+                    break;
+                }
+            }
             if batch.len() == count {
                 break;
             }
+            batch.push((address, sequence_number));
         }
         batch
     }
@@ -226,8 +253,7 @@ impl TimelineIndex {
     pub(crate) fn timeline_range(&self, start_id: u64, end_id: u64) -> Vec<(AccountAddress, u64)> {
         self.timeline
             .range((Bound::Excluded(start_id), Bound::Included(end_id)))
-            .map(|(_idx, txn)| txn)
-            .cloned()
+            .map(|(_idx, &(address, sequence, _))| (address, sequence))
             .collect()
     }
 
@@ -237,6 +263,7 @@ impl TimelineIndex {
             (
                 txn.get_sender(),
                 txn.sequence_info.transaction_sequence_number,
+                Instant::now(),
             ),
         );
         txn.timeline_state = TimelineState::Ready(self.timeline_id);
@@ -254,6 +281,134 @@ impl TimelineIndex {
     }
 }
 
+pub struct MultiBucketTimelineIndex {
+    timelines: Vec<TimelineIndex>,
+    bucket_mins: Vec<u64>,
+    bucket_mins_to_string: Vec<String>,
+}
+
+impl MultiBucketTimelineIndex {
+    pub(crate) fn new(bucket_mins: Vec<u64>) -> anyhow::Result<Self> {
+        anyhow::ensure!(!bucket_mins.is_empty(), "Must not be empty");
+        anyhow::ensure!(bucket_mins[0] == 0, "First bucket must start at 0");
+
+        let mut prev = None;
+        let mut timelines = vec![];
+        for entry in bucket_mins.clone() {
+            if let Some(prev) = prev {
+                anyhow::ensure!(prev < entry, "Values must be sorted and not repeat");
+            }
+            prev = Some(entry);
+            timelines.push(TimelineIndex::new());
+        }
+
+        let bucket_mins_to_string: Vec<_> = bucket_mins
+            .iter()
+            .map(|bucket_min| bucket_min.to_string())
+            .collect();
+
+        Ok(Self {
+            timelines,
+            bucket_mins,
+            bucket_mins_to_string,
+        })
+    }
+
+    /// Read all transactions from the timeline since <timeline_id>.
+    /// At most `count` transactions will be returned.
+    pub(crate) fn read_timeline(
+        &self,
+        timeline_id: &MultiBucketTimelineIndexIds,
+        count: usize,
+        before: Option<Instant>,
+    ) -> Vec<Vec<(AccountAddress, u64)>> {
+        assert!(timeline_id.id_per_bucket.len() == self.bucket_mins.len());
+
+        let mut added = 0;
+        let mut returned = vec![];
+        for (timeline, &timeline_id) in self
+            .timelines
+            .iter()
+            .zip(timeline_id.id_per_bucket.iter())
+            .rev()
+        {
+            let txns = timeline.read_timeline(timeline_id, count - added, before);
+            added += txns.len();
+            returned.push(txns);
+
+            if added == count {
+                break;
+            }
+        }
+        while returned.len() < self.timelines.len() {
+            returned.push(vec![]);
+        }
+        returned.iter().rev().cloned().collect()
+    }
+
+    /// Read transactions from the timeline from `start_id` (exclusive) to `end_id` (inclusive).
+    pub(crate) fn timeline_range(
+        &self,
+        start_end_pairs: HashMap<TimelineIndexIdentifier, (u64, u64)>,
+    ) -> Vec<(AccountAddress, u64)> {
+        assert_eq!(start_end_pairs.len(), self.timelines.len());
+
+        let mut all_txns = vec![];
+        for (timeline_index_identifier, (start_id, end_id)) in start_end_pairs {
+            let mut txns = self
+                .timelines
+                .get(timeline_index_identifier as usize)
+                .map_or_else(Vec::new, |timeline| {
+                    timeline.timeline_range(start_id, end_id)
+                });
+            all_txns.append(&mut txns);
+        }
+        all_txns
+    }
+
+    #[inline]
+    fn get_timeline(&mut self, ranking_score: u64) -> &mut TimelineIndex {
+        let index = self
+            .bucket_mins
+            .binary_search(&ranking_score)
+            .unwrap_or_else(|i| i - 1);
+        self.timelines.get_mut(index).unwrap()
+    }
+
+    pub(crate) fn insert(&mut self, txn: &mut MempoolTransaction) {
+        self.get_timeline(txn.ranking_score).insert(txn);
+    }
+
+    pub(crate) fn remove(&mut self, txn: &MempoolTransaction) {
+        self.get_timeline(txn.ranking_score).remove(txn);
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        let mut size = 0;
+        for timeline in &self.timelines {
+            size += timeline.size()
+        }
+        size
+    }
+
+    pub(crate) fn get_sizes(&self) -> Vec<(&str, usize)> {
+        self.bucket_mins_to_string
+            .iter()
+            .zip(self.timelines.iter())
+            .map(|(bucket_min, timeline)| (bucket_min.as_str(), timeline.size()))
+            .collect()
+    }
+
+    #[inline]
+    pub(crate) fn get_bucket(&self, ranking_score: u64) -> &str {
+        let index = self
+            .bucket_mins
+            .binary_search(&ranking_score)
+            .unwrap_or_else(|i| i - 1);
+        self.bucket_mins_to_string[index].as_str()
+    }
+}
+
 /// ParkingLotIndex keeps track of "not_ready" transactions, e.g., transactions that
 /// can't be included in the next block because their sequence number is too high.
 /// We keep a separate index to be able to efficiently evict them when Mempool is full.
@@ -261,7 +416,7 @@ pub struct ParkingLotIndex {
     // DS invariants:
     // 1. for each entry (account, txns) in `data`, `txns` is never empty
     // 2. for all accounts, data.get(account_indices.get(`account`)) == (account, sequence numbers of account's txns)
-    data: Vec<(AccountAddress, BTreeSet<u64>)>,
+    data: Vec<(AccountAddress, BTreeSet<(u64, HashValue)>)>,
     account_indices: HashMap<AccountAddress, usize>,
     size: usize,
 }
@@ -275,13 +430,19 @@ impl ParkingLotIndex {
         }
     }
 
-    pub(crate) fn insert(&mut self, txn: &MempoolTransaction) {
+    pub(crate) fn insert(&mut self, txn: &mut MempoolTransaction) {
+        if txn.insertion_info.park_time.is_none() {
+            txn.insertion_info.park_time = Some(SystemTime::now());
+        }
+        txn.was_parked = true;
+
         let sender = &txn.txn.sender();
         let sequence_number = txn.txn.sequence_number();
+        let hash = txn.get_committed_hash();
         let is_new_entry = match self.account_indices.get(sender) {
             Some(index) => {
                 if let Some((_account, seq_nums)) = self.data.get_mut(*index) {
-                    seq_nums.insert(sequence_number)
+                    seq_nums.insert((sequence_number, hash))
                 } else {
                     counters::CORE_MEMPOOL_INVARIANT_VIOLATION_COUNT.inc();
                     error!(
@@ -291,13 +452,16 @@ impl ParkingLotIndex {
                     );
                     return;
                 }
-            }
+            },
             None => {
-                let seq_nums = [sequence_number].iter().cloned().collect::<BTreeSet<_>>();
-                self.data.push((*sender, seq_nums));
+                let entry = [(sequence_number, hash)]
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                self.data.push((*sender, entry));
                 self.account_indices.insert(*sender, self.data.len() - 1);
                 true
-            }
+            },
         };
         if is_new_entry {
             self.size += 1;
@@ -308,7 +472,7 @@ impl ParkingLotIndex {
         let sender = &txn.txn.sender();
         if let Some(index) = self.account_indices.get(sender).cloned() {
             if let Some((_account, txns)) = self.data.get_mut(index) {
-                if txns.remove(&txn.txn.sequence_number()) {
+                if txns.remove(&(txn.txn.sequence_number(), txn.get_committed_hash())) {
                     self.size -= 1;
                 }
 
@@ -327,41 +491,57 @@ impl ParkingLotIndex {
         }
     }
 
-    pub(crate) fn contains(&self, account: &AccountAddress, seq_num: &u64) -> bool {
+    pub(crate) fn contains(&self, account: &AccountAddress, seq_num: u64, hash: HashValue) -> bool {
         self.account_indices
             .get(account)
             .and_then(|idx| self.data.get(*idx))
-            .map_or(false, |(_account, txns)| txns.contains(seq_num))
+            .map_or(false, |(_account, txns)| txns.contains(&(seq_num, hash)))
     }
 
     /// Returns a random "non-ready" transaction (with highest sequence number for that account).
     pub(crate) fn get_poppable(&self) -> Option<TxnPointer> {
         let mut rng = rand::thread_rng();
-        self.data
-            .choose(&mut rng)
-            .and_then(|(sender, txns)| txns.iter().rev().next().map(|seq_num| (*sender, *seq_num)))
+        self.data.choose(&mut rng).and_then(|(sender, txns)| {
+            txns.iter().next_back().map(|(seq_num, hash)| TxnPointer {
+                sender: *sender,
+                sequence_number: *seq_num,
+                hash: *hash,
+            })
+        })
     }
 
     pub(crate) fn size(&self) -> usize {
         self.size
     }
+
+    pub(crate) fn get_addresses(&self) -> Vec<(AccountAddress, u64)> {
+        self.data
+            .iter()
+            .map(|(addr, txns)| (*addr, txns.len() as u64))
+            .collect::<Vec<(AccountAddress, u64)>>()
+    }
 }
 
 /// Logical pointer to `MempoolTransaction`.
 /// Includes Account's address and transaction sequence number.
-pub type TxnPointer = (AccountAddress, u64);
+pub type TxnPointer = TransactionSummary;
 
 impl From<&MempoolTransaction> for TxnPointer {
-    fn from(transaction: &MempoolTransaction) -> Self {
-        (
-            transaction.get_sender(),
-            transaction.sequence_info.transaction_sequence_number,
-        )
+    fn from(txn: &MempoolTransaction) -> Self {
+        Self {
+            sender: txn.get_sender(),
+            sequence_number: txn.sequence_info.transaction_sequence_number,
+            hash: txn.get_committed_hash(),
+        }
     }
 }
 
 impl From<&OrderedQueueKey> for TxnPointer {
     fn from(key: &OrderedQueueKey) -> Self {
-        (key.address, key.sequence_number.transaction_sequence_number)
+        Self {
+            sender: key.address,
+            sequence_number: key.sequence_number.transaction_sequence_number,
+            hash: key.hash,
+        }
     }
 }

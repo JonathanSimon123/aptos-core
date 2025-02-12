@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module defines physical storage schema for any single-entry data.
@@ -12,16 +13,19 @@
 //! | single entry key  | raw value bytes |
 //! ```
 
-use super::{ensure_slice_len_eq, SINGLE_ENTRY_CF_NAME};
+use super::ensure_slice_len_eq;
+use crate::define_schema;
 use anyhow::{format_err, Result};
+use aptos_schemadb::{
+    schema::{KeyCodec, ValueCodec},
+    ColumnFamilyName,
+};
 use byteorder::ReadBytesExt;
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::{FromPrimitive, ToPrimitive};
-use schemadb::{
-    define_schema,
-    schema::{KeyCodec, ValueCodec},
-};
 use std::mem::size_of;
+
+pub const SINGLE_ENTRY_CF_NAME: ColumnFamilyName = "single_entry";
 
 define_schema!(
     SingleEntrySchema,
@@ -33,12 +37,10 @@ define_schema!(
 #[derive(Debug, Eq, PartialEq, FromPrimitive, ToPrimitive)]
 #[repr(u8)]
 pub enum SingleEntryKey {
-    // Used to store the highest timeout certificate
-    HighestTimeoutCertificate = 0,
     // Used to store the last vote
-    LastVoteMsg = 1,
+    LastVote = 0,
     // Two chain timeout cert
-    Highest2ChainTimeoutCert = 2,
+    Highest2ChainTimeoutCert = 1,
 }
 
 impl KeyCodec<SingleEntrySchema> for SingleEntryKey {

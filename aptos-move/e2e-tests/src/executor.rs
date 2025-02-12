@@ -1,57 +1,106 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Support for running the VM to execute and verify transactions.
 
+use crate::{
+    account::{Account, AccountData},
+    data_store::{
+        FakeDataStore, GENESIS_CHANGE_SET_HEAD, GENESIS_CHANGE_SET_MAINNET,
+        GENESIS_CHANGE_SET_TESTNET,
+    },
+    golden_outputs::GoldenOutputs,
+};
+use aptos_abstract_gas_usage::CalibrationAlgebra;
+use aptos_bitvec::BitVec;
+use aptos_block_executor::{
+    code_cache_global_manager::AptosModuleCacheManager, txn_commit_hook::NoOpTransactionCommitHook,
+    txn_provider::default::DefaultTxnProvider,
+};
+use aptos_crypto::HashValue;
+use aptos_framework::ReleaseBundle;
+use aptos_gas_algebra::DynamicExpression;
+use aptos_gas_meter::{AptosGasMeter, GasAlgebra, StandardGasAlgebra, StandardGasMeter};
+use aptos_gas_profiling::{GasProfiler, TransactionGasLog};
+use aptos_keygen::KeyGen;
+use aptos_types::{
+    account_config::{
+        new_block_event_key, AccountResource, CoinInfoResource, CoinStoreResource,
+        ConcurrentSupplyResource, NewBlockEvent, ObjectGroupResource, CORE_CODE_ADDRESS,
+    },
+    block_executor::{
+        config::{
+            BlockExecutorConfig, BlockExecutorConfigFromOnchain, BlockExecutorLocalConfig,
+            BlockExecutorModuleCacheLocalConfig,
+        },
+        transaction_slice_metadata::TransactionSliceMetadata,
+    },
+    block_metadata::BlockMetadata,
+    chain_id::ChainId,
+    contract_event::ContractEvent,
+    move_utils::MemberId,
+    on_chain_config::{AptosVersion, FeatureFlag, Features, OnChainConfig, ValidatorSet},
+    state_store::{state_key::StateKey, state_value::StateValue, StateView, TStateView},
+    transaction::{
+        signature_verified_transaction::{
+            into_signature_verified_block, SignatureVerifiedTransaction,
+        },
+        BlockOutput, ExecutionStatus, SignedTransaction, Transaction, TransactionOutput,
+        TransactionPayload, TransactionStatus, VMValidatorResult, ViewFunctionOutput,
+    },
+    vm_status::VMStatus,
+    write_set::{WriteOp, WriteSet, WriteSetMut},
+    AptosCoinType, CoinType,
+};
+use aptos_vm::{
+    block_executor::{AptosTransactionOutput, AptosVMBlockExecutorWrapper},
+    data_cache::AsMoveResolver,
+    gas::make_prod_gas_meter,
+    move_vm_ext::{MoveVmExt, SessionExt, SessionId},
+    AptosVM, VMValidator,
+};
+use aptos_vm_environment::environment::AptosEnvironment;
+use aptos_vm_genesis::{generate_genesis_change_set_for_testing_with_count, GenesisOptions};
+use aptos_vm_logging::log_schema::AdapterLogSchema;
+use aptos_vm_types::{
+    module_and_script_storage::{module_storage::AptosModuleStorage, AsAptosCodeStorage},
+    resolver::NoopBlockSynchronizationKillSwitch,
+    storage::change_set_configs::ChangeSetConfigs,
+};
+use bytes::Bytes;
+use claims::assert_ok;
+use move_core_types::{
+    account_address::AccountAddress,
+    identifier::Identifier,
+    language_storage::{ModuleId, StructTag, TypeTag},
+    move_resource::{MoveResource, MoveStructType},
+    value::MoveValue,
+};
+use move_vm_runtime::{
+    module_traversal::{TraversalContext, TraversalStorage},
+    ModuleStorage,
+};
+use move_vm_types::gas::UnmeteredGasMeter;
 use serde::Serialize;
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    str::FromStr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
-
-use crate::{
-    account::{Account, AccountData},
-    data_store::{FakeDataStore, GENESIS_CHANGE_SET, GENESIS_CHANGE_SET_FRESH},
-    golden_outputs::GoldenOutputs,
-};
-use aptos_crypto::HashValue;
-use aptos_keygen::KeyGen;
-use aptos_state_view::StateView;
-use aptos_types::{
-    access_path::AccessPath,
-    account_config::{AccountResource, CoinStoreResource, CORE_CODE_ADDRESS},
-    block_metadata::{new_block_event_key, BlockMetadata, NewBlockEvent},
-    on_chain_config::{OnChainConfig, VMPublishingOption, ValidatorSet, Version},
-    state_store::state_key::StateKey,
-    transaction::{
-        ChangeSet, ExecutionStatus, SignedTransaction, Transaction, TransactionOutput,
-        TransactionStatus, VMValidatorResult,
-    },
-    vm_status::VMStatus,
-    write_set::WriteSet,
-};
-use aptos_vm::{
-    data_cache::{AsMoveResolver, RemoteStorage},
-    move_vm_ext::{MoveVmExt, SessionId},
-    parallel_executor::ParallelAptosVM,
-    AptosVM, VMExecutor, VMValidator,
-};
-use move_deps::{
-    move_core_types::{
-        account_address::AccountAddress,
-        identifier::Identifier,
-        language_storage::{ModuleId, ResourceKey, TypeTag},
-        move_resource::MoveResource,
-    },
-    move_vm_types::gas_schedule::GasStatus,
-};
-use num_cpus;
 
 static RNG_SEED: [u8; 32] = [9u8; 32];
 
 const ENV_TRACE_DIR: &str = "TRACE";
+
+// Enables running parallel, in addition to sequential, in a
+// BothComparison mode.
+const ENV_ENABLE_PARALLEL: &str = "E2E_PARALLEL_EXEC";
 
 /// Directory structure of the trace dir
 pub const TRACE_FILE_NAME: &str = "name";
@@ -61,82 +110,210 @@ pub const TRACE_DIR_DATA: &str = "data";
 pub const TRACE_DIR_INPUT: &str = "input";
 pub const TRACE_DIR_OUTPUT: &str = "output";
 
+const POSTFIX: &str = "_should_error";
+
 /// Maps block number N to the index of the input and output transactions
 pub type TraceSeqMapping = (usize, Vec<usize>, Vec<usize>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutorMode {
+    SequentialOnly,
+    ParallelOnly,
+    // Runs sequential, then parallel, and compares outputs.
+    BothComparison,
+}
 
 /// Provides an environment to run a VM instance.
 ///
 /// This struct is a mock in-memory implementation of the Aptos executor.
-#[derive(Debug)]
 pub struct FakeExecutor {
     data_store: FakeDataStore,
+    event_store: Vec<ContractEvent>,
+    executor_thread_pool: Arc<rayon::ThreadPool>,
     block_time: u64,
     executed_output: Option<GoldenOutputs>,
     trace_dir: Option<PathBuf>,
     rng: KeyGen,
+    /// If set, determines whether to execute a comparison test with the parallel block executor.
+    /// If not set, environment variable E2E_PARALLEL_EXEC must be set
+    /// s.t. the comparison test is executed (BothComparison).
+    executor_mode: Option<ExecutorMode>,
+    allow_block_executor_fallback: bool,
+}
+
+pub enum GasMeterType {
+    RegularGasMeter,
+    UnmeteredGasMeter,
+}
+
+#[derive(Clone)]
+pub struct Measurement {
+    elapsed: Duration,
+    /// In internal gas units
+    execution_gas: u64,
+    /// In internal gas units
+    io_gas: u64,
+}
+
+const GAS_SCALING_FACTOR: f64 = 1_000_000.0;
+
+impl Measurement {
+    pub fn elapsed_micros(&self) -> u128 {
+        self.elapsed.as_micros()
+    }
+
+    pub fn elapsed_secs_f64(&self) -> f64 {
+        self.elapsed.as_secs_f64()
+    }
+
+    pub fn elapsed_micros_f64(&self) -> f64 {
+        self.elapsed.as_secs_f64() * 1_000_000.0
+    }
+
+    pub fn execution_gas_units(&self) -> f64 {
+        self.execution_gas as f64 / GAS_SCALING_FACTOR
+    }
+
+    pub fn io_gas_units(&self) -> f64 {
+        self.io_gas as f64 / GAS_SCALING_FACTOR
+    }
+}
+
+pub enum ExecFuncTimerDynamicArgs {
+    NoArgs,
+    DistinctSigners,
+    DistinctSignersAndFixed(Vec<AccountAddress>),
 }
 
 impl FakeExecutor {
     /// Creates an executor from a genesis [`WriteSet`].
-    pub fn from_genesis(write_set: &WriteSet) -> Self {
+    pub fn from_genesis(write_set: &WriteSet, chain_id: ChainId) -> Self {
+        let executor_thread_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(num_cpus::get())
+                .build()
+                .unwrap(),
+        );
+
+        let mut data_store = FakeDataStore::default();
+        data_store.set_chain_id(chain_id);
+
         let mut executor = FakeExecutor {
-            data_store: FakeDataStore::default(),
+            data_store,
+            event_store: Vec::new(),
+            executor_thread_pool,
             block_time: 0,
             executed_output: None,
             trace_dir: None,
             rng: KeyGen::from_seed(RNG_SEED),
+            executor_mode: None,
+            allow_block_executor_fallback: true,
         };
         executor.apply_write_set(write_set);
         executor
     }
 
-    /// Create an executor from a saved genesis blob
-    pub fn from_saved_genesis(saved_genesis_blob: &[u8]) -> Self {
-        let change_set = bcs::from_bytes::<ChangeSet>(saved_genesis_blob).unwrap();
-        Self::from_genesis(change_set.write_set())
-    }
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn from_genesis_with_existing_thread_pool(
+        write_set: &WriteSet,
+        chain_id: ChainId,
+        executor_thread_pool: Arc<rayon::ThreadPool>,
+    ) -> Self {
+        let mut data_store = FakeDataStore::default();
+        data_store.set_chain_id(chain_id);
 
-    /// Creates an executor from the genesis file GENESIS_FILE_LOCATION
-    pub fn from_genesis_file() -> Self {
-        Self::from_genesis(GENESIS_CHANGE_SET.clone().write_set())
-    }
-
-    /// Creates an executor using the standard genesis.
-    pub fn from_fresh_genesis() -> Self {
-        Self::from_genesis(GENESIS_CHANGE_SET_FRESH.clone().write_set())
-    }
-
-    pub fn allowlist_genesis() -> Self {
-        Self::custom_genesis(
-            cached_framework_packages::module_blobs(),
-            None,
-            VMPublishingOption::open(),
-        )
-    }
-
-    /// Creates an executor from the genesis file GENESIS_FILE_LOCATION with script/module
-    /// publishing options given by `publishing_options`. These can only be either `Open` or
-    /// `CustomScript`.
-    pub fn from_genesis_with_options(publishing_options: VMPublishingOption) -> Self {
-        if !publishing_options.is_open_script() {
-            panic!("Allowlisted transactions are not supported as a publishing option")
-        }
-
-        Self::custom_genesis(
-            cached_framework_packages::module_blobs(),
-            None,
-            publishing_options,
-        )
-    }
-
-    /// Creates an executor in which no genesis state has been applied yet.
-    pub fn no_genesis() -> Self {
-        FakeExecutor {
-            data_store: FakeDataStore::default(),
+        let mut executor = FakeExecutor {
+            data_store,
+            event_store: Vec::new(),
+            executor_thread_pool,
             block_time: 0,
             executed_output: None,
             trace_dir: None,
             rng: KeyGen::from_seed(RNG_SEED),
+            executor_mode: None,
+            allow_block_executor_fallback: true,
+        };
+        executor.apply_write_set(write_set);
+        executor
+    }
+
+    pub fn set_executor_mode(mut self, mode: ExecutorMode) -> Self {
+        self.executor_mode = Some(mode);
+        self
+    }
+
+    /// Configure this executor to not use parallel execution. By default, parallel execution is
+    /// enabled if E2E_PARALLEL_EXEC is set. This overrides the default.
+    pub fn set_not_parallel(self) -> Self {
+        self.set_executor_mode(ExecutorMode::SequentialOnly)
+    }
+
+    /// Configure this executor to use parallel execution. By default, parallel execution is
+    /// enabled if E2E_PARALLEL_EXEC is set. This overrides the default.
+    pub fn set_parallel(self) -> Self {
+        self.set_executor_mode(ExecutorMode::BothComparison)
+    }
+
+    pub fn disable_block_executor_fallback(&mut self) {
+        self.allow_block_executor_fallback = false;
+    }
+
+    /// Creates an executor from the genesis file GENESIS_FILE_LOCATION
+    pub fn from_head_genesis() -> Self {
+        Self::from_genesis(GENESIS_CHANGE_SET_HEAD.clone().write_set(), ChainId::test())
+    }
+
+    /// Creates an executor from the genesis file GENESIS_FILE_LOCATION
+    pub fn from_head_genesis_with_count(count: u64) -> Self {
+        Self::from_genesis(
+            generate_genesis_change_set_for_testing_with_count(GenesisOptions::Head, count)
+                .write_set(),
+            ChainId::test(),
+        )
+    }
+
+    /// Creates an executor using the standard genesis.
+    pub fn from_testnet_genesis() -> Self {
+        Self::from_genesis(
+            GENESIS_CHANGE_SET_TESTNET.clone().write_set(),
+            ChainId::testnet(),
+        )
+    }
+
+    /// Creates an executor using the mainnet genesis.
+    pub fn from_mainnet_genesis() -> Self {
+        Self::from_genesis(
+            GENESIS_CHANGE_SET_MAINNET.clone().write_set(),
+            ChainId::mainnet(),
+        )
+    }
+
+    pub fn data_store(&self) -> &FakeDataStore {
+        &self.data_store
+    }
+
+    pub fn data_store_mut(&mut self) -> &mut FakeDataStore {
+        &mut self.data_store
+    }
+
+    /// Creates an executor in which no genesis state has been applied yet.
+    pub fn no_genesis() -> Self {
+        let executor_thread_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(num_cpus::get())
+                .build()
+                .unwrap(),
+        );
+        FakeExecutor {
+            data_store: FakeDataStore::default(),
+            event_store: Vec::new(),
+            executor_thread_pool,
+            block_time: 0,
+            executed_output: None,
+            trace_dir: None,
+            rng: KeyGen::from_seed(RNG_SEED),
+            executor_mode: None,
+            allow_block_executor_fallback: true,
         }
     }
 
@@ -145,13 +322,24 @@ impl FakeExecutor {
         // files can persist on windows machines.
         let file_name = test_name.replace(':', "_");
         self.executed_output = Some(GoldenOutputs::new(&file_name));
+        self.set_tracing(test_name, file_name)
+    }
 
+    pub fn set_golden_file_at(&mut self, path: &str, test_name: &str) {
+        // 'test_name' includes ':' in the names, lets re-write these to be '_'s so that these
+        // files can persist on windows machines.
+        let file_name = test_name.replace(':', "_");
+        self.executed_output = Some(GoldenOutputs::new_at_path(PathBuf::from(path), &file_name));
+        self.set_tracing(test_name, file_name)
+    }
+
+    fn set_tracing(&mut self, test_name: &str, file_name: String) {
         // NOTE: tracing is only available when
         //  - the e2e test outputs a golden file, and
         //  - the environment variable is properly set
         if let Some(env_trace_dir) = env::var_os(ENV_TRACE_DIR) {
-            let aptos_version =
-                Version::fetch_config(&self.data_store.as_move_resolver()).map_or(0, |v| v.major);
+            let aptos_version = AptosVersion::fetch_config(&self.data_store.as_move_resolver())
+                .map_or(0, |v| v.major);
 
             let trace_dir = Path::new(&env_trace_dir).join(file_name);
             if trace_dir.exists() {
@@ -182,28 +370,19 @@ impl FakeExecutor {
     /// initialization done.
     pub fn stdlib_only_genesis() -> Self {
         let mut genesis = Self::no_genesis();
-        let blobs = cached_framework_packages::module_blobs();
-        let modules = cached_framework_packages::modules();
-        assert!(blobs.len() == modules.len());
-        for (module, bytes) in modules.iter().zip(blobs) {
+        for (bytes, module) in
+            aptos_cached_packages::head_release_bundle().code_and_compiled_modules()
+        {
             let id = module.self_id();
             genesis.add_module(&id, bytes.to_vec());
         }
         genesis
     }
 
-    /// Creates fresh genesis from the stdlib modules passed in.
-    pub fn custom_genesis(
-        genesis_modules: &[Vec<u8>],
-        validator_accounts: Option<usize>,
-        publishing_options: VMPublishingOption,
-    ) -> Self {
-        let genesis = vm_genesis::generate_test_genesis(
-            genesis_modules,
-            publishing_options,
-            validator_accounts,
-        );
-        Self::from_genesis(genesis.0.write_set())
+    /// Creates fresh genesis from the framework passed in.
+    pub fn custom_genesis(framework: &ReleaseBundle, validator_accounts: Option<usize>) -> Self {
+        let genesis = aptos_vm_genesis::generate_test_genesis(framework, validator_accounts);
+        Self::from_genesis(genesis.0.write_set(), ChainId::test())
     }
 
     /// Create one instance of [`AccountData`] without saving it to data store.
@@ -228,14 +407,116 @@ impl FakeExecutor {
         accounts
     }
 
+    /// Creates an account for the given static address. This address needs to be static so
+    /// we can load regular Move code to there without need to rewrite code addresses.
+    pub fn new_account_at(&mut self, addr: AccountAddress) -> Account {
+        let data = self.new_account_data_at(addr);
+        data.account().clone()
+    }
+
+    pub fn new_account_data_at(&mut self, addr: AccountAddress) -> AccountData {
+        // The below will use the genesis keypair but that should be fine.
+        let acc = Account::new_genesis_account(addr);
+
+        // Mint the account 10M Aptos coins (with 8 decimals).
+        self.store_and_fund_account(acc, 1_000_000_000_000_000, 0)
+    }
+
+    pub fn store_and_fund_account(
+        &mut self,
+        account: Account,
+        balance: u64,
+        seq_num: u64,
+    ) -> AccountData {
+        let features = Features::fetch_config(&self.data_store).unwrap_or_default();
+        let use_fa_balance = features.is_enabled(FeatureFlag::NEW_ACCOUNTS_DEFAULT_TO_FA_APT_STORE);
+        let use_concurrent_balance =
+            features.is_enabled(FeatureFlag::DEFAULT_TO_CONCURRENT_FUNGIBLE_BALANCE);
+
+        // Mint the account 10M Aptos coins (with 8 decimals).
+        let data = AccountData::with_account(
+            account,
+            balance,
+            seq_num,
+            use_fa_balance,
+            use_concurrent_balance,
+        );
+        self.add_account_data(&data);
+        data
+    }
+
     /// Applies a [`WriteSet`] to this executor's data store.
     pub fn apply_write_set(&mut self, write_set: &WriteSet) {
         self.data_store.add_write_set(write_set);
     }
 
+    pub fn append_events(&mut self, events: Vec<ContractEvent>) {
+        self.event_store.extend(events);
+    }
+
     /// Adds an account to this executor's data store.
     pub fn add_account_data(&mut self, account_data: &AccountData) {
-        self.data_store.add_account_data(account_data)
+        self.data_store.add_account_data(account_data);
+        // When a new account data with balance is initialized. The total_supply should be updated
+        // correspondingly to be consistent with the global state.
+        // if new_added_supply = 0, it is a noop.
+
+        if let Some(new_added_supply) = account_data.coin_balance() {
+            if new_added_supply != 0 {
+                let coin_info_resource = self
+                    .read_apt_coin_info_resource()
+                    .expect("coin info must exist in data store");
+                let old_supply = self.read_coin_supply().unwrap();
+                self.data_store.add_write_set(
+                    &coin_info_resource
+                        .to_writeset(old_supply + (new_added_supply as u128))
+                        .unwrap(),
+                )
+            }
+        }
+
+        if let Some(new_added_supply) = account_data.fungible_balance() {
+            if new_added_supply != 0 {
+                let mut fa_resource_group = self
+                    .read_resource_group::<ObjectGroupResource>(&AccountAddress::TEN)
+                    .expect("resource group must exist in data store");
+                let mut supply = bcs::from_bytes::<ConcurrentSupplyResource>(
+                    fa_resource_group
+                        .group
+                        .get(&ConcurrentSupplyResource::struct_tag())
+                        .unwrap(),
+                )
+                .unwrap();
+                supply
+                    .current
+                    .set(supply.current.get() + new_added_supply as u128);
+                fa_resource_group
+                    .group
+                    .insert(
+                        ConcurrentSupplyResource::struct_tag(),
+                        bcs::to_bytes(&supply).unwrap(),
+                    )
+                    .unwrap();
+                self.data_store.add_write_set(
+                    &WriteSetMut::new(vec![(
+                        StateKey::resource_group(
+                            &AccountAddress::TEN,
+                            &ObjectGroupResource::struct_tag(),
+                        ),
+                        WriteOp::legacy_modification(
+                            bcs::to_bytes(&fa_resource_group).unwrap().into(),
+                        ),
+                    )])
+                    .freeze()
+                    .unwrap(),
+                )
+            }
+        }
+    }
+
+    /// Adds coin info to this executor's data store.
+    pub fn add_coin_info(&mut self) {
+        self.data_store.add_coin_info()
     }
 
     /// Adds a module to this executor's data store.
@@ -245,20 +526,53 @@ impl FakeExecutor {
         self.data_store.add_module(module_id, module_blob)
     }
 
-    /// Reads the resource [`Value`] for an account from this executor's data store.
+    /// Reads the resource `Value` for an account from this executor's data store.
     pub fn read_account_resource(&self, account: &Account) -> Option<AccountResource> {
         self.read_account_resource_at_address(account.address())
     }
 
-    fn read_resource<T: MoveResource>(&self, addr: &AccountAddress) -> Option<T> {
-        let ap = AccessPath::resource_access_path(ResourceKey::new(*addr, T::struct_tag()));
-        let data_blob = StateView::get_state_value(&self.data_store, &StateKey::AccessPath(ap))
-            .expect("account must exist in data store")
-            .unwrap_or_else(|| panic!("Can't fetch {} resource for {}", T::STRUCT_NAME, addr));
-        bcs::from_bytes(data_blob.as_slice()).ok()
+    pub fn read_resource<T: MoveResource>(&self, addr: &AccountAddress) -> Option<T> {
+        let data_blob = TStateView::get_state_value_bytes(
+            &self.data_store,
+            &StateKey::resource_typed::<T>(addr).expect("failed to create StateKey"),
+        )
+        .expect("account must exist in data store")
+        .unwrap_or_else(|| panic!("Can't fetch {} resource for {}", T::STRUCT_NAME, addr));
+        bcs::from_bytes(&data_blob).ok()
     }
 
-    /// Reads the resource [`Value`] for an account under the given address from
+    pub fn read_resource_group<T: MoveResource>(&self, addr: &AccountAddress) -> Option<T> {
+        let data_blob = TStateView::get_state_value_bytes(
+            &self.data_store,
+            &StateKey::resource_group(addr, &T::struct_tag()),
+        )
+        .expect("account must exist in data store")
+        .unwrap_or_else(|| panic!("Can't fetch {} resource group for {}", T::STRUCT_NAME, addr));
+        bcs::from_bytes(&data_blob).ok()
+    }
+
+    pub fn read_resource_from_group<T: MoveResource>(
+        &self,
+        addr: &AccountAddress,
+        resource_group_tag: &StructTag,
+    ) -> Option<T> {
+        let bytes_opt = TStateView::get_state_value_bytes(
+            &self.data_store,
+            &StateKey::resource_group(addr, resource_group_tag),
+        )
+        .expect("account must exist in data store");
+
+        let group: Option<BTreeMap<StructTag, Vec<u8>>> = bytes_opt
+            .map(|bytes| bcs::from_bytes(&bytes))
+            .transpose()
+            .unwrap();
+        group
+            .and_then(|g| g.get(&T::struct_tag()).map(|b| bcs::from_bytes(b)))
+            .transpose()
+            .unwrap()
+    }
+
+    /// Reads the resource `Value` for an account under the given address from
     /// this executor's data store.
     pub fn read_account_resource_at_address(
         &self,
@@ -268,16 +582,42 @@ impl FakeExecutor {
     }
 
     /// Reads the CoinStore resource value for an account from this executor's data store.
-    pub fn read_coin_store_resource(&self, account: &Account) -> Option<CoinStoreResource> {
-        self.read_coin_store_resource_at_address(account.address())
+    pub fn read_apt_coin_store_resource(
+        &self,
+        account: &Account,
+    ) -> Option<CoinStoreResource<AptosCoinType>> {
+        self.read_apt_coin_store_resource_at_address(account.address())
+    }
+
+    /// Reads supply from CoinInfo resource value from this executor's data store.
+    pub fn read_coin_supply(&mut self) -> Option<u128> {
+        let bytes = self
+            .execute_view_function(
+                str::parse("0x1::coin::supply").unwrap(),
+                vec![move_core_types::language_storage::TypeTag::from_str(
+                    "0x1::aptos_coin::AptosCoin",
+                )
+                .unwrap()],
+                vec![],
+            )
+            .values
+            .unwrap()
+            .pop()
+            .unwrap();
+        bcs::from_bytes::<Option<u128>>(bytes.as_slice()).unwrap()
+    }
+
+    /// Reads the CoinInfo resource value from this executor's data store.
+    pub fn read_apt_coin_info_resource(&self) -> Option<CoinInfoResource<AptosCoinType>> {
+        self.read_resource(&AptosCoinType::coin_info_address())
     }
 
     /// Reads the CoinStore resource value for an account under the given address from this executor's
     /// data store.
-    pub fn read_coin_store_resource_at_address(
+    pub fn read_apt_coin_store_resource_at_address(
         &self,
         addr: &AccountAddress,
-    ) -> Option<CoinStoreResource> {
+    ) -> Option<CoinStoreResource<AptosCoinType>> {
         self.read_resource(addr)
     }
 
@@ -297,21 +637,6 @@ impl FakeExecutor {
         )
     }
 
-    /// Alternate form of 'execute_block' that keeps the vm_status before it goes into the
-    /// `TransactionOutput`
-    pub fn execute_block_and_keep_vm_status(
-        &self,
-        txn_block: Vec<SignedTransaction>,
-    ) -> Result<Vec<(VMStatus, TransactionOutput)>, VMStatus> {
-        AptosVM::execute_block_and_keep_vm_status(
-            txn_block
-                .into_iter()
-                .map(Transaction::UserTransaction)
-                .collect(),
-            &self.data_store,
-        )
-    }
-
     /// Executes the transaction as a singleton block and applies the resulting write set to the
     /// data store. Panics if execution fails
     pub fn execute_and_apply(&mut self, transaction: SignedTransaction) -> TransactionOutput {
@@ -321,33 +646,63 @@ impl FakeExecutor {
         match output.status() {
             TransactionStatus::Keep(status) => {
                 self.apply_write_set(output.write_set());
-                assert!(
-                    status == &ExecutionStatus::Success,
+                assert_eq!(
+                    status,
+                    &ExecutionStatus::Success,
                     "transaction failed with {:?}",
                     status
                 );
                 output
-            }
+            },
             TransactionStatus::Discard(status) => panic!("transaction discarded with {:?}", status),
             TransactionStatus::Retry => panic!("transaction status is retry"),
         }
     }
 
-    pub fn execute_transaction_block_parallel(
+    fn execute_transaction_block_impl_with_state_view(
         &self,
-        txn_block: Vec<Transaction>,
+        txn_block: Vec<SignatureVerifiedTransaction>,
+        onchain_config: BlockExecutorConfigFromOnchain,
+        sequential: bool,
+        state_view: &(impl StateView + Sync),
     ) -> Result<Vec<TransactionOutput>, VMStatus> {
-        let (result, _) =
-            ParallelAptosVM::execute_block(txn_block, &self.data_store, num_cpus::get())?;
-
-        Ok(result)
+        let config = BlockExecutorConfig {
+            local: BlockExecutorLocalConfig {
+                concurrency_level: if sequential {
+                    1
+                } else {
+                    usize::min(4, num_cpus::get())
+                },
+                allow_fallback: self.allow_block_executor_fallback,
+                discard_failed_blocks: false,
+                module_cache_config: BlockExecutorModuleCacheLocalConfig::default(),
+            },
+            onchain: onchain_config,
+        };
+        let txn_provider = DefaultTxnProvider::new(txn_block);
+        AptosVMBlockExecutorWrapper::execute_block_on_thread_pool::<
+            _,
+            NoOpTransactionCommitHook<AptosTransactionOutput, VMStatus>,
+            _,
+        >(
+            self.executor_thread_pool.clone(),
+            &txn_provider,
+            &state_view,
+            // Do not use shared module caches in tests.
+            &AptosModuleCacheManager::new(),
+            config,
+            TransactionSliceMetadata::unknown(),
+            None,
+        )
+        .map(BlockOutput::into_transaction_outputs_forced)
     }
 
-    pub fn execute_transaction_block(
+    pub fn execute_transaction_block_with_state_view(
         &self,
         txn_block: Vec<Transaction>,
+        state_view: &(impl StateView + Sync),
     ) -> Result<Vec<TransactionOutput>, VMStatus> {
-        let mut trace_map = TraceSeqMapping::default();
+        let mut trace_map: (usize, Vec<usize>, Vec<usize>) = TraceSeqMapping::default();
 
         // dump serialized transaction details before execution, if tracing
         if let Some(trace_dir) = &self.trace_dir {
@@ -360,12 +715,59 @@ impl FakeExecutor {
             }
         }
 
-        let output = AptosVM::execute_block(txn_block.clone(), &self.data_store);
-        let parallel_output = self.execute_transaction_block_parallel(txn_block);
-        assert_eq!(output, parallel_output);
+        let sig_verified_block = into_signature_verified_block(txn_block);
+
+        let mode = self.executor_mode.unwrap_or_else(|| {
+            if env::var(ENV_ENABLE_PARALLEL).is_ok() {
+                ExecutorMode::BothComparison
+            } else {
+                ExecutorMode::SequentialOnly
+            }
+        });
+
+        // TODO fetch values from state?
+        let onchain_config = BlockExecutorConfigFromOnchain::on_but_large_for_test();
+
+        let sequential_output = if mode != ExecutorMode::ParallelOnly {
+            Some(self.execute_transaction_block_impl_with_state_view(
+                sig_verified_block.clone(),
+                onchain_config.clone(),
+                true,
+                state_view,
+            ))
+        } else {
+            None
+        };
+
+        let parallel_output = if mode != ExecutorMode::SequentialOnly {
+            Some(self.execute_transaction_block_impl_with_state_view(
+                sig_verified_block,
+                onchain_config,
+                false,
+                state_view,
+            ))
+        } else {
+            None
+        };
+
+        if mode == ExecutorMode::BothComparison {
+            let sequential_output = sequential_output.as_ref().unwrap();
+            let parallel_output = parallel_output.as_ref().unwrap();
+
+            // make more granular comparison, to be able to understand test failures better
+            if sequential_output.is_ok() && parallel_output.is_ok() {
+                let txns_output_1 = sequential_output.as_ref().unwrap();
+                let txns_output_2 = parallel_output.as_ref().unwrap();
+                assert_outputs_equal(txns_output_1, "sequential", txns_output_2, "parallel");
+            } else {
+                assert_eq!(sequential_output, parallel_output, "Output mismatch");
+            }
+        }
+
+        let output = sequential_output.or(parallel_output).unwrap();
 
         if let Some(logger) = &self.executed_output {
-            logger.log(format!("{:?}\n", output).as_str());
+            logger.log(format!("{:#?}\n", output).as_str());
         }
 
         // dump serialized transaction output after execution, if tracing
@@ -377,7 +779,7 @@ impl FakeExecutor {
                         let output_seq = Self::trace(trace_output_dir.as_path(), res);
                         trace_map.2.push(output_seq);
                     }
-                }
+                },
                 Err(e) => {
                     let mut error_file = OpenOptions::new()
                         .write(true)
@@ -385,12 +787,19 @@ impl FakeExecutor {
                         .open(trace_dir.join(TRACE_FILE_ERROR))
                         .unwrap();
                     error_file.write_all(e.to_string().as_bytes()).unwrap();
-                }
+                },
             }
             let trace_meta_dir = trace_dir.join(TRACE_DIR_META);
             Self::trace(trace_meta_dir.as_path(), &trace_map);
         }
         output
+    }
+
+    pub fn execute_transaction_block(
+        &self,
+        txn_block: Vec<Transaction>,
+    ) -> Result<Vec<TransactionOutput>, VMStatus> {
+        self.execute_transaction_block_with_state_view(txn_block, &self.data_store)
     }
 
     pub fn execute_transaction(&self, txn: SignedTransaction) -> TransactionOutput {
@@ -401,6 +810,54 @@ impl FakeExecutor {
         outputs
             .pop()
             .expect("A block with one transaction should have one output")
+    }
+
+    pub fn execute_transaction_with_gas_profiler(
+        &self,
+        txn: SignedTransaction,
+    ) -> anyhow::Result<(TransactionOutput, TransactionGasLog)> {
+        let txn = txn
+            .check_signature()
+            .expect("invalid signature for transaction");
+
+        let log_context = AdapterLogSchema::new(self.data_store.id(), 0);
+
+        // TODO(Gas): revisit this.
+        let env = AptosEnvironment::new(&self.data_store);
+        let vm = AptosVM::new(env.clone(), self.get_state_view());
+
+        let resolver = self.data_store.as_move_resolver();
+        let code_storage = self.get_state_view().as_aptos_code_storage(env.clone());
+
+        let (_status, output, gas_profiler) = vm.execute_user_transaction_with_modified_gas_meter(
+            &resolver,
+            &code_storage,
+            &txn,
+            &log_context,
+            |gas_meter| {
+                let gas_profiler = match txn.payload() {
+                    TransactionPayload::Script(_) => GasProfiler::new_script(gas_meter),
+                    TransactionPayload::EntryFunction(entry_func) => GasProfiler::new_function(
+                        gas_meter,
+                        entry_func.module().clone(),
+                        entry_func.function().to_owned(),
+                        entry_func.ty_args().to_vec(),
+                    ),
+                    TransactionPayload::Multisig(..) => unimplemented!("not supported yet"),
+
+                    // Deprecated.
+                    TransactionPayload::ModuleBundle(..) => {
+                        unreachable!("Module bundle payload has been removed")
+                    },
+                };
+                gas_profiler
+            },
+        )?;
+
+        Ok((
+            output.try_materialize_into_transaction_output(&resolver)?,
+            gas_profiler.finish(),
+        ))
     }
 
     fn trace<P: AsRef<Path>, T: Serialize>(dir: P, item: &T) -> usize {
@@ -418,15 +875,34 @@ impl FakeExecutor {
         seq
     }
 
-    /// Get the blob for the associated AccessPath
-    pub fn read_from_access_path(&self, path: &AccessPath) -> Option<Vec<u8>> {
-        StateView::get_state_value(&self.data_store, &StateKey::AccessPath(path.clone())).unwrap()
+    pub fn get_events(&self) -> &[ContractEvent] {
+        self.event_store.as_slice()
     }
 
-    /// Verifies the given transaction by running it through the VM verifier.
-    pub fn verify_transaction(&self, txn: SignedTransaction) -> VMValidatorResult {
-        let vm = AptosVM::new(self.get_state_view());
-        vm.validate_transaction(txn, &self.data_store)
+    pub fn read_state_value(&self, state_key: &StateKey) -> Option<StateValue> {
+        TStateView::get_state_value(&self.data_store, state_key).unwrap()
+    }
+
+    /// Get the blob for the associated AccessPath
+    pub fn read_state_value_bytes(&self, state_key: &StateKey) -> Option<Bytes> {
+        TStateView::get_state_value_bytes(&self.data_store, state_key).unwrap()
+    }
+
+    /// Set the blob for the associated AccessPath
+    pub fn write_state_value(&mut self, state_key: StateKey, data_blob: Vec<u8>) {
+        self.data_store
+            .set(state_key, StateValue::new_legacy(data_blob.into()));
+    }
+
+    /// Validates the given transaction by running it through the VM validator.
+    pub fn validate_transaction(&self, txn: SignedTransaction) -> VMValidatorResult {
+        let env = AptosEnvironment::new(&self.data_store);
+        let vm = AptosVM::new(env.clone(), self.get_state_view());
+        vm.validate_transaction(
+            txn,
+            &self.data_store,
+            &self.data_store.as_aptos_code_storage(env),
+        )
     }
 
     pub fn get_state_view(&self) -> &FakeDataStore {
@@ -437,28 +913,65 @@ impl FakeExecutor {
         self.new_block_with_timestamp(self.block_time + 1);
     }
 
-    pub fn new_block_with_timestamp(&mut self, time_stamp: u64) {
-        let validator_set = ValidatorSet::fetch_config(&self.data_store.as_move_resolver())
+    pub fn new_block_with_timestamp(&mut self, time_microseconds: u64) {
+        self.block_time = time_microseconds;
+
+        let validator_set = ValidatorSet::fetch_config(&self.data_store)
             .expect("Unable to retrieve the validator set from storage");
-        self.block_time = time_stamp;
-        let new_block = BlockMetadata::new(
+        let proposer = *validator_set.payload().next().unwrap().account_address();
+        // when updating time, proposer cannot be ZERO.
+        self.new_block_with_metadata(proposer, vec![])
+    }
+
+    pub fn run_block_with_metadata(
+        &mut self,
+        proposer: AccountAddress,
+        failed_proposer_indices: Vec<u32>,
+        txns: Vec<SignedTransaction>,
+    ) -> Vec<(TransactionStatus, u64)> {
+        let mut txn_block: Vec<Transaction> =
+            txns.into_iter().map(Transaction::UserTransaction).collect();
+        let validator_set = ValidatorSet::fetch_config(&self.data_store)
+            .expect("Unable to retrieve the validator set from storage");
+        let new_block_metadata = BlockMetadata::new(
             HashValue::zero(),
             0,
             0,
-            vec![false; validator_set.payload().count()],
-            *validator_set.payload().next().unwrap().account_address(),
+            proposer,
+            BitVec::with_num_bits(validator_set.num_validators() as u16).into(),
+            failed_proposer_indices,
             self.block_time,
         );
-        let output = self
-            .execute_transaction_block(vec![Transaction::BlockMetadata(new_block)])
-            .expect("Executing block prologue should succeed")
-            .pop()
-            .expect("Failed to get the execution result for Block Prologue");
-        // check if we emit the expected event, there might be more events for transaction fees
-        let event = output.events()[0].clone();
+        txn_block.insert(0, Transaction::BlockMetadata(new_block_metadata));
+
+        let outputs = self
+            .execute_transaction_block(txn_block)
+            .expect("Must execute transactions");
+
+        // Check if we emit the expected event for block metadata, there might be more events for transaction fees.
+        let event = outputs[0].events()[0]
+            .v1()
+            .expect("The first event must be a block metadata v0 event")
+            .clone();
         assert_eq!(event.key(), &new_block_event_key());
         assert!(bcs::from_bytes::<NewBlockEvent>(event.event_data()).is_ok());
-        self.apply_write_set(output.write_set());
+
+        let mut results = vec![];
+        for output in outputs {
+            if !output.status().is_discarded() {
+                self.apply_write_set(output.write_set());
+            }
+            results.push((output.status().clone(), output.gas_used()));
+        }
+        results
+    }
+
+    pub fn new_block_with_metadata(
+        &mut self,
+        proposer: AccountAddress,
+        failed_proposer_indices: Vec<u32>,
+    ) {
+        self.run_block_with_metadata(proposer, failed_proposer_indices, vec![]);
     }
 
     fn module(name: &str) -> ModuleId {
@@ -477,6 +990,229 @@ impl FakeExecutor {
         self.block_time
     }
 
+    pub fn get_block_time_seconds(&mut self) -> u64 {
+        self.block_time / 1_000_000
+    }
+
+    /// exec_func_record_running_time is like exec(), however, we can run a Module published under
+    /// the creator address instead of 0x1, as what is currently done in exec.
+    /// Additionally we have dynamic_args and gas_meter_type to configure it further.
+    pub fn exec_func_record_running_time(
+        &mut self,
+        module: &ModuleId,
+        function_name: &str,
+        type_params: Vec<TypeTag>,
+        args: Vec<Vec<u8>>,
+        iterations: u64,
+        dynamic_args: ExecFuncTimerDynamicArgs,
+        gas_meter_type: GasMeterType,
+    ) -> Measurement {
+        let mut extra_accounts = match &dynamic_args {
+            ExecFuncTimerDynamicArgs::DistinctSigners
+            | ExecFuncTimerDynamicArgs::DistinctSignersAndFixed(_) => (0..iterations)
+                .map(|_| *self.new_account_at(AccountAddress::random()).address())
+                .collect::<Vec<_>>(),
+            _ => vec![],
+        };
+
+        let env = AptosEnvironment::new(&self.data_store);
+        let resolver = self.data_store.as_move_resolver();
+        let vm = MoveVmExt::new(env.clone(), &resolver);
+
+        // Create module storage, and ensure the module for the function we want to execute is
+        // cached.
+        let module_storage = self.data_store.as_aptos_code_storage(env.clone());
+        assert_ok!(module_storage.fetch_verified_module(module.address(), module.name()));
+
+        // start measuring here to reduce measurement errors (i.e., the time taken to load vm, module, etc.)
+        let mut i = 0;
+        let mut measurements = Vec::new();
+        while i < iterations {
+            let mut session = vm.new_session(&resolver, SessionId::void(), None);
+
+            // load function name into cache to ensure cache is hot
+            let _ = session.load_function(
+                &module_storage,
+                module,
+                &Self::name(function_name),
+                &type_params.clone(),
+            );
+
+            let fun_name = Self::name(function_name);
+            let should_error = fun_name.clone().into_string().ends_with(POSTFIX);
+            let ty = type_params.clone();
+            let mut arg = args.clone();
+            match &dynamic_args {
+                ExecFuncTimerDynamicArgs::DistinctSigners => {
+                    arg.insert(
+                        0,
+                        MoveValue::Signer(extra_accounts.pop().unwrap())
+                            .simple_serialize()
+                            .unwrap(),
+                    );
+                },
+                ExecFuncTimerDynamicArgs::DistinctSignersAndFixed(signers) => {
+                    for signer in signers.iter().rev() {
+                        arg.insert(0, MoveValue::Signer(*signer).simple_serialize().unwrap());
+                    }
+                    arg.insert(
+                        0,
+                        MoveValue::Signer(extra_accounts.pop().unwrap())
+                            .simple_serialize()
+                            .unwrap(),
+                    );
+                },
+                _ => {},
+            }
+
+            let (mut regular, mut unmetered) = match gas_meter_type {
+                GasMeterType::RegularGasMeter => (
+                    Some(make_prod_gas_meter(
+                        env.gas_feature_version(),
+                        env.gas_params().as_ref().unwrap().vm.clone(),
+                        env.storage_gas_params().as_ref().unwrap().clone(),
+                        false,
+                        1_000_000_000_000_000.into(),
+                        &NoopBlockSynchronizationKillSwitch {},
+                    )),
+                    None,
+                ),
+                GasMeterType::UnmeteredGasMeter => (None, Some(UnmeteredGasMeter)),
+            };
+
+            let start = Instant::now();
+            let storage = TraversalStorage::new();
+            // Not sure how to create a common type for both. Box<dyn GasMeter> doesn't work for some reason.
+            let result = match gas_meter_type {
+                GasMeterType::RegularGasMeter => session.execute_function_bypass_visibility(
+                    module,
+                    &fun_name,
+                    ty,
+                    arg,
+                    regular.as_mut().unwrap(),
+                    &mut TraversalContext::new(&storage),
+                    &module_storage,
+                ),
+                GasMeterType::UnmeteredGasMeter => session.execute_function_bypass_visibility(
+                    module,
+                    &fun_name,
+                    ty,
+                    arg,
+                    unmetered.as_mut().unwrap(),
+                    &mut TraversalContext::new(&storage),
+                    &module_storage,
+                ),
+            };
+            let elapsed = start.elapsed();
+            if let Err(err) = result {
+                if !should_error {
+                    println!(
+                        "Entry function under measurement failed with an error. Continuing, but measurements are probably not what is expected. Error: {}",
+                        err
+                    );
+                }
+            }
+            measurements.push(Measurement {
+                elapsed,
+                execution_gas: regular
+                    .as_ref()
+                    .map_or(0, |gas| gas.algebra().execution_gas_used().into()),
+                io_gas: regular
+                    .as_ref()
+                    .map_or(0, |gas| gas.algebra().io_gas_used().into()),
+            });
+            i += 1;
+        }
+
+        // take median of all running time iterations as a more robust measurement
+        measurements.sort_by_key(|v| v.elapsed);
+        let length = measurements.len();
+        let mid = length / 2;
+        let mut measurement = measurements[mid].clone();
+
+        if length % 2 == 0 {
+            measurement = Measurement {
+                elapsed: (measurements[mid - 1].elapsed + measurements[mid].elapsed) / 2,
+                execution_gas: (measurements[mid - 1].execution_gas
+                    + measurements[mid].execution_gas)
+                    / 2,
+                io_gas: (measurements[mid - 1].io_gas + measurements[mid].io_gas) / 2,
+            };
+        }
+
+        measurement
+    }
+
+    /// record abstract usage using a modified gas meter
+    pub fn exec_abstract_usage(
+        &mut self,
+        module: &ModuleId,
+        function_name: &str,
+        type_params: Vec<TypeTag>,
+        args: Vec<Vec<u8>>,
+    ) -> Vec<DynamicExpression> {
+        // Define the shared buffers
+        let a1 = Arc::new(Mutex::new(Vec::<DynamicExpression>::new()));
+        let a2 = Arc::clone(&a1);
+
+        let (write_set, _events) = {
+            let env = AptosEnvironment::new_with_gas_hook(
+                &self.data_store,
+                Arc::new(move |expression| {
+                    a2.lock().unwrap().push(expression);
+                }),
+            );
+            let resolver = self.data_store.as_move_resolver();
+            let vm = MoveVmExt::new(env.clone(), &resolver);
+
+            let module_storage = self.data_store.as_aptos_code_storage(env.clone());
+            let mut session = vm.new_session(&resolver, SessionId::void(), None);
+
+            let fun_name = Self::name(function_name);
+            let should_error = fun_name.clone().into_string().ends_with(POSTFIX);
+
+            let storage = TraversalStorage::new();
+            let result = session.execute_function_bypass_visibility(
+                module,
+                &fun_name,
+                type_params,
+                args,
+                &mut StandardGasMeter::new(CalibrationAlgebra {
+                    base: StandardGasAlgebra::new(
+                        env.gas_feature_version(),
+                        env.gas_params().as_ref().unwrap().vm.clone(),
+                        env.storage_gas_params().as_ref().unwrap().clone(),
+                        false,
+                        10_000_000_000_000,
+                        &NoopBlockSynchronizationKillSwitch {},
+                    ),
+                    shared_buffer: Arc::clone(&a1),
+                }),
+                &mut TraversalContext::new(&storage),
+                &module_storage,
+            );
+            if let Err(err) = result {
+                if !should_error {
+                    println!("Should error, but ignoring for now... {}", err);
+                }
+            }
+            let change_set_configs = &env
+                .storage_gas_params()
+                .as_ref()
+                .unwrap()
+                .change_set_configs;
+            finish_session_assert_no_modules(session, &module_storage, change_set_configs)
+        };
+        self.data_store.add_write_set(&write_set);
+
+        let a1_result = Arc::into_inner(a1);
+        a1_result
+            .expect("Failed to get a1 arc result")
+            .lock()
+            .unwrap()
+            .to_vec()
+    }
+
     pub fn exec(
         &mut self,
         module_name: &str,
@@ -484,35 +1220,42 @@ impl FakeExecutor {
         type_params: Vec<TypeTag>,
         args: Vec<Vec<u8>>,
     ) {
-        let write_set = {
-            let mut gas_status = GasStatus::new_unmetered();
-            let vm = MoveVmExt::new().unwrap();
-            let remote_view = RemoteStorage::new(&self.data_store);
-            let mut session = vm.new_session(&remote_view, SessionId::void());
+        let module_id = Self::module(module_name);
+        let (write_set, events) = {
+            let env = AptosEnvironment::new(&self.data_store);
+            let resolver = self.data_store.as_move_resolver();
+            let vm = MoveVmExt::new(env.clone(), &resolver);
+
+            let module_storage = self.data_store.as_aptos_code_storage(env.clone());
+            let mut session = vm.new_session(&resolver, SessionId::void(), None);
+            let storage = TraversalStorage::new();
             session
                 .execute_function_bypass_visibility(
-                    &Self::module(module_name),
+                    &module_id,
                     &Self::name(function_name),
                     type_params,
                     args,
-                    &mut gas_status,
+                    // TODO(Gas): we probably want to switch to metered execution in the future
+                    &mut UnmeteredGasMeter,
+                    &mut TraversalContext::new(&storage),
+                    &module_storage,
                 )
                 .unwrap_or_else(|e| {
                     panic!(
                         "Error calling {}.{}: {}",
-                        module_name,
+                        &module_id,
                         function_name,
                         e.into_vm_status()
                     )
                 });
-            let session_out = session.finish().expect("Failed to generate txn effects");
-            let (write_set, _events) = session_out
-                .into_change_set(&mut ())
-                .expect("Failed to generate writeset")
-                .into_inner();
-            write_set
+            finish_session_assert_no_modules(
+                session,
+                &module_storage,
+                &ChangeSetConfigs::unlimited_at_gas_feature_version(env.gas_feature_version()),
+            )
         };
         self.data_store.add_write_set(&write_set);
+        self.event_store.extend(events);
     }
 
     pub fn try_exec(
@@ -521,25 +1264,135 @@ impl FakeExecutor {
         function_name: &str,
         type_params: Vec<TypeTag>,
         args: Vec<Vec<u8>>,
-    ) -> Result<WriteSet, VMStatus> {
-        let mut gas_status = GasStatus::new_unmetered();
-        let vm = MoveVmExt::new().unwrap();
-        let remote_view = RemoteStorage::new(&self.data_store);
-        let mut session = vm.new_session(&remote_view, SessionId::void());
+    ) -> Result<(WriteSet, Vec<ContractEvent>), VMStatus> {
+        let env = AptosEnvironment::new(&self.data_store);
+        let resolver = self.data_store.as_move_resolver();
+        let vm = MoveVmExt::new(env.clone(), &resolver);
+
+        let module_storage = self.data_store.as_aptos_code_storage(env.clone());
+
+        let mut session = vm.new_session(&resolver, SessionId::void(), None);
+        let traversal_storage = TraversalStorage::new();
         session
             .execute_function_bypass_visibility(
                 &Self::module(module_name),
                 &Self::name(function_name),
                 type_params,
                 args,
-                &mut gas_status,
+                // TODO(Gas): we probably want to switch to metered execution in the future
+                &mut UnmeteredGasMeter,
+                &mut TraversalContext::new(&traversal_storage),
+                &module_storage,
             )
             .map_err(|e| e.into_vm_status())?;
-        let session_out = session.finish().expect("Failed to generate txn effects");
-        let (writeset, _events) = session_out
-            .into_change_set(&mut ())
-            .expect("Failed to generate writeset")
-            .into_inner();
-        Ok(writeset)
+        Ok(finish_session_assert_no_modules(
+            session,
+            &module_storage,
+            &ChangeSetConfigs::unlimited_at_gas_feature_version(env.gas_feature_version()),
+        ))
+    }
+
+    pub fn execute_view_function(
+        &mut self,
+        fun: MemberId,
+        type_args: Vec<TypeTag>,
+        arguments: Vec<Vec<u8>>,
+    ) -> ViewFunctionOutput {
+        let max_gas_amount = u64::MAX;
+        AptosVM::execute_view_function(
+            self.get_state_view(),
+            fun.module_id,
+            fun.member_id,
+            type_args,
+            arguments,
+            max_gas_amount,
+        )
+    }
+}
+
+/// Finishes the session, and asserts there has been no modules published (publishing is the
+/// responsibility of the adapter, i.e., [AptosVM]).
+fn finish_session_assert_no_modules(
+    session: SessionExt,
+    module_storage: &impl AptosModuleStorage,
+    change_set_configs: &ChangeSetConfigs,
+) -> (WriteSet, Vec<ContractEvent>) {
+    let (change_set, empty_module_write_set) = session
+        .finish(change_set_configs, module_storage)
+        .expect("Failed to finish the session");
+    assert_ok!(empty_module_write_set.is_empty_or_invariant_violation());
+
+    change_set
+        .try_combine_into_storage_change_set(empty_module_write_set)
+        .expect("Failed to convert to storage ChangeSet")
+        .into_inner()
+}
+
+pub fn assert_outputs_equal(
+    txns_output_1: &[TransactionOutput],
+    name1: &str,
+    txns_output_2: &[TransactionOutput],
+    name2: &str,
+) {
+    assert_eq!(
+        txns_output_1.len(),
+        txns_output_2.len(),
+        "Transaction outputs size mismatch: in {:?} and in {:?}",
+        name1,
+        name2,
+    );
+
+    for (idx, (txn_output_1, txn_output_2)) in
+        txns_output_1.iter().zip(txns_output_2.iter()).enumerate()
+    {
+        // Gas is usually the problem, so check it separately to
+        // have a concise error message.
+        assert_eq!(
+            txn_output_1.try_extract_fee_statement().unwrap_or_default(),
+            txn_output_2.try_extract_fee_statement().unwrap_or_default(),
+            "Different gas used for {:?} and {:?} for transaction outputs at index {}",
+            name1,
+            name2,
+            idx,
+        );
+
+        // Identify differences in write sets, if any.
+
+        let keys = txn_output_1
+            .write_set()
+            .iter()
+            .chain(txn_output_2.write_set().iter())
+            .map(|(k, _)| k)
+            .collect::<BTreeSet<_>>();
+        let mut differences = vec![];
+        for key in keys {
+            let write1 = txn_output_1.write_set().get(key);
+            let write2 = txn_output_2.write_set().get(key);
+
+            if write1 != write2 {
+                differences.push(format!(
+                    "Write for {:?} differs: {:?} vs {:?}",
+                    key, write1, write2
+                ));
+            }
+        }
+        if !differences.is_empty() {
+            println!("Differences:\n{}", differences.join("\n"));
+        }
+        assert!(
+            differences.is_empty(),
+            "First write op mismatch for transaction output at index {}, between {} and {}",
+            idx,
+            name1,
+            name2,
+        );
+
+        // Still perform comparison on all fields in transaction
+        // outputs to catch other inconsistencies.
+        assert_eq!(
+            txn_output_1, txn_output_2,
+            "first transaction output mismatch at index {}, for {} and {}",
+            idx, name1, name2,
+        );
     }
 }

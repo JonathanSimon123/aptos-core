@@ -1,34 +1,41 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
 //! Aptos is a one stop tool for operations, debugging, and other operations with the blockchain
 
 #![forbid(unsafe_code)]
 
-use aptos::Tool;
-use aptos_logger::Level;
+#[cfg(unix)]
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
+use aptos::{move_tool, Tool};
 use clap::Parser;
-use std::process::exit;
+use std::{process::exit, time::Duration};
 
-#[tokio::main]
-async fn main() {
-    let mut logger = aptos_logger::Logger::new();
-    logger
-        .channel_size(1000)
-        .is_async(false)
-        .level(Level::Warn)
-        .read_env();
-    logger.build();
+fn main() {
+    // Register hooks.
+    move_tool::register_package_hooks();
 
-    // Run the corresponding tools
-    let result = Tool::parse().execute().await;
+    // Create a runtime.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
-    // At this point, we'll want to print and determine whether to exit for an error code
+    // Run the corresponding tool.
+    let result = runtime.block_on(Tool::parse().execute());
+
+    // Shutdown the runtime with a timeout. We do this to make sure that we don't sit
+    // here waiting forever waiting for tasks that sometimes don't want to exit on
+    // their own (e.g. telemetry, containers spawned by the localnet, etc).
+    runtime.shutdown_timeout(Duration::from_millis(50));
+
     match result {
         Ok(inner) => println!("{}", inner),
         Err(inner) => {
             println!("{}", inner);
             exit(1);
-        }
+        },
     }
 }

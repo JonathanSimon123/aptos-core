@@ -35,6 +35,9 @@ Create chart name and version as used by the chart label.
 Common labels
 */}}
 {{- define "aptos-validator.labels" -}}
+{{- range $k, $v := .Values.labels }}
+{{ $k }}: {{ $v }}
+{{- end }}
 helm.sh/chart: {{ include "aptos-validator.chart" . }}
 {{ include "aptos-validator.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
@@ -44,11 +47,32 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
 {{/*
+Multicluster labels. `multiclusterLabels` takes in a tuple of context and index as arguments.
+It should be invoked as `aptos-validator.multiclusterLabels (tuple $ $i)` where $i is the index
+of the statefulset.
+
+The logic below assigns a target cluster to each statefulset replica in a round-robin fashion.
+*/}}
+{{- define "aptos-validator.multiclusterLabels" -}}
+{{- $ctx := index $ 0 -}}
+{{- if $ctx.Values.multicluster.enabled }}
+{{- $index := index $ 1 -}}
+{{- $numClusters := len $ctx.Values.multicluster.targetClusters }}
+{{- $clusterIndex := mod $index $numClusters }}
+{{- $cluster := index $ctx.Values.multicluster.targetClusters $clusterIndex }}
+multicluster/targetcluster: {{ $cluster }}
+{{- end }}
+{{- end -}}
+
+{{/*
 Selector labels
 */}}
 {{- define "aptos-validator.selectorLabels" -}}
+{{- range $k, $v := .Values.labels }}
+{{ $k }}: {{ $v }}
+{{- end }}
 app.kubernetes.io/part-of: {{ include "aptos-validator.name" . }}
-app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/managed-by: helm
 {{- end -}}
 
 {{/*

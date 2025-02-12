@@ -9,8 +9,8 @@
 # * If you use this compose for different Aptos Networks, you will need remove the db volume first.
 # * If you would like to use the current Aptos version within this repository, execute the
 #     `build.sh` in `docker/validator` and change the image tag below to aptos_e2e:latest
-# * Validator images can be found at https://hub.docker.com/repository/docker/aptoslab/validator/tags
-# * Faucet images can be found at https://hub.docker.com/repository/docker/aptoslab/faucet/tags
+# * Validator images can be found at https://hub.docker.com/repository/docker/aptoslabs/validator/tags
+# * Faucet images can be found at https://hub.docker.com/repository/docker/aptoslabs/faucet/tags
 
 # Monitoring:
 # If you want to install the monitoring components for your validator-testnet
@@ -26,7 +26,7 @@ services:
   validator:
     # Note this image currently does not support this, will update to the appropriate minimum
     # version shortly
-    image: "${VALIDATOR_IMAGE_REPO:-aptoslab/validator}:${IMAGE_TAG:-devnet}"
+    image: "${VALIDATOR_IMAGE_REPO:-aptoslabs/validator}:${IMAGE_TAG:-devnet}"
     networks:
       shared:
         ipv4_address:  172.16.1.10
@@ -36,15 +36,16 @@ services:
         target: /opt/aptos/var
       - type: bind
         source: ./validator_node_template.yaml
-        target: /opt/aptos/var/validator_node_template.yaml
-    command: ["/opt/aptos/bin/aptos-node", "--test", "--config", "/opt/aptos/var/"]
+        target: /opt/aptos/config.yaml
+    command: ["/usr/local/bin/aptos-node", "--test", "--test-dir", "/opt/aptos/var/", "--test-config-override", "/opt/aptos/config.yaml"]
     ports:
-      - "8080:8080"
+      - "8080:8080" # REST API
+      - "50051:50051" # Indexer GRPC, if enabled
     expose:
       - 9101
 
   faucet:
-    image: "${FAUCET_IMAGE_REPO:-aptoslab/faucet}:${IMAGE_TAG:-devnet}"
+    image: "${FAUCET_IMAGE_REPO:-aptoslabs/faucet}:${IMAGE_TAG:-devnet}"
     depends_on:
       - validator
     networks:
@@ -62,19 +63,18 @@ services:
             sleep 1
           else
             sleep 1
-            /opt/aptos/bin/aptos-faucet \\
-              --address 0.0.0.0 \\
-              --port 8000 \\
+            /usr/local/bin/aptos-faucet-service \\
+              run-simple \\
+              --key-file-path /opt/aptos/var/mint.key \\
               --chain-id TESTING \\
-              --mint-key-file-path /opt/aptos/var/mint.key \\
-              --server-url http://172.16.1.10:8080
+              --node-url http://172.16.1.10:8080
             echo 'Faucet failed to run likely due to the Validator still starting. Will try again.'
           fi
         done
         exit 1
       "
     ports:
-      - "8000:8000"
+      - "8081:8081"
 
 networks:
   shared:

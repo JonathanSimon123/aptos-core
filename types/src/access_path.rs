@@ -1,8 +1,9 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Suppose we have the following data structure in a smart contract:
-//!
+//! ```move
 //! struct B {
 //!   Map<String, String> mymap;
 //! }
@@ -18,46 +19,89 @@
 //!
 //! A a;
 //! C c;
+//! ```
 //!
 //! and the data belongs to Alice. Then an access to `a.b.mymap` would be translated to an access
 //! to an entry in key-value store whose key is `<Alice>/a/b/mymap`. In the same way, the access to
 //! `c.mylist` would need to query `<Alice>/c/mylist`.
 //!
 //! So an account stores its data in a directory structure, for example:
+//! ```text
 //!   <Alice>/balance:   10
 //!   <Alice>/a/b/mymap: {"Bob" => "abcd", "Carol" => "efgh"}
 //!   <Alice>/a/myint:   20
 //!   <Alice>/c/mylist:  [3, 5, 7, 9]
-//!
+//! ```
 //! If someone needs to query the map above and find out what value associated with "Bob" is,
-//! `address` will be set to Alice and `path` will be set to "/a/b/mymap/Bob".
+//! `address` will be set to Alice and `path` will be set to `/a/b/mymap/Bob`.
 //!
-//! On the other hand, if you want to query only <Alice>/a/*, `address` will be set to Alice and
-//! `path` will be set to "/a" and use the `get_prefix()` method from statedb
+//! On the other hand, if you want to query only `<Alice>/a/*`, `address` will be set to Alice and
+//! `path` will be set to `/a` and use the `get_prefix()` method from statedb
 
-use crate::{account_address::AccountAddress, state_store::state_key::StateKey};
+use crate::{
+    account_address::AccountAddress,
+    state_store::state_key::{inner::StateKeyInner, StateKey},
+};
 use anyhow::{Error, Result};
 use aptos_crypto::hash::HashValue;
-use move_deps::move_core_types::language_storage::{
-    ModuleId, ResourceKey, StructTag, CODE_TAG, RESOURCE_TAG,
-};
+use move_core_types::language_storage::{ModuleId, StructTag};
+#[cfg(any(test, feature = "fuzzing"))]
+use proptest::prelude::*;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-use std::{convert::TryFrom, fmt};
+use std::{convert::TryFrom, fmt, fmt::Formatter};
 
 #[derive(Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct AccessPath {
     pub address: AccountAddress,
     #[serde(with = "serde_bytes")]
     pub path: Vec<u8>,
 }
 
-#[derive(Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
+#[cfg(any(test, feature = "fuzzing"))]
+impl Arbitrary for AccessPath {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        (any::<AccountAddress>(), any::<Path>())
+            .prop_map(|(address, path)| AccessPath {
+                address,
+                path: bcs::to_bytes(&path).unwrap(),
+            })
+            .boxed()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub enum Path {
     Code(ModuleId),
     Resource(StructTag),
+    ResourceGroup(StructTag),
+}
+
+impl fmt::Display for Path {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Path::Code(module_id) => {
+                write!(f, "Code({})", module_id)
+            },
+            Path::Resource(struct_tag) => {
+                write!(f, "Resource({})", struct_tag)
+            },
+            Path::ResourceGroup(struct_tag) => {
+                write!(f, "ResourceGroup({})", struct_tag)
+            },
+        }
+    }
+}
+
+pub enum PathType {
+    Code,
+    Resource,
+    ResourceGroup,
 }
 
 impl AccessPath {
@@ -65,27 +109,40 @@ impl AccessPath {
         AccessPath { address, path }
     }
 
-    pub fn resource_access_vec(tag: StructTag) -> Vec<u8> {
-        bcs::to_bytes(&Path::Resource(tag)).expect("Unexpected serialization error")
+    pub fn resource_path_vec(tag: StructTag) -> Result<Vec<u8>> {
+        let r = bcs::to_bytes(&Path::Resource(tag))?;
+        Ok(r)
     }
 
     /// Convert Accesses into a byte offset which would be used by the storage layer to resolve
     /// where fields are stored.
-    pub fn resource_access_path(key: ResourceKey) -> AccessPath {
-        let path = AccessPath::resource_access_vec(key.type_);
+    pub fn resource_access_path(address: AccountAddress, type_: StructTag) -> Result<AccessPath> {
+        Ok(AccessPath {
+            address,
+            path: AccessPath::resource_path_vec(type_)?,
+        })
+    }
+
+    pub fn resource_group_path_vec(tag: StructTag) -> Vec<u8> {
+        bcs::to_bytes(&Path::ResourceGroup(tag)).expect("Unexpected serialization error")
+    }
+
+    /// Convert Accesses into a byte offset which would be used by the storage layer to resolve
+    /// where fields are stored.
+    pub fn resource_group_access_path(address: AccountAddress, type_: StructTag) -> AccessPath {
         AccessPath {
-            address: key.address,
-            path,
+            address,
+            path: AccessPath::resource_group_path_vec(type_),
         }
     }
 
-    fn code_access_path_vec(key: ModuleId) -> Vec<u8> {
+    pub fn code_path_vec(key: ModuleId) -> Vec<u8> {
         bcs::to_bytes(&Path::Code(key)).expect("Unexpected serialization error")
     }
 
-    pub fn code_access_path(key: ModuleId) -> AccessPath {
+    pub fn code_access_path(key: ModuleId) -> Self {
         let address = *key.address();
-        let path = AccessPath::code_access_path_vec(key);
+        let path = AccessPath::code_path_vec(key);
         AccessPath { address, path }
     }
 
@@ -99,18 +156,40 @@ impl AccessPath {
     pub fn get_struct_tag(&self) -> Option<StructTag> {
         match self.get_path() {
             Path::Resource(s) => Some(s),
+            Path::ResourceGroup(s) => Some(s),
             Path::Code(_) => None,
         }
+    }
+
+    /// Extracts a [ModuleId]. Returns [None] if this is not a module access.
+    pub fn try_get_module_id(&self) -> Option<ModuleId> {
+        match self.get_path() {
+            Path::Code(module_id) => Some(module_id),
+            Path::Resource(_) | Path::ResourceGroup(_) => None,
+        }
+    }
+
+    pub fn is_code(&self) -> bool {
+        matches!(self.get_path(), Path::Code(_))
+    }
+
+    pub fn is_resource_group(&self) -> bool {
+        matches!(self.get_path(), Path::ResourceGroup(_))
+    }
+
+    pub fn size(&self) -> usize {
+        self.address.as_ref().len() + self.path.len()
     }
 }
 
 impl fmt::Debug for AccessPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "AccessPath {{ address: {:x}, path: {} }}",
-            self.address,
-            hex::encode(&self.path)
+            "AccessPath {{ address: 0x{}, path: {:?} }}",
+            self.address.short_str_lossless(),
+            bcs::from_bytes::<Path>(&self.path)
+                .map_or_else(|_| hex::encode(&self.path), |path| format!("{}", path)),
         )
     }
 }
@@ -122,8 +201,9 @@ impl fmt::Display for AccessPath {
         } else {
             write!(f, "AccessPath {{ address: {:x}, ", self.address)?;
             match self.path[0] {
-                RESOURCE_TAG => write!(f, "type: Resource, ")?,
-                CODE_TAG => write!(f, "type: Module, ")?,
+                p if p == PathType::Resource as u8 => write!(f, "type: Resource, ")?,
+                p if p == PathType::Code as u8 => write!(f, "type: Module, ")?,
+                p if p == PathType::ResourceGroup as u8 => write!(f, "type: ResourceGroup, ")?,
                 tag => write!(f, "type: {:?}, ", tag)?,
             };
             write!(
@@ -151,9 +231,10 @@ impl From<&ModuleId> for AccessPath {
 
 impl TryFrom<StateKey> for AccessPath {
     type Error = Error;
+
     fn try_from(state_key: StateKey) -> Result<Self> {
-        match state_key {
-            StateKey::AccessPath(access_path) => Ok(access_path),
+        match state_key.inner() {
+            StateKeyInner::AccessPath(access_path) => Ok(access_path.clone()),
             _ => anyhow::bail!("Unsupported state key type"),
         }
     }

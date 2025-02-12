@@ -1,736 +1,802 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use aptos_api::runtime::bootstrap as bootstrap_api;
-use aptos_config::{
-    config::{
-        AptosDataClientConfig, DataStreamingServiceConfig, NetworkConfig, NodeConfig,
-        PersistableConfig, StorageServiceConfig,
-    },
-    network_id::NetworkId,
-    utils::get_genesis_txn,
-};
-use aptos_data_client::aptosnet::AptosNetDataClient;
-use aptos_infallible::RwLock;
-use aptos_logger::{prelude::*, Logger};
-use aptos_metrics::{get_public_json_metrics, metric_server};
-use aptos_state_view::account_with_state_view::AsAccountWithStateView;
-use aptos_telemetry::{
-    constants::{
-        APTOS_NODE_PUSH_METRICS, CHAIN_ID_METRIC, NODE_PUSH_TIME_SECS, PEER_ID_METRIC,
-        SYNCED_VERSION_METRIC,
-    },
-    send_env_data,
-};
-use aptos_time_service::TimeService;
-use aptos_types::{
-    account_config::aptos_root_address, account_view::AccountView, chain_id::ChainId,
-    move_resource::MoveStorage, on_chain_config::ON_CHAIN_CONFIG_REGISTRY, waypoint::Waypoint,
-};
-use aptos_vm::AptosVM;
-use aptosdb::AptosDB;
-use backup_service::start_backup_service;
-use consensus::consensus_provider::start_consensus;
-use consensus_notifications::ConsensusNotificationListener;
-use data_streaming_service::{
-    streaming_client::{new_streaming_service_client_listener_pair, StreamingServiceClient},
-    streaming_service::DataStreamingService,
-};
-use debug_interface::node_debug_service::NodeDebugService;
-use event_notifications::EventSubscriptionService;
-use executor::{chunk_executor::ChunkExecutor, db_bootstrapper::maybe_bootstrap};
-use futures::channel::mpsc::channel;
-use mempool_notifications::MempoolNotificationSender;
-use network::application::storage::PeerMetadataStorage;
-use network_builder::builder::NetworkBuilder;
-use state_sync_multiplexer::{
-    state_sync_v1_network_config, StateSyncMultiplexer, StateSyncRuntimes,
-};
-use state_sync_v1::network::{StateSyncEvents, StateSyncSender};
+#![forbid(unsafe_code)]
+
+mod consensus;
+mod indexer;
+mod logger;
+mod network;
+mod services;
+mod state_sync;
+mod storage;
+pub mod utils;
+
+#[cfg(test)]
+mod tests;
+
+use crate::utils::ensure_max_open_files_limit;
+use anyhow::anyhow;
+use aptos_admin_service::AdminService;
+use aptos_api::bootstrap as bootstrap_api;
+use aptos_build_info::build_information;
+use aptos_config::config::{merge_node_config, NodeConfig, PersistableConfig};
+use aptos_framework::ReleaseBundle;
+use aptos_logger::{prelude::*, telemetry_log_writer::TelemetryLog, Level, LoggerFilterUpdater};
+use aptos_state_sync_driver::driver_factory::StateSyncRuntimes;
+use aptos_types::{chain_id::ChainId, on_chain_config::OnChainJWKConsensusConfig};
+use clap::Parser;
+use futures::channel::{mpsc, oneshot};
+use hex::{FromHex, FromHexError};
+use rand::{rngs::StdRng, SeedableRng};
 use std::{
-    boxed::Box,
-    collections::{HashMap, HashSet},
+    env, fs,
     io::Write,
-    net::ToSocketAddrs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
     thread,
-    time::Instant,
 };
-use storage_interface::{state_view::LatestDbStateCheckpointView, DbReaderWriter};
-use storage_service::start_storage_service_with_db;
-use storage_service_client::{StorageServiceClient, StorageServiceMultiSender};
-use storage_service_server::{
-    network::StorageServiceNetworkEvents, StorageReader, StorageServiceServer,
-};
-use tokio::runtime::{Builder, Runtime};
-use tokio_stream::wrappers::IntervalStream;
+use tokio::runtime::Runtime;
 
-const AC_SMP_CHANNEL_BUFFER_SIZE: usize = 1_024;
-const INTRA_NODE_CHANNEL_BUFFER_SIZE: usize = 1;
-const MEMPOOL_NETWORK_CHANNEL_BUFFER_SIZE: usize = 1_024;
+const EPOCH_LENGTH_SECS: u64 = 60;
 
-pub struct AptosHandle {
-    _api: Runtime,
-    _backup: Runtime,
-    _consensus_runtime: Option<Runtime>,
-    _debug: NodeDebugService,
-    _mempool: Runtime,
-    _network_runtimes: Vec<Runtime>,
-    _state_sync_runtimes: StateSyncRuntimes,
-    _telemetry_runtime: Runtime,
+/// Runs an Aptos validator or fullnode
+#[derive(Clone, Debug, Parser)]
+#[clap(name = "Aptos Node", author, version)]
+pub struct AptosNodeArgs {
+    /// Path to node configuration file (or template for local test mode).
+    #[clap(
+        short = 'f',
+        long,
+        value_parser,
+        required_unless_present_any = ["test", "info"],
+    )]
+    #[cfg_attr(target_os = "linux", clap(required_unless_present_any = ["stacktrace"]))]
+    config: Option<PathBuf>,
+
+    /// Directory to run the test mode in.
+    ///
+    /// Repeated runs will start up from previous state.
+    #[clap(long, value_parser, requires("test"))]
+    test_dir: Option<PathBuf>,
+
+    /// Path to node configuration file override for local test mode. Cannot be used with --config
+    #[clap(long, value_parser, requires("test"), conflicts_with("config"))]
+    test_config_override: Option<PathBuf>,
+
+    /// Run only a single validator node testnet.
+    #[clap(long)]
+    test: bool,
+
+    /// Optimize the single validator node testnet for higher performance
+    #[clap(long, requires("test"))]
+    performance: bool,
+
+    /// Random number generator seed for starting a single validator testnet.
+    #[clap(long, value_parser = load_seed, requires("test"))]
+    seed: Option<[u8; 32]>,
+
+    /// Use random ports instead of ports from the node configuration.
+    #[clap(long, requires("test"))]
+    random_ports: bool,
+
+    /// Paths to the Aptos framework release package to be used for genesis.
+    #[clap(long, requires("test"))]
+    genesis_framework: Option<PathBuf>,
+
+    /// Enable lazy mode.
+    ///
+    /// Setting this flag will set `consensus#mempool_poll_count` config to `u64::MAX` and
+    /// only commit a block when there are user transactions in mempool.
+    #[clap(long, requires("test"))]
+    lazy: bool,
+
+    /// Display information about the build of this node
+    #[clap(long)]
+    info: bool,
+
+    #[cfg(target_os = "linux")]
+    /// Start as a child process to collect thread dump.
+    /// See rstack-self crate for more details.
+    #[clap(long)]
+    stacktrace: bool,
 }
 
-pub fn start(config: &NodeConfig, log_file: Option<PathBuf>) {
-    crash_handler::setup_panic_handler();
+impl AptosNodeArgs {
+    /// Runs an Aptos node based on the given command line arguments and config flags
+    pub fn run(self) {
+        #[cfg(target_os = "linux")]
+        // https://sfackler.github.io/rstack/doc/rstack_self/index.html
+        //
+        // TODO(grao): I don't like this way, but I didn't find other existing solution in Rust.
+        // Maybe try to use libc directly?
+        if self.stacktrace {
+            let _ = rstack_self::child();
+            return;
+        }
 
-    let mut logger = aptos_logger::Logger::new();
-    logger
-        .channel_size(config.logger.chan_size)
-        .is_async(config.logger.is_async)
-        .level(config.logger.level)
-        .read_env();
-    if config.logger.enable_backtrace {
-        logger.enable_backtrace();
+        if self.info {
+            let build_information = build_information!();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&build_information)
+                    .expect("Failed to print build information")
+            );
+            return;
+        }
+
+        if self.test {
+            println!("WARNING: Entering test mode! This should never be used in production!");
+            if self.performance {
+                println!("WARNING: Entering performance mode! System utilization may be high!");
+            }
+
+            // Set the genesis framework
+            let genesis_framework = if let Some(path) = self.genesis_framework {
+                ReleaseBundle::read(path).unwrap()
+            } else {
+                aptos_cached_packages::head_release_bundle().clone()
+            };
+
+            // Create a seeded RNG, setup the test environment and start the node
+            let rng = self
+                .seed
+                .map(StdRng::from_seed)
+                .unwrap_or_else(StdRng::from_entropy);
+            setup_test_environment_and_start_node(
+                &self.config,
+                &self.test_config_override,
+                None,
+                self.test_dir,
+                self.random_ports,
+                self.lazy,
+                self.performance,
+                &genesis_framework,
+                rng,
+            )
+            .expect("Test node should start correctly!");
+        } else {
+            // Get the config file path
+            let config_path = self.config.expect("Config is required to launch node");
+            if !config_path.exists() {
+                panic!(
+                    "The node config file could not be found! Ensure the given path is correct: {:?}",
+                    config_path.display()
+                )
+            }
+
+            // A config file exists, attempt to parse the config
+            let config = NodeConfig::load_from_path(config_path.clone()).unwrap_or_else(|error| {
+                panic!(
+                    "Failed to load the node config file! Given file path: {:?}. Error: {:?}",
+                    config_path.display(),
+                    error
+                )
+            });
+
+            ensure_max_open_files_limit(config.storage.ensure_rlimit_nofile);
+
+            // Start the node
+            start(config, None, true).expect("Node should start correctly");
+        };
     }
-    if let Some(log_file) = log_file {
-        logger.printer(Box::new(FileWriter::new(log_file)));
-    }
-    let logger = Some(logger.build());
+}
 
-    // Let's now log some important information, since the logger is set up
-    info!(config = config, "Loaded AptosNode config");
+pub fn load_seed(input: &str) -> Result<[u8; 32], FromHexError> {
+    let trimmed_input = input.trim();
+    FromHex::from_hex(trimmed_input)
+}
 
+/// Runtime handle to ensure that all inner runtimes stay in scope
+pub struct AptosHandle {
+    _admin_service: AdminService,
+    _api_runtime: Option<Runtime>,
+    _backup_runtime: Option<Runtime>,
+    _consensus_observer_runtime: Option<Runtime>,
+    _consensus_publisher_runtime: Option<Runtime>,
+    _consensus_runtime: Option<Runtime>,
+    _dkg_runtime: Option<Runtime>,
+    _indexer_grpc_runtime: Option<Runtime>,
+    _indexer_runtime: Option<Runtime>,
+    _indexer_table_info_runtime: Option<Runtime>,
+    _jwk_consensus_runtime: Option<Runtime>,
+    _mempool_runtime: Runtime,
+    _network_runtimes: Vec<Runtime>,
+    _peer_monitoring_service_runtime: Runtime,
+    _state_sync_runtimes: StateSyncRuntimes,
+    _telemetry_runtime: Option<Runtime>,
+    _indexer_db_runtime: Option<Runtime>,
+}
+
+pub fn start(
+    config: NodeConfig,
+    log_file: Option<PathBuf>,
+    create_global_rayon_pool: bool,
+) -> anyhow::Result<()> {
+    start_and_report_ports(config, log_file, create_global_rayon_pool, None, None)
+}
+
+/// Start an Aptos node
+pub fn start_and_report_ports(
+    config: NodeConfig,
+    log_file: Option<PathBuf>,
+    create_global_rayon_pool: bool,
+    api_port_tx: Option<oneshot::Sender<u16>>,
+    indexer_grpc_port_tx: Option<oneshot::Sender<u16>>,
+) -> anyhow::Result<()> {
+    // Setup panic handler
+    aptos_crash_handler::setup_panic_handler();
+
+    // Create global rayon thread pool
+    utils::create_global_rayon_pool(create_global_rayon_pool);
+
+    // Initialize the global aptos-node-identity
+    aptos_node_identity::init(config.get_peer_id())?;
+
+    // Instantiate the global logger
+    let (remote_log_receiver, logger_filter_update) = logger::create_logger(&config, log_file);
+
+    assert!(
+        !cfg!(feature = "testing") && !cfg!(feature = "fuzzing"),
+        "Testing features shouldn't be compiled"
+    );
+
+    // Ensure failpoints are configured correctly
     if fail::has_failpoints() {
-        warn!("Failpoints is enabled");
+        warn!("Failpoints are enabled!");
+
+        // Set all of the failpoints
         if let Some(failpoints) = &config.failpoints {
             for (point, actions) in failpoints {
-                fail::cfg(point, actions).expect("fail to set actions for failpoint");
+                fail::cfg(point, actions).unwrap_or_else(|_| {
+                    panic!(
+                        "Failed to set actions for failpoint! Failpoint: {:?}, Actions: {:?}",
+                        point, actions
+                    )
+                });
             }
         }
     } else if config.failpoints.is_some() {
-        warn!("failpoints is set in config, but the binary doesn't compile with this feature");
+        warn!("Failpoints is set in the node config, but the binary didn't compile with this feature!");
     }
 
-    let _node_handle = setup_environment(config, logger);
+    // Set up the node environment and start it
+    let _node_handle = setup_environment_and_start_node(
+        config,
+        remote_log_receiver,
+        Some(logger_filter_update),
+        api_port_tx,
+        indexer_grpc_port_tx,
+    )?;
     let term = Arc::new(AtomicBool::new(false));
-
     while !term.load(Ordering::Acquire) {
-        std::thread::park();
+        thread::park();
     }
+
+    Ok(())
 }
 
-pub fn load_test_environment<R>(
-    config_path: Option<PathBuf>,
+/// Load a config based on a variety of different ways to provide config options. For
+/// more information about each argument and its precedence, see
+/// `setup_test_environment_and_start_node`.
+pub fn load_node_config<R>(
+    config_path: &Option<PathBuf>,
+    test_config_override_path: &Option<PathBuf>,
+    test_dir: &Path,
     random_ports: bool,
-    lazy: bool,
-    genesis_modules: Vec<Vec<u8>>,
+    enable_lazy_mode: bool,
+    enable_performance_mode: bool,
+    framework: &ReleaseBundle,
     rng: R,
-) where
-    R: ::rand::RngCore + ::rand::CryptoRng,
+) -> anyhow::Result<NodeConfig>
+where
+    R: rand::RngCore + rand::CryptoRng,
 {
-    let config_temp_path = aptos_temppath::TempPath::new();
+    // The validator builder puts the first node in the 0 directory
+    let validator_config_path = test_dir.join("0").join("node.yaml");
 
-    let (try_load, config_path) = if let Some(config_path) = config_path {
-        (
-            config_path.join("0").join("node.yaml").exists(),
+    let config = if validator_config_path.exists() {
+        NodeConfig::load_from_path(&validator_config_path)
+            .map_err(|error| anyhow!("Unable to load config: {:?}", error))?
+    } else {
+        // Create a test only config for a single validator node.
+        let config = create_single_node_test_config(
             config_path,
-        )
-    } else {
-        (false, config_temp_path.as_ref().to_path_buf())
-    };
-
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .create(&config_path)
-        .unwrap();
-
-    let config_path = config_path.canonicalize().unwrap();
-
-    let validator_config_path = config_path.join("0").join("node.yaml");
-    let aptos_root_key_path = config_path.join("mint.key");
-
-    let config = if try_load {
-        NodeConfig::load(&validator_config_path).expect("Unable to load config:")
-    } else {
-        // Build a single validator network
-        let mut maybe_config = PathBuf::from(&config_path);
-        maybe_config.push("validator_node_template.yaml");
-        let mut template = NodeConfig::load_config(maybe_config)
-            .unwrap_or_else(|_| NodeConfig::default_for_validator());
-
-        // enable REST and JSON-RPC API
-        template.api.address = format!("0.0.0.0:{}", template.api.address.port())
-            .parse()
-            .unwrap();
-        if lazy {
-            template.consensus.mempool_poll_count = u64::MAX;
+            test_config_override_path,
+            test_dir,
+            random_ports,
+            enable_lazy_mode,
+            enable_performance_mode,
+            framework,
+            rng,
+        )?;
+        if let Some(ref test_config_override_path) = test_config_override_path {
+            println!(
+                "\tMerged default config with override from path: {:?}",
+                test_config_override_path
+            );
         }
-
-        let builder = aptos_genesis_tool::validator_builder::ValidatorBuilder::new(
-            &config_path,
-            genesis_modules,
-        )
-        .template(template)
-        .randomize_first_validator_ports(random_ports);
-
-        let (root_keys, _genesis, genesis_waypoint, validators) = builder.build(rng).unwrap();
-
-        let serialized_keys = bcs::to_bytes(&root_keys.root_key).unwrap();
-        let mut key_file = std::fs::File::create(&aptos_root_key_path).unwrap();
-        key_file.write_all(&serialized_keys).unwrap();
-
-        // Build a waypoint file so that clients / docker can grab it easily
-        let waypoint_file_path = config_path.join("waypoint.txt");
-        std::io::Write::write_all(
-            &mut std::fs::File::create(&waypoint_file_path).unwrap(),
-            genesis_waypoint.to_string().as_bytes(),
-        )
-        .unwrap();
-
-        validators[0].config.clone()
+        if let Some(ref config_path) = config_path {
+            println!("\tUsed user-provided config from path: {:?}", config_path);
+        }
+        config
     };
+
+    Ok(config)
+}
+
+/// Print details about a node config configured for a test environment and start it.
+pub fn start_test_environment_node(
+    config: NodeConfig,
+    test_dir: PathBuf,
+    enable_lazy_mode: bool,
+) -> anyhow::Result<()> {
+    let aptos_root_key_path = test_dir.join("mint.key");
 
     // Prepare log file since we cannot automatically route logs to stderr
-    let log_file = config_path.join("validator.log");
+    let log_file = test_dir.join("validator.log");
 
+    // Print out useful information about the environment and the node
     println!("Completed generating configuration:");
     println!("\tLog file: {:?}", log_file);
-    println!("\tConfig path: {:?}", config_path);
+    println!("\tTest dir: {:?}", test_dir);
     println!("\tAptos root key path: {:?}", aptos_root_key_path);
     println!("\tWaypoint: {}", config.base.waypoint.genesis_waypoint());
-    println!("\tChainId: {}", ChainId::test());
-    println!("\tREST API endpoint: {}", &config.api.address);
+    println!("\tChainId: {}", ChainId::test().id());
+    println!("\tREST API endpoint: http://{}", &config.api.address);
     println!(
-        "\tFullNode network: {}",
+        "\tMetrics endpoint: http://{}:{}/metrics",
+        &config.inspection_service.address, &config.inspection_service.port
+    );
+    println!(
+        "\tAptosnet fullnode network endpoint: {}",
         &config.full_node_networks[0].listen_address
     );
-    if lazy {
+    if config.indexer_grpc.enabled {
+        println!(
+            "\tIndexer gRPC node stream endpoint: {}",
+            config.indexer_grpc.address
+        );
+    }
+    if enable_lazy_mode {
         println!("\tLazy mode is enabled");
     }
-
     println!("\nAptos is running, press ctrl-c to exit\n");
 
-    start(&config, Some(log_file))
+    start(config, Some(log_file), false)
 }
 
-// Fetch chain ID from on-chain resource
-fn fetch_chain_id(db: &DbReaderWriter) -> ChainId {
-    let db_state_view = db
-        .reader
-        .latest_state_checkpoint_view()
-        .expect("[aptos-node] failed to create db state view");
-    db_state_view
-        .as_account_with_state_view(&aptos_root_address())
-        .get_chain_id_resource()
-        .expect("[aptos-node] failed to get chain ID resource")
-        .expect("[aptos-node] missing chain ID resource")
-        .chain_id()
-}
+/// Creates a simple test environment and starts the node.
+///
+/// You will notice many args referring to configs. Let's explain them:
+/// - `test_config_override_path` is the path to a config file that will be used as
+///   a template when building the final config. If not provided, a default template
+///   will be used. Many overrides are applied on top of this base config.
+/// - `config_path` is similar to `test_config_override_path`, but many of the
+///   overrides that are applied when using `test_config_override_path` are not
+///   applied when using `config_path`. Read the code for more info.
+/// - `config` is a complete NodeConfig. No overrides are applied on top of this if
+///    it is provided. If both `config` and `test_dir` are provided, `config` takes
+///    precedence.
+/// - `test_dir` is a directory that contains a config file. Much like `config`, the
+///   config read from this file is used without any overrides.
+pub fn setup_test_environment_and_start_node<R>(
+    config_path: &Option<PathBuf>,
+    test_config_override_path: &Option<PathBuf>,
+    config: Option<NodeConfig>,
+    test_dir: Option<PathBuf>,
+    random_ports: bool,
+    enable_lazy_mode: bool,
+    enable_performance_mode: bool,
+    framework: &ReleaseBundle,
+    rng: R,
+) -> anyhow::Result<()>
+where
+    R: rand::RngCore + rand::CryptoRng,
+{
+    // If there wasn't a test directory specified, create a temporary one
+    let test_dir =
+        test_dir.unwrap_or_else(|| aptos_temppath::TempPath::new().as_ref().to_path_buf());
 
-fn setup_debug_interface(config: &NodeConfig, logger: Option<Arc<Logger>>) -> NodeDebugService {
-    let addr = format!(
-        "{}:{}",
-        config.debug_interface.address, config.debug_interface.admission_control_node_debug_port,
-    )
-    .to_socket_addrs()
-    .unwrap()
-    .next()
-    .unwrap();
+    // Create the directories for the node
+    fs::DirBuilder::new().recursive(true).create(&test_dir)?;
+    let test_dir = test_dir.canonicalize()?;
 
-    NodeDebugService::new(addr, logger, config)
-}
-
-fn create_state_sync_runtimes<M: MempoolNotificationSender + 'static>(
-    node_config: &NodeConfig,
-    storage_service_server_network_handles: Vec<StorageServiceNetworkEvents>,
-    storage_service_client_network_handles: HashMap<
-        NetworkId,
-        storage_service_client::StorageServiceNetworkSender,
-    >,
-    state_sync_network_handles: Vec<(NetworkId, StateSyncSender, StateSyncEvents)>,
-    peer_metadata_storage: Arc<PeerMetadataStorage>,
-    mempool_notifier: M,
-    consensus_listener: ConsensusNotificationListener,
-    waypoint: Waypoint,
-    event_subscription_service: EventSubscriptionService,
-    db_rw: DbReaderWriter,
-) -> StateSyncRuntimes {
-    // Start the state sync storage service
-    let storage_service_runtime = setup_state_sync_storage_service(
-        node_config.state_sync.storage_service,
-        storage_service_server_network_handles,
-        &db_rw,
-    );
-
-    // Start the data client
-    let (aptos_data_client, aptos_data_client_runtime) = setup_aptos_data_client(
-        node_config.state_sync.storage_service,
-        node_config.state_sync.aptos_data_client,
-        storage_service_client_network_handles,
-        peer_metadata_storage,
-    );
-
-    // Start the data streaming service
-    let (streaming_service_client, streaming_service_runtime) = setup_data_streaming_service(
-        node_config.state_sync.data_streaming_service,
-        aptos_data_client.clone(),
-    );
-
-    // Create the chunk executor
-    let chunk_executor = Arc::new(
-        ChunkExecutor::<AptosVM>::new(db_rw.clone()).expect("Unable to create the chunk executor!"),
-    );
-
-    // Create the state sync multiplexer
-    let state_sync_multiplexer = StateSyncMultiplexer::new(
-        state_sync_network_handles,
-        mempool_notifier,
-        consensus_listener,
-        db_rw,
-        chunk_executor,
-        node_config,
-        waypoint,
-        event_subscription_service,
-        aptos_data_client,
-        streaming_service_client,
-    );
-
-    // Create and return the new state sync handle
-    StateSyncRuntimes::new(
-        aptos_data_client_runtime,
-        state_sync_multiplexer,
-        storage_service_runtime,
-        streaming_service_runtime,
-    )
-}
-
-fn setup_data_streaming_service(
-    config: DataStreamingServiceConfig,
-    aptos_data_client: AptosNetDataClient,
-) -> (StreamingServiceClient, Runtime) {
-    // Create the data streaming service
-    let (streaming_service_client, streaming_service_listener) =
-        new_streaming_service_client_listener_pair();
-    let data_streaming_service =
-        DataStreamingService::new(config, aptos_data_client, streaming_service_listener);
-
-    // Start the data streaming service
-    let streaming_service_runtime = Builder::new_multi_thread()
-        .thread_name("data-streaming-service")
-        .enable_all()
-        .build()
-        .expect("Failed to create data streaming service!");
-    streaming_service_runtime.spawn(data_streaming_service.start_service());
-
-    (streaming_service_client, streaming_service_runtime)
-}
-
-fn setup_aptos_data_client(
-    storage_service_config: StorageServiceConfig,
-    aptos_data_client_config: AptosDataClientConfig,
-    network_handles: HashMap<NetworkId, storage_service_client::StorageServiceNetworkSender>,
-    peer_metadata_storage: Arc<PeerMetadataStorage>,
-) -> (AptosNetDataClient, Runtime) {
-    // Combine all storage service client handles
-    let network_client = StorageServiceClient::new(
-        StorageServiceMultiSender::new(network_handles),
-        peer_metadata_storage,
-    );
-
-    // Create a new runtime for the data client
-    let aptos_data_client_runtime = Builder::new_multi_thread()
-        .thread_name("aptos-data-client")
-        .enable_all()
-        .build()
-        .expect("Failed to create aptos data client!");
-
-    // Create the data client and spawn the data poller
-    let (aptos_data_client, data_summary_poller) = AptosNetDataClient::new(
-        aptos_data_client_config,
-        storage_service_config,
-        TimeService::real(),
-        network_client,
-        Some(aptos_data_client_runtime.handle().clone()),
-    );
-    aptos_data_client_runtime.spawn(data_summary_poller.start_poller());
-
-    (aptos_data_client, aptos_data_client_runtime)
-}
-
-fn setup_state_sync_storage_service(
-    config: StorageServiceConfig,
-    network_handles: Vec<StorageServiceNetworkEvents>,
-    db_rw: &DbReaderWriter,
-) -> Runtime {
-    // Create a new state sync storage service runtime
-    let storage_service_runtime = Builder::new_multi_thread()
-        .thread_name("storage-service-server")
-        .enable_all()
-        .build()
-        .expect("Failed to start the AptosNet storage-service runtime.");
-
-    // Spawn all state sync storage service servers on the same runtime
-    let storage_reader = StorageReader::new(config, Arc::clone(&db_rw.reader));
-    for events in network_handles {
-        let service = StorageServiceServer::new(
-            config,
-            storage_service_runtime.handle().clone(),
-            storage_reader.clone(),
-            TimeService::real(),
-            events,
-        );
-        storage_service_runtime.spawn(service.start());
-    }
-
-    storage_service_runtime
-}
-
-async fn periodic_telemetry_dump(node_config: NodeConfig, db: DbReaderWriter) {
-    use futures::stream::StreamExt;
-    let mut dump_interval = IntervalStream::new(tokio::time::interval(
-        std::time::Duration::from_secs(NODE_PUSH_TIME_SECS),
-    ))
-    .fuse();
-
-    info!("periodic_telemetry_dump task started");
-
-    loop {
-        futures::select! {
-            _ = dump_interval.select_next_some() => {
-
-                // Build the params from internal prometheus metrics
-                let mut metrics_params: HashMap<String, String> = HashMap::new();
-
-                let met = get_public_json_metrics();
-                for (k, v) in &met {
-                    metrics_params.insert(k.to_string(), v.to_string());
-                }
-
-                // get some data we do not currently have metrics for
-                let chain_id = fetch_chain_id(&db).id(); // get the chain_id as its u8 id for consistency of schema
-                let peer_id = match node_config.peer_id() {
-                    Some(p) => p.to_string(),
-                    None => String::new()
-                };
-                let synced_version = (&*db.reader).fetch_synced_version().unwrap_or(0);
-
-                metrics_params.insert(SYNCED_VERSION_METRIC.to_string(), synced_version.to_string());
-                metrics_params.insert(CHAIN_ID_METRIC.to_string(), chain_id.to_string());
-                metrics_params.insert(PEER_ID_METRIC.to_string(), peer_id.to_string());
-                send_env_data(APTOS_NODE_PUSH_METRICS.to_string(), peer_id.to_string(), metrics_params).await;
-            }
-        }
-    }
-}
-
-async fn periodic_state_dump(node_config: NodeConfig, db: DbReaderWriter) {
-    use futures::stream::StreamExt;
-
-    let args: Vec<String> = ::std::env::args().collect();
-
-    // Once an hour
-    let mut config_interval = IntervalStream::new(tokio::time::interval(
-        std::time::Duration::from_secs(60 * 60),
-    ))
-    .fuse();
-    // Once a minute
-    let mut version_interval =
-        IntervalStream::new(tokio::time::interval(std::time::Duration::from_secs(60))).fuse();
-
-    info!("periodic_state_dump task started");
-
-    loop {
-        futures::select! {
-            _ = config_interval.select_next_some() => {
-                info!(config = node_config, args = args, "config and command line arguments");
-            }
-            _ = version_interval.select_next_some() => {
-                let chain_id = fetch_chain_id(&db);
-                let ledger_info = if let Ok(ledger_info) = db.reader.get_latest_ledger_info() {
-                    ledger_info
-                } else {
-                    warn!("unable to query latest ledger info");
-                    continue;
-                };
-
-                let latest_ledger_verion = ledger_info.ledger_info().version();
-                let root_hash = ledger_info.ledger_info().transaction_accumulator_hash();
-
-                info!(
-                    chain_id = chain_id,
-                    latest_ledger_verion = latest_ledger_verion,
-                    root_hash = root_hash,
-                    "latest ledger version and its corresponding root hash"
-                );
-            }
-        }
-    }
-}
-
-pub fn setup_environment(node_config: &NodeConfig, logger: Option<Arc<Logger>>) -> AptosHandle {
-    let debug_if = setup_debug_interface(node_config, logger);
-
-    let metrics_port = node_config.debug_interface.metrics_server_port;
-    let metric_host = node_config.debug_interface.address.clone();
-    thread::spawn(move || metric_server::start_server(metric_host, metrics_port, false));
-    let public_metrics_port = node_config.debug_interface.public_metrics_server_port;
-    let public_metric_host = node_config.debug_interface.address.clone();
-    thread::spawn(move || {
-        metric_server::start_server(public_metric_host, public_metrics_port, true)
-    });
-
-    let mut instant = Instant::now();
-    let (aptos_db, db_rw) = DbReaderWriter::wrap(
-        AptosDB::open(
-            &node_config.storage.dir(),
-            false, /* readonly */
-            node_config.storage.storage_pruner_config,
-            node_config.storage.rocksdb_config,
-        )
-        .expect("DB should open."),
-    );
-    let _simple_storage_service = start_storage_service_with_db(node_config, Arc::clone(&aptos_db));
-    let backup_service = start_backup_service(
-        node_config.storage.backup_service_address,
-        Arc::clone(&aptos_db),
-    );
-
-    let genesis_waypoint = node_config.base.waypoint.genesis_waypoint();
-    // if there's genesis txn and waypoint, commit it if the result matches.
-    if let Some(genesis) = get_genesis_txn(node_config) {
-        maybe_bootstrap::<AptosVM>(&db_rw, genesis, genesis_waypoint)
-            .expect("Db-bootstrapper should not fail.");
-    } else {
-        info!("Genesis txn not provided, it's fine if you don't expect to apply it otherwise please double check config");
-    }
-    AptosVM::set_concurrency_level_once(node_config.execution.concurrency_level as usize);
-
-    debug!(
-        "Storage service started in {} ms",
-        instant.elapsed().as_millis()
-    );
-
-    let chain_id = fetch_chain_id(&db_rw);
-    let mut network_runtimes = vec![];
-    let mut state_sync_network_handles = vec![];
-    let mut mempool_network_handles = vec![];
-    let mut consensus_network_handles = None;
-    let mut storage_service_server_network_handles = vec![];
-    let mut storage_service_client_network_handles = HashMap::new();
-
-    // Create an event subscription service so that components can be notified of events and reconfigs
-    let mut event_subscription_service = EventSubscriptionService::new(
-        ON_CHAIN_CONFIG_REGISTRY,
-        Arc::new(RwLock::new(db_rw.clone())),
-    );
-    let mempool_reconfig_subscription = event_subscription_service
-        .subscribe_to_reconfigurations()
-        .unwrap();
-
-    // Create a consensus subscription for reconfiguration events (if this node is a validator).
-    let consensus_reconfig_subscription = if node_config.base.role.is_validator() {
-        Some(
-            event_subscription_service
-                .subscribe_to_reconfigurations()
-                .unwrap(),
-        )
-    } else {
-        None
+    let config = match config {
+        Some(config) => config,
+        None => load_node_config(
+            config_path,
+            test_config_override_path,
+            &test_dir,
+            random_ports,
+            enable_lazy_mode,
+            enable_performance_mode,
+            framework,
+            rng,
+        )?,
     };
 
-    // Gather all network configs into a single vector.
-    let mut network_configs: Vec<&NetworkConfig> = node_config.full_node_networks.iter().collect();
-    if let Some(network_config) = node_config.validator_network.as_ref() {
-        network_configs.push(network_config);
+    start_test_environment_node(config, test_dir, enable_lazy_mode)
+}
+
+/// Creates a single node test config, with a few config tweaks to reduce
+/// the overhead of running the node on a local machine. It writes necessary
+/// configuration artifacts (e.g. the mint key) to disk.
+pub fn create_single_node_test_config<R>(
+    config_path: &Option<PathBuf>,
+    test_config_override_path: &Option<PathBuf>,
+    test_dir: &Path,
+    random_ports: bool,
+    enable_lazy_mode: bool,
+    enable_performance_mode: bool,
+    framework: &ReleaseBundle,
+    rng: R,
+) -> anyhow::Result<NodeConfig>
+where
+    R: rand::RngCore + rand::CryptoRng,
+{
+    let mut node_config = match test_config_override_path {
+        // If a config override path was provided, merge it with the default config
+        Some(test_config_override_path) => {
+            let reader = fs::File::open(test_config_override_path).map_err(|e| {
+                anyhow!(
+                    "Unable to open config override file {:?}. Error: {}",
+                    test_config_override_path,
+                    e
+                )
+            })?;
+            let values: serde_yaml::Value = serde_yaml::from_reader(&reader).map_err(|e| {
+                anyhow!(
+                    "Unable to read config override file as YAML {:?}. Error: {}",
+                    test_config_override_path,
+                    e
+                )
+            })?;
+            merge_node_config(NodeConfig::get_default_validator_config(), values)?
+        },
+        None => NodeConfig::get_default_validator_config(),
+    };
+
+    // Adjust some fields in the default template to lower the overhead of
+    // running on a local machine.
+    // Some are further overridden to give us higher performance when enable_performance_mode is true
+    node_config
+        .consensus
+        .quorum_store
+        .num_workers_for_remote_batches = 1;
+
+    if enable_performance_mode {
+        // Setting to a pretty conservative concurrency level. It can be tuned locally.
+        node_config.execution.concurrency_level = 4;
+        // Don't constrain the TPS of Quorum Store for this single node.
+        node_config
+            .consensus
+            .quorum_store
+            .back_pressure
+            .dynamic_max_txn_per_s = 10_000;
+    } else {
+        node_config.execution.concurrency_level = 1;
+        node_config.execution.num_proof_reading_threads = 1;
+        node_config.consensus.quorum_store_poll_time_ms = 1000;
     }
 
-    // Instantiate every network and collect the requisite endpoints for state_sync, mempool, and consensus.
-    let mut network_ids = HashSet::new();
-    network_configs.iter().for_each(|config| {
-        let network_id = config.network_id;
-        // Guarantee there is only one of this network
-        if network_ids.contains(&network_id) {
-            panic!(
-                "Duplicate NetworkId: '{}'.  Can't start node with duplicate networks",
-                network_id
-            );
-        }
-        network_ids.insert(network_id);
-    });
-    let network_ids: Vec<_> = network_ids.into_iter().collect();
+    node_config.execution.paranoid_hot_potato_verification = false;
+    node_config.execution.paranoid_type_verification = false;
+    node_config
+        .execution
+        .processed_transactions_detailed_counters = false;
 
-    let peer_metadata_storage = PeerMetadataStorage::new(&network_ids);
-    for network_config in network_configs.into_iter() {
-        debug!("Creating runtime for {}", network_config.network_id);
-        let runtime = Builder::new_multi_thread()
-            .thread_name(format!("network-{}", network_config.network_id))
-            .enable_all()
-            .build()
-            .expect("Failed to start runtime. Won't be able to start networking.");
+    node_config.peer_monitoring_service.max_concurrent_requests = 1;
+    node_config
+        .peer_monitoring_service
+        .enable_peer_monitoring_client = false;
 
-        // Entering here gives us a runtime to instantiate all the pieces of the builder
-        let _enter = runtime.enter();
-
-        // Perform common instantiation steps
-        let mut network_builder = NetworkBuilder::create(
-            chain_id,
-            node_config.base.role,
-            network_config,
-            TimeService::real(),
-            Some(&mut event_subscription_service),
-            peer_metadata_storage.clone(),
-        );
-        let network_id = network_config.network_id;
-
-        // Create the endpoints to connect the Network to State Sync.
-        let (state_sync_sender, state_sync_events) =
-            network_builder.add_p2p_service(&state_sync_v1_network_config());
-        state_sync_network_handles.push((network_id, state_sync_sender, state_sync_events));
-
-        // TODO(philiphayes): configure which networks we serve the storage service
-        // on? for example, if we're a light node we wouldn't want to provide the
-        // storage service at all.
-
-        // Register the network-facing storage service with Network.
-        let storage_service_events =
-            network_builder.add_service(&storage_service_server::network::network_endpoint_config(
-                node_config.state_sync.storage_service,
-            ));
-        storage_service_server_network_handles.push(storage_service_events);
-
-        // Register the storage-service clients with Network
-        let storage_service_sender =
-            network_builder.add_client(&storage_service_client::network_endpoint_config());
-        storage_service_client_network_handles.insert(network_id, storage_service_sender);
-
-        // Create the endpoints to connect the Network to mempool.
-        let (mempool_sender, mempool_events) = network_builder.add_p2p_service(
-            &aptos_mempool::network::network_endpoint_config(MEMPOOL_NETWORK_CHANNEL_BUFFER_SIZE),
-        );
-        mempool_network_handles.push((network_id, mempool_sender, mempool_events));
-
-        // Perform steps relevant specifically to Validator networks.
-        if network_id.is_validator_network() {
-            // A valid config is allowed to have at most one ValidatorNetwork
-            // TODO:  `expect_none` would be perfect here, once it is stable.
-            if consensus_network_handles.is_some() {
-                panic!("There can be at most one validator network!");
-            }
-
-            consensus_network_handles = Some(
-                network_builder
-                    .add_p2p_service(&consensus::network_interface::network_endpoint_config()),
-            );
-        }
-
-        let network_context = network_builder.network_context();
-        network_builder.build(runtime.handle().clone());
-        network_builder.start();
-        debug!("Network built for network context: {}", network_context);
-        network_runtimes.push(runtime);
+    if enable_performance_mode {
+        node_config
+            .mempool
+            .shared_mempool_max_concurrent_inbound_syncs = 16;
+        node_config.mempool.shared_mempool_tick_interval_ms = 10;
+        node_config.mempool.default_failovers = 0;
+    } else {
+        node_config
+            .mempool
+            .shared_mempool_max_concurrent_inbound_syncs = 1;
+        node_config.mempool.default_failovers = 1;
+        node_config.mempool.max_broadcasts_per_peer = 1;
     }
 
-    // TODO set up on-chain discovery network based on UpstreamConfig.fallback_network
-    // and pass network handles to mempool/state sync
+    node_config
+        .state_sync
+        .state_sync_driver
+        .enable_auto_bootstrapping = true;
+    node_config
+        .state_sync
+        .state_sync_driver
+        .max_connection_deadline_secs = 1;
+    node_config
+        .state_sync
+        .state_sync_driver
+        .progress_check_interval_ms = 10_000;
+    node_config
+        .state_sync
+        .data_streaming_service
+        .progress_check_interval_ms = 10_000;
 
-    // For state sync to send notifications to mempool and receive notifications from consensus.
-    let (mempool_notifier, mempool_listener) =
-        mempool_notifications::new_mempool_notifier_listener_pair();
-    let (consensus_notifier, consensus_listener) =
-        consensus_notifications::new_consensus_notifier_listener_pair(
-            node_config.state_sync.client_commit_timeout_ms,
-        );
+    // Configure the validator network
+    let validator_network = node_config.validator_network.as_mut().unwrap();
+    validator_network.connectivity_check_interval_ms = 10000;
+    validator_network.max_connection_delay_ms = 10000;
+    validator_network.ping_interval_ms = 10000;
+    validator_network.runtime_threads = Some(1);
 
-    // Create the state sync runtimes
-    let state_sync_runtimes = create_state_sync_runtimes(
-        node_config,
-        storage_service_server_network_handles,
-        storage_service_client_network_handles,
-        state_sync_network_handles,
-        peer_metadata_storage.clone(),
-        mempool_notifier,
-        consensus_listener,
-        genesis_waypoint,
-        event_subscription_service,
-        db_rw.clone(),
+    // Configure the fullnode network
+    let fullnode_network = node_config.full_node_networks.get_mut(0).unwrap();
+    fullnode_network.connectivity_check_interval_ms = 10000;
+    fullnode_network.max_connection_delay_ms = 10000;
+    fullnode_network.ping_interval_ms = 10000;
+    fullnode_network.runtime_threads = Some(1);
+
+    // If a config path was provided, use that as the template
+    if let Some(config_path) = config_path {
+        node_config = NodeConfig::load_config(config_path).map_err(|e| {
+            anyhow!(
+                "Unable to load config from path: {:?}. Error: {:?}",
+                config_path,
+                e
+            )
+        })?;
+    }
+
+    // Change the default log level
+    node_config.logger.level = Level::Debug;
+
+    // Enable the REST API
+    node_config.api.address = format!("0.0.0.0:{}", node_config.api.address.port())
+        .parse()
+        .expect("Unable to set the REST API address!");
+
+    // Set the correct poll count for mempool
+    if enable_lazy_mode {
+        node_config.consensus.quorum_store_poll_time_ms = 3_600_000;
+    }
+
+    // The validator builder puts the first node in the 0 directory
+    let aptos_root_key_path = test_dir.join("mint.key");
+
+    // Build genesis and the validator node
+    let builder = aptos_genesis::builder::Builder::new(test_dir, framework.clone())?
+        .with_init_config(Some(Arc::new(move |_, config, _| {
+            *config = node_config.clone();
+        })))
+        .with_init_genesis_config(Some(Arc::new(|genesis_config| {
+            genesis_config.allow_new_validators = true;
+            genesis_config.epoch_duration_secs = EPOCH_LENGTH_SECS;
+            genesis_config.recurring_lockup_duration_secs = 7200;
+            genesis_config.jwk_consensus_config_override = match env::var("INITIALIZE_JWK_CONSENSUS") {
+                Ok(val) if val.as_str() == "1" => {
+                    let config = OnChainJWKConsensusConfig::default_enabled();
+                    println!("Flag `INITIALIZE_JWK_CONSENSUS` detected, will enable JWK Consensus for all default OIDC providers in genesis: {:?}", config);
+                    Some(config)
+                }
+                _ => None,
+            };
+        })))
+        .with_randomize_first_validator_ports(random_ports);
+    let (root_key, _genesis, genesis_waypoint, mut validators) = builder.build(rng)?;
+
+    // Write the mint key to disk
+    let serialized_keys = bcs::to_bytes(&root_key)?;
+    let mut key_file = fs::File::create(aptos_root_key_path)?;
+    key_file.write_all(&serialized_keys)?;
+
+    // Build a waypoint file so that clients / docker can grab it easily
+    let waypoint_file_path = test_dir.join("waypoint.txt");
+    Write::write_all(
+        &mut fs::File::create(waypoint_file_path)?,
+        genesis_waypoint.to_string().as_bytes(),
+    )?;
+
+    aptos_config::config::sanitize_node_config(validators[0].config.override_config_mut())?;
+
+    let mut node_config = validators[0].config.override_config().clone();
+
+    // Enable the AdminService.
+    node_config.admin_service.enabled = Some(true);
+
+    Ok(node_config)
+}
+
+/// Initializes the node environment and starts the node
+pub fn setup_environment_and_start_node(
+    mut node_config: NodeConfig,
+    remote_log_rx: Option<mpsc::Receiver<TelemetryLog>>,
+    logger_filter_update_job: Option<LoggerFilterUpdater>,
+    api_port_tx: Option<oneshot::Sender<u16>>,
+    indexer_grpc_port_tx: Option<oneshot::Sender<u16>>,
+) -> anyhow::Result<AptosHandle> {
+    // Log the node config at node startup
+    node_config.log_all_configs();
+
+    // Starts the admin service
+    let mut admin_service = services::start_admin_service(&node_config);
+
+    // Set up the storage database and any RocksDB checkpoints
+    let (db_rw, backup_service, genesis_waypoint, indexer_db_opt, update_receiver) =
+        storage::initialize_database_and_checkpoints(&mut node_config)?;
+
+    admin_service.set_aptos_db(db_rw.clone().into());
+
+    // Set the Aptos VM configurations
+    utils::set_aptos_vm_configurations(&node_config);
+
+    // Obtain the chain_id from the DB
+    let chain_id = utils::fetch_chain_id(&db_rw)?;
+
+    // Set the chain_id in global AptosNodeIdentity
+    aptos_node_identity::set_chain_id(chain_id)?;
+
+    // Start the telemetry service (as early as possible and before any blocking calls)
+    let telemetry_runtime = services::start_telemetry_service(
+        &node_config,
+        remote_log_rx,
+        logger_filter_update_job,
+        chain_id,
     );
 
-    let (mp_client_sender, mp_client_events) = channel(AC_SMP_CHANNEL_BUFFER_SIZE);
-
-    let api_runtime = bootstrap_api(node_config, chain_id, aptos_db, mp_client_sender).unwrap();
-
-    let mut consensus_runtime = None;
-    let (consensus_to_mempool_sender, consensus_requests) = channel(INTRA_NODE_CHANNEL_BUFFER_SIZE);
-
-    instant = Instant::now();
-    let mempool = aptos_mempool::bootstrap(
-        node_config,
-        Arc::clone(&db_rw.reader),
-        mempool_network_handles,
-        mp_client_events,
-        consensus_requests,
-        mempool_listener,
+    // Create an event subscription service (and reconfig subscriptions for consensus and mempool)
+    let (
+        mut event_subscription_service,
         mempool_reconfig_subscription,
-        peer_metadata_storage.clone(),
+        consensus_observer_reconfig_subscription,
+        consensus_reconfig_subscription,
+        dkg_subscriptions,
+        jwk_consensus_subscriptions,
+    ) = state_sync::create_event_subscription_service(&node_config, &db_rw);
+
+    // Set up the networks and gather the application network handles
+    let peers_and_metadata = network::create_peers_and_metadata(&node_config);
+    let (
+        network_runtimes,
+        consensus_network_interfaces,
+        consensus_observer_network_interfaces,
+        dkg_network_interfaces,
+        jwk_consensus_network_interfaces,
+        mempool_network_interfaces,
+        peer_monitoring_service_network_interfaces,
+        storage_service_network_interfaces,
+    ) = network::setup_networks_and_get_interfaces(
+        &node_config,
+        chain_id,
+        peers_and_metadata.clone(),
+        &mut event_subscription_service,
     );
-    debug!("Mempool started in {} ms", instant.elapsed().as_millis());
 
-    // StateSync should be instantiated and started before Consensus to avoid a cyclic dependency:
-    // network provider -> consensus -> state synchronizer -> network provider.  This has resulted
-    // in a deadlock as observed in GitHub issue #749.
-    if let Some((consensus_network_sender, consensus_network_events)) = consensus_network_handles {
-        // Make sure that state synchronizer is caught up at least to its waypoint
-        // (in case it's present). There is no sense to start consensus prior to that.
-        // TODO: Note that we need the networking layer to be able to discover & connect to the
-        // peers with potentially outdated network identity public keys.
-        debug!("Wait until state sync is initialized");
-        state_sync_runtimes.block_until_initialized();
-        debug!("State sync initialization complete.");
+    // Start the peer monitoring service
+    let peer_monitoring_service_runtime = services::start_peer_monitoring_service(
+        &node_config,
+        peer_monitoring_service_network_interfaces,
+        db_rw.reader.clone(),
+    );
 
-        // Initialize and start consensus.
-        instant = Instant::now();
-        consensus_runtime = Some(start_consensus(
-            node_config,
-            consensus_network_sender,
-            consensus_network_events,
-            Arc::new(consensus_notifier),
-            consensus_to_mempool_sender,
+    // Start state sync and get the notification endpoints for mempool and consensus
+    let (aptos_data_client, state_sync_runtimes, mempool_listener, consensus_notifier) =
+        state_sync::start_state_sync_and_get_notification_handles(
+            &node_config,
+            storage_service_network_interfaces,
+            genesis_waypoint,
+            event_subscription_service,
             db_rw.clone(),
-            consensus_reconfig_subscription
-                .expect("Consensus requires a reconfiguration subscription!"),
-            peer_metadata_storage,
-        ));
-        debug!("Consensus started in {} ms", instant.elapsed().as_millis());
-    }
+        )?;
 
-    // Spawn a task which will periodically dump some interesting state
-    debug_if
-        .runtime()
-        .handle()
-        .spawn(periodic_state_dump(node_config.to_owned(), db_rw.clone()));
+    // Start the node inspection service
+    services::start_node_inspection_service(
+        &node_config,
+        aptos_data_client,
+        peers_and_metadata.clone(),
+    );
 
-    let telemery_runtime = Builder::new_multi_thread()
-        .thread_name("aptos-telemetry")
-        .enable_all()
-        .build()
-        .expect("Failed to create aptos telemetry runtime!");
+    // Bootstrap the API and indexer
+    let (
+        mempool_client_receiver,
+        api_runtime,
+        indexer_table_info_runtime,
+        indexer_runtime,
+        indexer_grpc_runtime,
+        internal_indexer_db_runtime,
+        mempool_client_sender,
+    ) = services::bootstrap_api_and_indexer(
+        &node_config,
+        db_rw.clone(),
+        chain_id,
+        indexer_db_opt,
+        update_receiver,
+        api_port_tx,
+        indexer_grpc_port_tx,
+    )?;
 
-    telemery_runtime
-        .handle()
-        .spawn(periodic_telemetry_dump(node_config.to_owned(), db_rw));
+    // Set mempool client sender in order to enable the Mempool API in the admin service
+    admin_service.set_mempool_client_sender(mempool_client_sender);
 
-    AptosHandle {
-        _api: api_runtime,
-        _backup: backup_service,
+    // Create mempool and get the consensus to mempool sender
+    let (mempool_runtime, consensus_to_mempool_sender) =
+        services::start_mempool_runtime_and_get_consensus_sender(
+            &mut node_config,
+            &db_rw,
+            mempool_reconfig_subscription,
+            mempool_network_interfaces,
+            mempool_listener,
+            mempool_client_receiver,
+            peers_and_metadata,
+        );
+
+    // Create the DKG runtime and get the VTxn pool
+    let (vtxn_pool, dkg_runtime) =
+        consensus::create_dkg_runtime(&mut node_config, dkg_subscriptions, dkg_network_interfaces);
+
+    // Create the JWK consensus runtime
+    let jwk_consensus_runtime = consensus::create_jwk_consensus_runtime(
+        &mut node_config,
+        jwk_consensus_subscriptions,
+        jwk_consensus_network_interfaces,
+        &vtxn_pool,
+    );
+
+    // Wait until state sync has been initialized
+    debug!("Waiting until state sync is initialized!");
+    state_sync_runtimes.block_until_initialized();
+    debug!("State sync initialization complete.");
+
+    // Create the consensus observer and publisher (if enabled)
+    let (consensus_observer_runtime, consensus_publisher_runtime, consensus_publisher) =
+        consensus::create_consensus_observer_and_publisher(
+            &node_config,
+            consensus_observer_network_interfaces,
+            consensus_notifier.clone(),
+            consensus_to_mempool_sender.clone(),
+            db_rw.clone(),
+            consensus_observer_reconfig_subscription,
+        );
+
+    // Create the consensus runtime (if enabled)
+    let consensus_runtime = consensus::create_consensus_runtime(
+        &node_config,
+        db_rw.clone(),
+        consensus_reconfig_subscription,
+        consensus_network_interfaces,
+        consensus_notifier.clone(),
+        consensus_to_mempool_sender.clone(),
+        vtxn_pool,
+        consensus_publisher.clone(),
+        &mut admin_service,
+    );
+
+    Ok(AptosHandle {
+        _admin_service: admin_service,
+        _api_runtime: api_runtime,
+        _backup_runtime: backup_service,
+        _consensus_observer_runtime: consensus_observer_runtime,
+        _consensus_publisher_runtime: consensus_publisher_runtime,
         _consensus_runtime: consensus_runtime,
-        _debug: debug_if,
-        _mempool: mempool,
+        _dkg_runtime: dkg_runtime,
+        _indexer_grpc_runtime: indexer_grpc_runtime,
+        _indexer_runtime: indexer_runtime,
+        _indexer_table_info_runtime: indexer_table_info_runtime,
+        _jwk_consensus_runtime: jwk_consensus_runtime,
+        _mempool_runtime: mempool_runtime,
         _network_runtimes: network_runtimes,
+        _peer_monitoring_service_runtime: peer_monitoring_service_runtime,
         _state_sync_runtimes: state_sync_runtimes,
-        _telemetry_runtime: telemery_runtime,
-    }
+        _telemetry_runtime: telemetry_runtime,
+        _indexer_db_runtime: internal_indexer_db_runtime,
+    })
+}
+
+#[test]
+fn verify_tool() {
+    use clap::CommandFactory;
+    AptosNodeArgs::command().debug_assert()
 }

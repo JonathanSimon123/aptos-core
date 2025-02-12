@@ -1,47 +1,86 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
-
 #![forbid(unsafe_code)]
 
-mod error;
-mod executed_chunk;
-
-pub use error::Error;
-
 use anyhow::Result;
-use aptos_crypto::{
-    ed25519::Ed25519Signature,
-    hash::{EventAccumulatorHasher, TransactionAccumulatorHasher, ACCUMULATOR_PLACEHOLDER_HASH},
-    HashValue,
-};
-use aptos_state_view::StateViewId;
+use aptos_crypto::HashValue;
+use aptos_scratchpad::SparseMerkleTree;
 use aptos_types::{
+    account_config::{NEW_EPOCH_EVENT_MOVE_TYPE_TAG, NEW_EPOCH_EVENT_V2_MOVE_TYPE_TAG},
+    block_executor::{config::BlockExecutorConfigFromOnchain, partitioner::ExecutableBlock},
     contract_event::ContractEvent,
-    epoch_state::EpochState,
+    dkg::DKG_START_EVENT_MOVE_TYPE_TAG,
+    jwks::OBSERVED_JWK_UPDATED_MOVE_TYPE_TAG,
     ledger_info::LedgerInfoWithSignatures,
-    nibble::nibble_path::NibblePath,
-    proof::{accumulator::InMemoryAccumulator, AccumulatorExtensionProof},
     state_store::{state_key::StateKey, state_value::StateValue},
     transaction::{
         Transaction, TransactionInfo, TransactionListWithProof, TransactionOutputListWithProof,
-        TransactionStatus, Version,
+        Version,
     },
     write_set::WriteSet,
 };
-use scratchpad::ProofRead;
-use serde::{Deserialize, Serialize};
-use std::{cmp::max, collections::HashMap, sync::Arc};
-use storage_interface::DbReader;
+pub use error::{ExecutorError, ExecutorResult};
+pub use ledger_update_output::LedgerUpdateOutput;
+use state_compute_result::StateComputeResult;
+use std::{
+    collections::BTreeSet,
+    ops::Deref,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
-pub use executed_chunk::ExecutedChunk;
-use storage_interface::{in_memory_state::InMemoryState, verified_state_view::VerifiedStateView};
-
-type SparseMerkleProof = aptos_types::proof::SparseMerkleProof;
+mod error;
+pub mod execution_output;
+mod ledger_update_output;
+mod metrics;
+pub mod planned;
+pub mod state_checkpoint_output;
+pub mod state_compute_result;
+pub mod transactions_with_output;
 
 pub trait ChunkExecutorTrait: Send + Sync {
     /// Verifies the transactions based on the provided proofs and ledger info. If the transactions
     /// are valid, executes them and returns the executed result for commit.
+    #[cfg(any(test, feature = "fuzzing"))]
     fn execute_chunk(
+        &self,
+        txn_list_with_proof: TransactionListWithProof,
+        // Target LI that has been verified independently: the proofs are relative to this version.
+        verified_target_li: &LedgerInfoWithSignatures,
+        epoch_change_li: Option<&LedgerInfoWithSignatures>,
+    ) -> Result<()> {
+        self.enqueue_chunk_by_execution(txn_list_with_proof, verified_target_li, epoch_change_li)?;
+
+        self.update_ledger()
+    }
+
+    /// Similar to `execute_chunk`, but instead of executing transactions, apply the transaction
+    /// outputs directly to get the executed result.
+    #[cfg(any(test, feature = "fuzzing"))]
+    fn apply_chunk(
+        &self,
+        txn_output_list_with_proof: TransactionOutputListWithProof,
+        // Target LI that has been verified independently: the proofs are relative to this version.
+        verified_target_li: &LedgerInfoWithSignatures,
+        epoch_change_li: Option<&LedgerInfoWithSignatures>,
+    ) -> Result<()> {
+        self.enqueue_chunk_by_transaction_outputs(
+            txn_output_list_with_proof,
+            verified_target_li,
+            epoch_change_li,
+        )?;
+
+        self.update_ledger()
+    }
+
+    /// Verifies the transactions based on the provided proofs and ledger info. If the transactions
+    /// are valid, executes them and make state checkpoint, so that a later chunk of transaction can
+    /// be applied on top of it. This stage calculates the state checkpoint, but not the top level
+    /// transaction accumulator.
+    fn enqueue_chunk_by_execution(
         &self,
         txn_list_with_proof: TransactionListWithProof,
         // Target LI that has been verified independently: the proofs are relative to this version.
@@ -49,35 +88,33 @@ pub trait ChunkExecutorTrait: Send + Sync {
         epoch_change_li: Option<&LedgerInfoWithSignatures>,
     ) -> Result<()>;
 
-    /// Similar to `execute_chunk`, but instead of executing transactions, apply the transaction
-    /// outputs directly to get the executed result.
-    fn apply_chunk(
+    /// Similar to `enqueue_chunk_by_execution`, but instead of executing transactions, apply the
+    /// transaction outputs directly to get the executed result.
+    fn enqueue_chunk_by_transaction_outputs(
         &self,
         txn_output_list_with_proof: TransactionOutputListWithProof,
         // Target LI that has been verified independently: the proofs are relative to this version.
         verified_target_li: &LedgerInfoWithSignatures,
         epoch_change_li: Option<&LedgerInfoWithSignatures>,
-    ) -> anyhow::Result<()>;
+    ) -> Result<()>;
+
+    /// As a separate stage, calculate the transaction accumulator changes, prepare for db commission.
+    fn update_ledger(&self) -> Result<()>;
 
     /// Commit a previously executed chunk. Returns a chunk commit notification.
     fn commit_chunk(&self) -> Result<ChunkCommitNotification>;
 
-    fn execute_and_commit_chunk(
-        &self,
-        txn_list_with_proof: TransactionListWithProof,
-        verified_target_li: &LedgerInfoWithSignatures,
-        epoch_change_li: Option<&LedgerInfoWithSignatures>,
-    ) -> Result<ChunkCommitNotification>;
-
-    fn apply_and_commit_chunk(
-        &self,
-        txn_output_list_with_proof: TransactionOutputListWithProof,
-        verified_target_li: &LedgerInfoWithSignatures,
-        epoch_change_li: Option<&LedgerInfoWithSignatures>,
-    ) -> Result<ChunkCommitNotification>;
-
     /// Resets the chunk executor by synchronizing state with storage.
     fn reset(&self) -> Result<()>;
+
+    /// Finishes the chunk executor by releasing memory held by inner data structures(SMT).
+    fn finish(&self);
+}
+
+pub struct StateSnapshotDelta {
+    pub version: Version,
+    pub smt: SparseMerkleTree<StateValue>,
+    pub jmt_updates: Vec<(HashValue, (HashValue, StateKey))>,
 }
 
 pub trait BlockExecutorTrait: Send + Sync {
@@ -85,410 +122,165 @@ pub trait BlockExecutorTrait: Send + Sync {
     fn committed_block_id(&self) -> HashValue;
 
     /// Reset the internal state including cache with newly fetched latest committed block from storage.
-    fn reset(&self) -> Result<(), Error>;
+    fn reset(&self) -> Result<()>;
 
-    /// Executes a block.
+    /// Executes a block - TBD, this API will be removed in favor of `execute_and_state_checkpoint`, followed
+    /// by `ledger_update` once we have ledger update as a separate pipeline phase.
+    #[cfg(any(test, feature = "fuzzing"))]
     fn execute_block(
         &self,
-        block: (HashValue, Vec<Transaction>),
+        block: ExecutableBlock,
         parent_block_id: HashValue,
-    ) -> Result<StateComputeResult, Error>;
+        onchain_config: BlockExecutorConfigFromOnchain,
+    ) -> ExecutorResult<StateComputeResult> {
+        let block_id = block.block_id;
+        self.execute_and_update_state(block, parent_block_id, onchain_config)?;
+        self.ledger_update(block_id, parent_block_id)
+    }
 
-    /// Saves eligible blocks to persistent storage.
-    /// If we have multiple blocks and not all of them have signatures, we may send them to storage
-    /// in a few batches. For example, if we have
-    /// ```text
-    /// A <- B <- C <- D <- E
-    /// ```
-    /// and only `C` and `E` have signatures, we will send `A`, `B` and `C` in the first batch,
-    /// then `D` and `E` later in the another batch.
-    /// Commits a block and all its ancestors in a batch manner.
+    /// Executes a block and returns the state checkpoint output.
+    fn execute_and_update_state(
+        &self,
+        block: ExecutableBlock,
+        parent_block_id: HashValue,
+        onchain_config: BlockExecutorConfigFromOnchain,
+    ) -> ExecutorResult<()>;
+
+    fn ledger_update(
+        &self,
+        block_id: HashValue,
+        parent_block_id: HashValue,
+    ) -> ExecutorResult<StateComputeResult>;
+
+    #[cfg(any(test, feature = "fuzzing"))]
     fn commit_blocks(
         &self,
         block_ids: Vec<HashValue>,
         ledger_info_with_sigs: LedgerInfoWithSignatures,
-    ) -> Result<(), Error>;
+    ) -> ExecutorResult<()> {
+        for block_id in block_ids {
+            self.pre_commit_block(block_id)?;
+        }
+        self.commit_ledger(ledger_info_with_sigs)
+    }
+
+    fn pre_commit_block(&self, block_id: HashValue) -> ExecutorResult<()>;
+
+    fn commit_ledger(&self, ledger_info_with_sigs: LedgerInfoWithSignatures) -> ExecutorResult<()>;
+
+    /// Finishes the block executor by releasing memory held by inner data structures(SMT).
+    fn finish(&self);
+}
+
+#[derive(Clone)]
+pub enum VerifyExecutionMode {
+    NoVerify,
+    Verify {
+        txns_to_skip: Arc<BTreeSet<Version>>,
+        lazy_quit: bool,
+        seen_error: Arc<AtomicBool>,
+    },
+}
+
+impl VerifyExecutionMode {
+    pub fn verify_all() -> Self {
+        Self::Verify {
+            txns_to_skip: Arc::new(BTreeSet::new()),
+            lazy_quit: false,
+            seen_error: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn verify_except(txns_to_skip: Vec<Version>) -> Self {
+        Self::Verify {
+            txns_to_skip: Arc::new(txns_to_skip.into_iter().collect()),
+            lazy_quit: false,
+            seen_error: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn txns_to_skip(&self) -> Arc<BTreeSet<Version>> {
+        match self {
+            VerifyExecutionMode::NoVerify => Arc::new(BTreeSet::new()),
+            VerifyExecutionMode::Verify { txns_to_skip, .. } => txns_to_skip.clone(),
+        }
+    }
+
+    pub fn set_lazy_quit(mut self, is_lazy_quit: bool) -> Self {
+        if let Self::Verify {
+            ref mut lazy_quit, ..
+        } = self
+        {
+            *lazy_quit = is_lazy_quit
+        }
+        self
+    }
+
+    pub fn is_lazy_quit(&self) -> bool {
+        match self {
+            VerifyExecutionMode::NoVerify => false,
+            VerifyExecutionMode::Verify { lazy_quit, .. } => *lazy_quit,
+        }
+    }
+
+    pub fn mark_seen_error(&self) {
+        match self {
+            VerifyExecutionMode::NoVerify => unreachable!("Should not call in no-verify mode."),
+            VerifyExecutionMode::Verify { seen_error, .. } => {
+                seen_error.store(true, Ordering::Relaxed)
+            },
+        }
+    }
+
+    pub fn should_verify(&self) -> bool {
+        !matches!(self, Self::NoVerify)
+    }
+
+    pub fn seen_error(&self) -> bool {
+        match self {
+            VerifyExecutionMode::NoVerify => false,
+            VerifyExecutionMode::Verify { seen_error, .. } => seen_error.load(Ordering::Relaxed),
+        }
+    }
 }
 
 pub trait TransactionReplayer: Send {
-    fn replay(
+    fn enqueue_chunks(
         &self,
         transactions: Vec<Transaction>,
         transaction_infos: Vec<TransactionInfo>,
-    ) -> Result<()>;
+        write_sets: Vec<WriteSet>,
+        event_vecs: Vec<Vec<ContractEvent>>,
+        verify_execution_mode: &VerifyExecutionMode,
+    ) -> Result<usize>;
 
-    fn commit(&self) -> Result<Arc<ExecutedChunk>>;
+    fn commit(&self) -> Result<Version>;
 }
 
 /// A structure that holds relevant information about a chunk that was committed.
+#[derive(Clone)]
 pub struct ChunkCommitNotification {
-    pub committed_events: Vec<ContractEvent>,
+    pub subscribable_events: Vec<ContractEvent>,
     pub committed_transactions: Vec<Transaction>,
     pub reconfiguration_occurred: bool,
 }
 
-/// A structure that summarizes the result of the execution needed for consensus to agree on.
-/// The execution is responsible for generating the ID of the new state, which is returned in the
-/// result.
-///
-/// Not every transaction in the payload succeeds: the returned vector keeps the boolean status
-/// of success / failure of the transactions.
-/// Note that the specific details of compute_status are opaque to StateMachineReplication,
-/// which is going to simply pass the results between StateComputer and TxnManager.
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
-pub struct StateComputeResult {
-    /// transaction accumulator root hash is identified as `state_id` in Consensus.
-    root_hash: HashValue,
-    /// Represents the roots of all the full subtrees from left to right in this accumulator
-    /// after the execution. For details, please see [`InMemoryAccumulator`](aptos_types::proof::accumulator::InMemoryAccumulator).
-    frozen_subtree_roots: Vec<HashValue>,
-
-    /// The frozen subtrees roots of the parent block,
-    parent_frozen_subtree_roots: Vec<HashValue>,
-
-    /// The number of leaves of the transaction accumulator after executing a proposed block.
-    /// This state must be persisted to ensure that on restart that the version is calculated correctly.
-    num_leaves: u64,
-
-    /// The number of leaves after executing the parent block,
-    parent_num_leaves: u64,
-
-    /// If set, this is the new epoch info that should be changed to if this block is committed.
-    epoch_state: Option<EpochState>,
-    /// The compute status (success/failure) of the given payload. The specific details are opaque
-    /// for StateMachineReplication, which is merely passing it between StateComputer and
-    /// TxnManager.
-    compute_status: Vec<TransactionStatus>,
-
-    /// The transaction info hashes of all success txns.
-    transaction_info_hashes: Vec<HashValue>,
-
-    /// The signature of the VoteProposal corresponding to this block.
-    signature: Option<Ed25519Signature>,
-
-    reconfig_events: Vec<ContractEvent>,
+/// Used in both state sync and consensus to filter the txn events that should be subscribable by node components.
+pub fn should_forward_to_subscription_service(event: &ContractEvent) -> bool {
+    let type_tag = event.type_tag();
+    type_tag == OBSERVED_JWK_UPDATED_MOVE_TYPE_TAG.deref()
+        || type_tag == DKG_START_EVENT_MOVE_TYPE_TAG.deref()
+        || type_tag == NEW_EPOCH_EVENT_MOVE_TYPE_TAG.deref()
+        || type_tag == NEW_EPOCH_EVENT_V2_MOVE_TYPE_TAG.deref()
 }
 
-impl StateComputeResult {
-    pub fn new(
-        root_hash: HashValue,
-        frozen_subtree_roots: Vec<HashValue>,
-        num_leaves: u64,
-        parent_frozen_subtree_roots: Vec<HashValue>,
-        parent_num_leaves: u64,
-        epoch_state: Option<EpochState>,
-        compute_status: Vec<TransactionStatus>,
-        transaction_info_hashes: Vec<HashValue>,
-        reconfig_events: Vec<ContractEvent>,
-    ) -> Self {
-        Self {
-            root_hash,
-            frozen_subtree_roots,
-            num_leaves,
-            parent_frozen_subtree_roots,
-            parent_num_leaves,
-            epoch_state,
-            compute_status,
-            transaction_info_hashes,
-            reconfig_events,
-            signature: None,
-        }
-    }
-
-    /// generate a new dummy state compute result with a given root hash.
-    /// this function is used in RandomComputeResultStateComputer to assert that the compute
-    /// function is really called.
-    pub fn new_dummy_with_root_hash(root_hash: HashValue) -> Self {
-        Self {
-            root_hash,
-            frozen_subtree_roots: vec![],
-            num_leaves: 0,
-            parent_frozen_subtree_roots: vec![],
-            parent_num_leaves: 0,
-            epoch_state: None,
-            compute_status: vec![],
-            transaction_info_hashes: vec![],
-            reconfig_events: vec![],
-            signature: None,
-        }
-    }
-
-    /// generate a new dummy state compute result with ACCUMULATOR_PLACEHOLDER_HASH as the root hash.
-    /// this function is used in ordering_state_computer as a dummy state compute result,
-    /// where the real compute result is generated after ordering_state_computer.commit pushes
-    /// the blocks and the finality proof to the execution phase.
-    pub fn new_dummy() -> Self {
-        StateComputeResult::new_dummy_with_root_hash(*ACCUMULATOR_PLACEHOLDER_HASH)
-    }
-}
-
-impl StateComputeResult {
-    pub fn version(&self) -> Version {
-        max(self.num_leaves, 1)
-            .checked_sub(1)
-            .expect("Integer overflow occurred")
-    }
-
-    pub fn root_hash(&self) -> HashValue {
-        self.root_hash
-    }
-
-    pub fn compute_status(&self) -> &Vec<TransactionStatus> {
-        &self.compute_status
-    }
-
-    pub fn epoch_state(&self) -> &Option<EpochState> {
-        &self.epoch_state
-    }
-
-    pub fn extension_proof(&self) -> AccumulatorExtensionProof<TransactionAccumulatorHasher> {
-        AccumulatorExtensionProof::<TransactionAccumulatorHasher>::new(
-            self.parent_frozen_subtree_roots.clone(),
-            self.parent_num_leaves(),
-            self.transaction_info_hashes().clone(),
-        )
-    }
-
-    pub fn transaction_info_hashes(&self) -> &Vec<HashValue> {
-        &self.transaction_info_hashes
-    }
-
-    pub fn num_leaves(&self) -> u64 {
-        self.num_leaves
-    }
-
-    pub fn frozen_subtree_roots(&self) -> &Vec<HashValue> {
-        &self.frozen_subtree_roots
-    }
-
-    pub fn parent_num_leaves(&self) -> u64 {
-        self.parent_num_leaves
-    }
-
-    pub fn parent_frozen_subtree_roots(&self) -> &Vec<HashValue> {
-        &self.parent_frozen_subtree_roots
-    }
-
-    pub fn has_reconfiguration(&self) -> bool {
-        self.epoch_state.is_some()
-    }
-
-    pub fn reconfig_events(&self) -> &[ContractEvent] {
-        &self.reconfig_events
-    }
-
-    pub fn signature(&self) -> &Option<Ed25519Signature> {
-        &self.signature
-    }
-
-    pub fn set_signature(&mut self, sig: Ed25519Signature) {
-        self.signature = Some(sig);
-    }
-}
-
-/// A wrapper of the in-memory state sparse merkle tree and the transaction accumulator that
-/// represent a specific state collectively. Usually it is a state after executing a block.
-#[derive(Clone, Debug)]
-pub struct ExecutedTrees {
-    /// The in-memory representation of state after execution.
-    state: InMemoryState,
-
-    /// The in-memory Merkle Accumulator representing a blockchain state consistent with the
-    /// `state_tree`.
-    transaction_accumulator: Arc<InMemoryAccumulator<TransactionAccumulatorHasher>>,
-}
-
-impl ExecutedTrees {
-    pub fn state(&self) -> &InMemoryState {
-        &self.state
-    }
-
-    pub fn txn_accumulator(&self) -> &Arc<InMemoryAccumulator<TransactionAccumulatorHasher>> {
-        &self.transaction_accumulator
-    }
-
-    pub fn version(&self) -> Option<Version> {
-        let num_elements = self.txn_accumulator().num_leaves() as u64;
-        num_elements.checked_sub(1)
-    }
-
-    pub fn state_id(&self) -> HashValue {
-        self.txn_accumulator().root_hash()
-    }
-
-    pub fn new(
-        state: InMemoryState,
-        transaction_accumulator: Arc<InMemoryAccumulator<TransactionAccumulatorHasher>>,
-    ) -> Self {
-        Self {
-            state,
-            transaction_accumulator,
-        }
-    }
-
-    pub fn new_at_state_checkpoint(
-        state_root_hash: HashValue,
-        frozen_subtrees_in_accumulator: Vec<HashValue>,
-        num_leaves_in_accumulator: u64,
-    ) -> Self {
-        let state = InMemoryState::new_at_checkpoint(
-            state_root_hash,
-            num_leaves_in_accumulator.checked_sub(1),
-        );
-        let transaction_accumulator = Arc::new(
-            InMemoryAccumulator::new(frozen_subtrees_in_accumulator, num_leaves_in_accumulator)
-                .expect("The startup info read from storage should be valid."),
-        );
-
-        Self::new(state, transaction_accumulator)
-    }
-
-    pub fn new_empty() -> Self {
-        Self::new(
-            InMemoryState::new_empty(),
-            Arc::new(InMemoryAccumulator::new_empty()),
-        )
-    }
-
-    pub fn is_same_view(&self, rhs: &Self) -> bool {
-        self.transaction_accumulator.root_hash() == rhs.transaction_accumulator.root_hash()
-    }
-
-    pub fn state_view(
-        &self,
-        persisted_view: &Self,
-        id: StateViewId,
-        reader: Arc<dyn DbReader>,
-    ) -> VerifiedStateView {
-        VerifiedStateView::new(
-            id,
-            reader.clone(),
-            persisted_view.state.checkpoint_version,
-            persisted_view.state.checkpoint_root_hash(),
-            self.state.current.clone(),
-        )
-    }
-}
-
-impl Default for ExecutedTrees {
-    fn default() -> Self {
-        Self::new_empty()
-    }
-}
-
-pub struct ProofReader {
-    proofs: HashMap<HashValue, SparseMerkleProof>,
-}
-
-impl ProofReader {
-    pub fn new(proofs: HashMap<HashValue, SparseMerkleProof>) -> Self {
-        ProofReader { proofs }
-    }
-
-    pub fn new_empty() -> Self {
-        Self::new(HashMap::new())
-    }
-}
-
-impl ProofRead for ProofReader {
-    fn get_proof(&self, key: HashValue) -> Option<&SparseMerkleProof> {
-        self.proofs.get(&key)
-    }
-}
-
-/// The entire set of data associated with a transaction. In addition to the output generated by VM
-/// which includes the write set and events, this also has the in-memory trees.
-#[derive(Clone, Debug)]
-pub struct TransactionData {
-    /// Each entry in this map represents the new value of a store store object touched by this
-    /// transaction.
-    state_updates: HashMap<StateKey, StateValue>,
-
-    /// Each entry in this map represents the the hash of a newly generated jellyfish node
-    /// and its corresponding nibble path.
-    jf_node_hashes: HashMap<NibblePath, HashValue>,
-
-    /// The writeset generated from this transaction.
-    write_set: WriteSet,
-
-    /// The list of events emitted during this transaction.
-    events: Vec<ContractEvent>,
-
-    /// List of reconfiguration events emitted during this transaction.
-    reconfig_events: Vec<ContractEvent>,
-
-    /// The execution status set by the VM.
-    status: TransactionStatus,
-
-    /// The in-memory Merkle Accumulator that has all events emitted by this transaction.
-    event_tree: Arc<InMemoryAccumulator<EventAccumulatorHasher>>,
-
-    /// The amount of gas used.
-    gas_used: u64,
-
-    /// TransactionInfo
-    txn_info: TransactionInfo,
-
-    /// TransactionInfo.hash()
-    txn_info_hash: HashValue,
-}
-
-impl TransactionData {
-    pub fn new(
-        state_updates: HashMap<StateKey, StateValue>,
-        jf_node_hashes: HashMap<NibblePath, HashValue>,
-        write_set: WriteSet,
-        events: Vec<ContractEvent>,
-        reconfig_events: Vec<ContractEvent>,
-        status: TransactionStatus,
-        event_tree: Arc<InMemoryAccumulator<EventAccumulatorHasher>>,
-        gas_used: u64,
-        txn_info: TransactionInfo,
-        txn_info_hash: HashValue,
-    ) -> Self {
-        TransactionData {
-            state_updates,
-            jf_node_hashes,
-            write_set,
-            events,
-            reconfig_events,
-            status,
-            event_tree,
-            gas_used,
-            txn_info,
-            txn_info_hash,
-        }
-    }
-
-    pub fn state_updates(&self) -> &HashMap<StateKey, StateValue> {
-        &self.state_updates
-    }
-
-    pub fn jf_node_hashes(&self) -> &HashMap<NibblePath, HashValue> {
-        &self.jf_node_hashes
-    }
-
-    pub fn write_set(&self) -> &WriteSet {
-        &self.write_set
-    }
-
-    pub fn events(&self) -> &[ContractEvent] {
-        &self.events
-    }
-
-    pub fn status(&self) -> &TransactionStatus {
-        &self.status
-    }
-
-    pub fn event_root_hash(&self) -> HashValue {
-        self.event_tree.root_hash()
-    }
-
-    pub fn gas_used(&self) -> u64 {
-        self.gas_used
-    }
-
-    pub fn txn_info_hash(&self) -> HashValue {
-        self.txn_info_hash
-    }
+#[cfg(feature = "bench")]
+pub fn should_forward_to_subscription_service_old(event: &ContractEvent) -> bool {
+    matches!(
+        event.type_tag().to_string().as_str(),
+        "0x1::reconfiguration::NewEpochEvent"
+            | "0x1::dkg::DKGStartEvent"
+            | "\
+            0x1::jwks::ObservedJWKsUpdated"
+    )
 }

@@ -1,8 +1,9 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::AptosDB;
+use crate::{db::AptosDB, event_store::EventStore};
 use aptos_crypto::hash::ACCUMULATOR_PLACEHOLDER_HASH;
 use aptos_proptest_helpers::Index;
 use aptos_temppath::TempPath;
@@ -13,7 +14,7 @@ use aptos_types::{
     proptest_types::{AccountInfoUniverse, ContractEventGen},
 };
 use itertools::Itertools;
-use move_deps::move_core_types::{language_storage::TypeTag, move_resource::MoveStructType};
+use move_core_types::{language_storage::TypeTag, move_resource::MoveStructType};
 use proptest::{
     collection::{hash_set, vec},
     prelude::*,
@@ -22,100 +23,13 @@ use proptest::{
 use rand::Rng;
 use std::collections::HashMap;
 
-fn save(store: &EventStore, version: Version, events: &[ContractEvent]) -> HashValue {
-    let mut cs = ChangeSet::new();
-    let root_hash = store.put_events(version, events, &mut cs).unwrap();
-    assert_eq!(
-        cs.counter_bumps(version).get(LedgerCounter::EventsCreated),
-        events.len()
-    );
-    store.db.write_schemas(cs.batch).unwrap();
-
-    root_hash
-}
-
-#[test]
-fn test_put_empty() {
-    let tmp_dir = TempPath::new();
-    let db = AptosDB::new_for_test(&tmp_dir);
-    let store = &db.event_store;
-    let mut cs = ChangeSet::new();
-    assert_eq!(
-        store.put_events(0, &[], &mut cs).unwrap(),
-        *ACCUMULATOR_PLACEHOLDER_HASH
-    );
-}
-
 #[test]
 fn test_error_on_get_from_empty() {
     let tmp_dir = TempPath::new();
     let db = AptosDB::new_for_test(&tmp_dir);
     let store = &db.event_store;
 
-    assert!(store
-        .get_event_with_proof_by_version_and_index(100, 0)
-        .is_err());
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(10))]
-
-    #[test]
-    fn test_put_get_verify(events in vec(any::<ContractEvent>().no_shrink(), 1..100)) {
-        let tmp_dir = TempPath::new();
-        let db = AptosDB::new_for_test(&tmp_dir);
-        let store = &db.event_store;
-
-        let root_hash = save(store, 100, &events);
-
-        // get and verify each and every event with proof
-        for (idx, expected_event) in events.iter().enumerate() {
-            let (event, proof) = store
-                .get_event_with_proof_by_version_and_index(100, idx as u64)
-                .unwrap();
-            prop_assert_eq!(&event, expected_event);
-            proof.verify(root_hash, event.hash(), idx as u64).unwrap();
-        }
-        // error on index >= num_events
-        prop_assert!(store
-            .get_event_with_proof_by_version_and_index(100, events.len() as u64)
-            .is_err());
-    }
-
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1))]
-
-    #[test]
-    fn test_get_all_events_by_version(
-        events1 in vec(any::<ContractEvent>().no_shrink(), 1..100),
-        events2 in vec(any::<ContractEvent>().no_shrink(), 1..100),
-        events3 in vec(any::<ContractEvent>().no_shrink(), 1..100),
-    ) {
-
-        let tmp_dir = TempPath::new();
-        let db = AptosDB::new_for_test(&tmp_dir);
-        let store = &db.event_store;
-        // Save 3 chunks at different versions
-        save(store, 99 /*version*/, &events1);
-        save(store, 100 /*version*/, &events2);
-        save(store, 101 /*version*/, &events3);
-
-        // Now get all events at each version and verify that it matches what is expected.
-        let events_99 = store.get_events_by_version(99 /*version*/).unwrap();
-        prop_assert_eq!(events_99, events1);
-
-        let events_100 = store.get_events_by_version(100 /*version*/).unwrap();
-        prop_assert_eq!(events_100, events2);
-
-        let events_101 = store.get_events_by_version(101 /*version*/).unwrap();
-        prop_assert_eq!(events_101, events3);
-
-        // Now query a version that doesn't exist and verify that no results come back
-        let events_102 = store.get_events_by_version(102 /*version*/).unwrap();
-        prop_assert_eq!(events_102.len(), 0);
-    }
+    assert!(store.get_event_by_version_and_index(100, 0).is_err());
 }
 
 fn traverse_events_by_key(
@@ -154,12 +68,7 @@ fn traverse_events_by_key(
 
     event_keys
         .into_iter()
-        .map(|(_seq, ver, idx)| {
-            store
-                .get_event_with_proof_by_version_and_index(ver, idx)
-                .unwrap()
-                .0
-        })
+        .map(|(_seq, ver, idx)| store.get_event_by_version_and_index(ver, idx).unwrap())
         .collect()
 }
 
@@ -189,16 +98,19 @@ fn test_index_get_impl(event_batches: Vec<Vec<ContractEvent>>) {
     let tmp_dir = TempPath::new();
     let db = AptosDB::new_for_test(&tmp_dir);
     let store = &db.event_store;
+    let event_db = &db.ledger_db.event_db();
 
-    let mut cs = ChangeSet::new();
+    let mut batch = SchemaBatch::new();
     event_batches.iter().enumerate().for_each(|(ver, events)| {
-        store.put_events(ver as u64, events, &mut cs).unwrap();
+        event_db
+            .put_events(ver as u64, events, /*skip_index=*/ false, &mut batch)
+            .unwrap();
     });
-    store.db.write_schemas(cs.batch);
+    event_db.write_schemas(batch);
     let ledger_version_plus_one = event_batches.len() as u64;
 
     assert_eq!(
-        store
+        event_db
             .get_events_by_version_iter(0, event_batches.len())
             .unwrap()
             .collect::<Result<Vec<_>>>()
@@ -212,12 +124,19 @@ fn test_index_get_impl(event_batches: Vec<Vec<ContractEvent>>) {
         .into_iter()
         .enumerate()
         .for_each(|(ver, batch)| {
-            batch.into_iter().for_each(|e| {
-                let mut events_and_versions =
-                    events_by_event_key.entry(*e.key()).or_insert_with(Vec::new);
-                assert_eq!(events_and_versions.len() as u64, e.sequence_number());
-                events_and_versions.push((e, ver as Version));
-            })
+            batch
+                .into_iter()
+                .filter(|e| matches!(e, ContractEvent::V1(_)))
+                .for_each(|e| {
+                    let mut events_and_versions = events_by_event_key
+                        .entry(*e.v1().unwrap().key())
+                        .or_insert_with(Vec::new);
+                    assert_eq!(
+                        events_and_versions.len() as u64,
+                        e.v1().unwrap().sequence_number()
+                    );
+                    events_and_versions.push((e, ver as Version));
+                })
         });
 
     // Fetch and check.
@@ -267,6 +186,7 @@ fn test_index_get_impl(event_batches: Vec<Vec<ContractEvent>>) {
 
 prop_compose! {
     fn arb_new_block_events()(
+        hash in any::<AccountAddress>(),
         address in any::<AccountAddress>(),
         mut version in 1..10000u64,
         mut timestamp in 0..1000000u64, // initial timestamp
@@ -283,15 +203,19 @@ prop_compose! {
             version += v;
             timestamp += t;
             let new_block_event = NewBlockEvent::new(
+                hash,
+                0, // epoch
                 seq, // round
+                seq, // height
+                vec![], // prev block voters
                 address, // proposer
-                Vec::new(), // prev block voters
+                Vec::new(), // failed_proposers
                 timestamp,
             );
-            let event = ContractEvent::new(
+            let event = ContractEvent::new_v1(
                 new_block_event_key(),
                 seq,
-                TypeTag::Struct(NewBlockEvent::struct_tag()),
+                TypeTag::Struct(Box::new(NewBlockEvent::struct_tag())),
                 bcs::to_bytes(&new_block_event).unwrap(),
             );
             seq += 1;
@@ -304,17 +228,23 @@ fn test_get_last_version_before_timestamp_impl(new_block_events: Vec<(Version, C
     let tmp_dir = TempPath::new();
     let db = AptosDB::new_for_test(&tmp_dir);
     let store = &db.event_store;
+    let event_db = &db.ledger_db.event_db();
     // error on no blocks
     assert!(store.get_last_version_before_timestamp(1000, 2000).is_err());
 
     // save events to db
-    let mut cs = ChangeSet::new();
+    let mut batch = SchemaBatch::new();
     new_block_events.iter().for_each(|(ver, event)| {
-        store
-            .put_events(*ver as u64, &[event.clone()], &mut cs)
+        event_db
+            .put_events(
+                *ver,
+                &[event.clone()],
+                /*skip_index=*/ false,
+                &mut batch,
+            )
             .unwrap();
     });
-    store.db.write_schemas(cs.batch);
+    event_db.write_schemas(batch);
 
     let ledger_version = new_block_events.last().unwrap().0;
 
@@ -362,6 +292,8 @@ fn test_get_last_version_before_timestamp_impl(new_block_events: Vec<(Version, C
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
     #[test]
     fn test_get_last_version_before_timestamp(new_block_events in arb_new_block_events()) {
         test_get_last_version_before_timestamp_impl(new_block_events)

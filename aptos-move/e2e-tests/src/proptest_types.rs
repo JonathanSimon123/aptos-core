@@ -1,18 +1,19 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::account::{Account, AccountData, AccountRoleSpecifier};
+use crate::account::{Account, AccountData};
 use proptest::prelude::*;
 
 impl Arbitrary for Account {
     type Parameters = ();
+    type Strategy = fn() -> Account;
+
     fn arbitrary_with(_params: ()) -> Self::Strategy {
         // Provide Account::new as the canonical strategy. This means that no shrinking will happen,
         // but that's fine as accounts have nothing to shrink inside them anyway.
         Account::new as Self::Strategy
     }
-
-    type Strategy = fn() -> Account;
 }
 
 impl AccountData {
@@ -39,7 +40,6 @@ impl AccountData {
                         sequence_number,
                         sent_events_count,
                         received_events_count,
-                        AccountRoleSpecifier::default(), // TODO: Vary account type?
                     )
                 },
             )

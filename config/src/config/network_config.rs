@@ -1,14 +1,18 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    config::{Error, IdentityBlob, SecureBackend},
-    keys::ConfigKey,
+    config::{
+        identity_config::{Identity, IdentityFromStorage},
+        Error, IdentityBlob,
+    },
     network_id::NetworkId,
     utils,
 };
 use aptos_crypto::{x25519, Uniform};
 use aptos_secure_storage::{CryptoStorage, KVStorage, Storage};
+use aptos_short_hex_str::AsShortHexStr;
 use aptos_types::{
     account_address::from_identity_public_key, network_address::NetworkAddress,
     transaction::authenticator::AuthenticationKey, PeerId,
@@ -18,31 +22,33 @@ use rand::{
     Rng, SeedableRng,
 };
 use serde::{Deserialize, Serialize};
-use short_hex_str::AsShortHexStr;
 use std::{
     collections::{HashMap, HashSet},
     convert::TryFrom,
+    fmt,
     path::PathBuf,
     string::ToString,
-    time::Duration,
 };
 
 // TODO: We could possibly move these constants somewhere else, but since they are defaults for the
 //   configurations of the system, we'll leave it here for now.
 /// Current supported protocol negotiation handshake version. See
-/// [`network::protocols::wire::v1`](../../network/protocols/wire/handshake/v1/index.html).
+/// [`aptos_network::protocols::wire::v1`](../../network/protocols/wire/handshake/v1/index.html).
 pub const HANDSHAKE_VERSION: u8 = 0;
 pub const NETWORK_CHANNEL_SIZE: usize = 1024;
 pub const PING_INTERVAL_MS: u64 = 10_000;
 pub const PING_TIMEOUT_MS: u64 = 20_000;
-pub const PING_FAILURES_TOLERATED: u64 = 5;
+pub const PING_FAILURES_TOLERATED: u64 = 3;
 pub const CONNECTIVITY_CHECK_INTERVAL_MS: u64 = 5000;
-pub const MAX_CONCURRENT_NETWORK_REQS: usize = 100;
 pub const MAX_CONNECTION_DELAY_MS: u64 = 60_000; /* 1 minute */
-// Max default fullnode outbound connections is now 2 to decrease load on network
-pub const MAX_FULLNODE_OUTBOUND_CONNECTIONS: usize = 2;
+pub const MAX_FULLNODE_OUTBOUND_CONNECTIONS: usize = 6;
 pub const MAX_INBOUND_CONNECTIONS: usize = 100;
-pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; /* 16 MiB */
+pub const MAX_MESSAGE_METADATA_SIZE: usize = 128 * 1024; /* 128 KiB: a buffer for metadata that might be added to messages by networking */
+pub const MESSAGE_PADDING_SIZE: usize = 2 * 1024 * 1024; /* 2 MiB: a safety buffer to allow messages to get larger during serialization */
+pub const MAX_APPLICATION_MESSAGE_SIZE: usize =
+    (MAX_MESSAGE_SIZE - MAX_MESSAGE_METADATA_SIZE) - MESSAGE_PADDING_SIZE; /* The message size that applications should check against */
+pub const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024; /* 4 MiB large messages will be chunked into multiple frames and streamed */
+pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024; /* 64 MiB */
 pub const CONNECTION_BACKOFF_BASE: u64 = 2;
 pub const IP_BYTE_BUCKET_RATE: usize = 102400 /* 100 KiB */;
 pub const IP_BYTE_BUCKET_SIZE: usize = IP_BYTE_BUCKET_RATE;
@@ -50,53 +56,74 @@ pub const IP_BYTE_BUCKET_SIZE: usize = IP_BYTE_BUCKET_RATE;
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkConfig {
-    // Maximum backoff delay for connecting outbound to peers
+    /// Maximum backoff delay for connecting outbound to peers
     pub max_connection_delay_ms: u64,
-    // Base for outbound connection backoff
+    /// Base for outbound connection backoff
     pub connection_backoff_base: u64,
-    // Rate to check connectivity to connected peers
+    /// Rate to check connectivity to connected peers
     pub connectivity_check_interval_ms: u64,
-    // Size of all network channels
+    /// Size of all network channels
     pub network_channel_size: usize,
-    // Maximum number of concurrent network requests
-    pub max_concurrent_network_reqs: usize,
-    // Choose a protocol to discover and dial out to other peers on this network.
-    // `DiscoveryMethod::None` disables discovery and dialing out (unless you have
-    // seed peers configured).
+    /// Choose a protocol to discover and dial out to other peers on this network.
+    /// `DiscoveryMethod::None` disables discovery and dialing out (unless you have
+    /// seed peers configured).
     pub discovery_method: DiscoveryMethod,
+    /// Same as `discovery_method` but allows for multiple
     pub discovery_methods: Vec<DiscoveryMethod>,
+    /// Identity of this network
     pub identity: Identity,
     // TODO: Add support for multiple listen/advertised addresses in config.
-    // The address that this node is listening on for new connections.
+    /// The address that this node is listening on for new connections.
     pub listen_address: NetworkAddress,
-    // Select this to enforce that both peers should authenticate each other, otherwise
-    // authentication only occurs for outgoing connections.
+    /// Select this to enforce that both peers should authenticate each other, otherwise
+    /// authentication only occurs for outgoing connections.
     pub mutual_authentication: bool,
+    /// ID of the network to differentiate between networks
     pub network_id: NetworkId,
-    // Addresses of initial peers to connect to. In a mutual_authentication network,
-    // we will extract the public keys from these addresses to set our initial
-    // trusted peers set.  TODO: Replace usage in configs with `seeds` this is for backwards compatibility
+    /// Number of threads to run for networking
+    pub runtime_threads: Option<usize>,
+    /// Overrides for the size of the inbound and outbound buffers for each peer.
+    /// NOTE: The defaults are None, so socket options are not called. Change to Some values with
+    /// caution. Experiments have shown that relying on Linux's default tcp auto-tuning can perform
+    /// better than setting these. In particular, for larger values to take effect, the
+    /// `net.core.rmem_max` and `net.core.wmem_max` sysctl values may need to be increased. On a
+    /// vanilla GCP machine, these are set to 212992. Without increasing the sysctl values and
+    /// setting a value will constrain the buffer size to the sysctl value. (In contrast, default
+    /// auto-tuning can increase beyond these values.)
+    pub inbound_rx_buffer_size_bytes: Option<u32>,
+    pub inbound_tx_buffer_size_bytes: Option<u32>,
+    pub outbound_rx_buffer_size_bytes: Option<u32>,
+    pub outbound_tx_buffer_size_bytes: Option<u32>,
+    /// Addresses of initial peers to connect to. In a mutual_authentication network,
+    /// we will extract the public keys from these addresses to set our initial
+    /// trusted peers set.  TODO: Replace usage in configs with `seeds` this is for backwards compatibility
     pub seed_addrs: HashMap<PeerId, Vec<NetworkAddress>>,
-    // The initial peers to connect to prior to onchain discovery
+    /// The initial peers to connect to prior to onchain discovery
     pub seeds: PeerSet,
-    // The maximum size of an inbound or outbound request frame
+    /// The maximum size of an inbound or outbound request frame
     pub max_frame_size: usize,
-    // Enables proxy protocol on incoming connections to get original source addresses
+    /// Enables proxy protocol on incoming connections to get original source addresses
     pub enable_proxy_protocol: bool,
-    // Interval to send healthcheck pings to peers
+    /// Interval to send healthcheck pings to peers
     pub ping_interval_ms: u64,
-    // Timeout until a healthcheck ping is rejected
+    /// Timeout until a healthcheck ping is rejected
     pub ping_timeout_ms: u64,
-    // Number of failed healthcheck pings until a peer is marked unhealthy
+    /// Number of failed healthcheck pings until a peer is marked unhealthy
     pub ping_failures_tolerated: u64,
-    // Maximum number of outbound connections, limited by ConnectivityManager
+    /// Maximum number of outbound connections, limited by ConnectivityManager
     pub max_outbound_connections: usize,
-    // Maximum number of outbound connections, limited by PeerManager
+    /// Maximum number of outbound connections, limited by PeerManager
     pub max_inbound_connections: usize,
-    // Inbound rate limiting configuration, if not specified, no rate limiting
+    /// Inbound rate limiting configuration, if not specified, no rate limiting
     pub inbound_rate_limit_config: Option<RateLimitConfig>,
-    // Outbound rate limiting configuration, if not specified, no rate limiting
+    /// Outbound rate limiting configuration, if not specified, no rate limiting
     pub outbound_rate_limit_config: Option<RateLimitConfig>,
+    /// The maximum size of an inbound or outbound message (it may be divided into multiple frame)
+    pub max_message_size: usize,
+    /// The maximum number of parallel message deserialization tasks that can run (per application)
+    pub max_parallel_deserialization_tasks: Option<usize>,
+    /// Whether or not to enable latency aware peer dialing
+    pub enable_latency_aware_dialing: bool,
 }
 
 impl Default for NetworkConfig {
@@ -107,13 +134,15 @@ impl Default for NetworkConfig {
 
 impl NetworkConfig {
     pub fn network_with_id(network_id: NetworkId) -> NetworkConfig {
+        let mutual_authentication = network_id.is_validator_network();
         let mut config = Self {
             discovery_method: DiscoveryMethod::None,
             discovery_methods: Vec::new(),
             identity: Identity::None,
             listen_address: "/ip4/0.0.0.0/tcp/6180".parse().unwrap(),
-            mutual_authentication: false,
+            mutual_authentication,
             network_id,
+            runtime_threads: None,
             seed_addrs: HashMap::new(),
             seeds: PeerSet::default(),
             max_frame_size: MAX_FRAME_SIZE,
@@ -121,7 +150,6 @@ impl NetworkConfig {
             max_connection_delay_ms: MAX_CONNECTION_DELAY_MS,
             connectivity_check_interval_ms: CONNECTIVITY_CHECK_INTERVAL_MS,
             network_channel_size: NETWORK_CHANNEL_SIZE,
-            max_concurrent_network_reqs: MAX_CONCURRENT_NETWORK_REQS,
             connection_backoff_base: CONNECTION_BACKOFF_BASE,
             ping_interval_ms: PING_INTERVAL_MS,
             ping_timeout_ms: PING_TIMEOUT_MS,
@@ -130,13 +158,33 @@ impl NetworkConfig {
             max_inbound_connections: MAX_INBOUND_CONNECTIONS,
             inbound_rate_limit_config: None,
             outbound_rate_limit_config: None,
+            max_message_size: MAX_MESSAGE_SIZE,
+            inbound_rx_buffer_size_bytes: None,
+            inbound_tx_buffer_size_bytes: None,
+            outbound_rx_buffer_size_bytes: None,
+            outbound_tx_buffer_size_bytes: None,
+            max_parallel_deserialization_tasks: None,
+            enable_latency_aware_dialing: true,
         };
+
+        // Configure the number of parallel deserialization tasks
+        config.configure_num_deserialization_tasks();
+
+        // Prepare the identity based on the identity format
         config.prepare_identity();
+
         config
     }
-}
 
-impl NetworkConfig {
+    /// Configures the number of parallel deserialization tasks
+    /// based on the number of CPU cores of the machine. This is
+    /// only done if the config does not specify a value.
+    fn configure_num_deserialization_tasks(&mut self) {
+        if self.max_parallel_deserialization_tasks.is_none() {
+            self.max_parallel_deserialization_tasks = Some(num_cpus::get());
+        }
+    }
+
     pub fn identity_key(&self) -> x25519::PrivateKey {
         let key = match &self.identity {
             Identity::FromConfig(config) => Some(config.key.private_key()),
@@ -148,11 +196,11 @@ impl NetworkConfig {
                 let key = x25519::PrivateKey::from_ed25519_private_bytes(&key.to_bytes())
                     .expect("Unable to convert key");
                 Some(key)
-            }
+            },
             Identity::FromFile(config) => {
                 let identity_blob: IdentityBlob = IdentityBlob::from_file(&config.path).unwrap();
-                Some(identity_blob.network_key)
-            }
+                Some(identity_blob.network_private_key)
+            },
             Identity::None => None,
         };
         key.expect("identity key should be present")
@@ -180,29 +228,17 @@ impl NetworkConfig {
         }
     }
 
-    /// Per convenience, so that NetworkId isn't needed to be specified for `validator_networks`
-    pub fn load_validator_network(&mut self) -> Result<(), Error> {
-        self.network_id = NetworkId::Validator;
-        self.load()
-    }
-
-    pub fn load_fullnode_network(&mut self) -> Result<(), Error> {
-        if self.network_id.is_validator_network() {
-            return Err(Error::InvariantViolation(format!(
-                "Set {} network for a non-validator network",
-                self.network_id
-            )));
-        }
-        self.load()
-    }
-
-    fn load(&mut self) -> Result<(), Error> {
+    pub fn set_listen_address_and_prepare_identity(&mut self) -> Result<(), Error> {
+        // Set the listen address to the local IP if it is not specified
         if self.listen_address.to_string().is_empty() {
-            self.listen_address = utils::get_local_ip()
-                .ok_or_else(|| Error::InvariantViolation("No local IP".to_string()))?;
+            self.listen_address = utils::get_local_ip().ok_or_else(|| {
+                Error::InvariantViolation("Failed to get the Local IP".to_string())
+            })?;
         }
 
+        // Prepare the identity
         self.prepare_identity();
+
         Ok(())
     }
 
@@ -216,7 +252,7 @@ impl NetworkConfig {
                     .expect("Unable to read peer id")
                     .value;
                 Some(peer_id)
-            }
+            },
             Identity::FromFile(config) => {
                 let identity_blob: IdentityBlob = IdentityBlob::from_file(&config.path).unwrap();
 
@@ -225,10 +261,10 @@ impl NetworkConfig {
                     Some(address)
                 } else {
                     Some(from_identity_public_key(
-                        identity_blob.network_key.public_key(),
+                        identity_blob.network_private_key.public_key(),
                     ))
                 }
-            }
+            },
             Identity::None => None,
         }
         .expect("peer id should be present")
@@ -240,17 +276,14 @@ impl NetworkConfig {
             Identity::None => {
                 let mut rng = StdRng::from_seed(OsRng.gen());
                 let key = x25519::PrivateKey::generate(&mut rng);
-                let peer_id =
-                    aptos_types::account_address::from_identity_public_key(key.public_key());
-                self.identity = Identity::from_config(key, peer_id);
-            }
+                let peer_id = from_identity_public_key(key.public_key());
+                self.identity = Identity::from_config_auto_generated(key, peer_id);
+            },
             Identity::FromConfig(config) => {
-                let peer_id =
-                    aptos_types::account_address::from_identity_public_key(config.key.public_key());
                 if config.peer_id == PeerId::ZERO {
-                    config.peer_id = peer_id;
+                    config.peer_id = from_identity_public_key(config.key.public_key());
                 }
-            }
+            },
             Identity::FromFile(_) => (),
         };
     }
@@ -266,20 +299,21 @@ impl NetworkConfig {
         } else {
             AuthenticationKey::try_from(identity_key.public_key().as_slice())
                 .unwrap()
-                .derived_address()
+                .account_address()
         };
         self.identity = Identity::from_config(identity_key, peer_id);
     }
 
     fn verify_address(peer_id: &PeerId, addr: &NetworkAddress) -> Result<(), Error> {
-        crate::config::invariant(
-            addr.is_aptosnet_addr(),
-            format!(
+        if !addr.is_aptosnet_addr() {
+            return Err(Error::InvariantViolation(format!(
                 "Unexpected seed peer address format: peer_id: {}, addr: '{}'",
                 peer_id.short_str(),
                 addr,
-            ),
-        )
+            )));
+        }
+
+        Ok(())
     }
 
     // Verifies both the `seed_addrs` and `seeds` before they're merged
@@ -296,10 +330,12 @@ impl NetworkConfig {
             }
 
             // Require there to be a pubkey somewhere, either in the address (assumed by `is_aptosnet_addr`)
-            crate::config::invariant(
-                !seed.keys.is_empty() || !seed.addresses.is_empty(),
-                format!("Seed peer {} has no pubkeys", peer_id.short_str()),
-            )?;
+            if seed.keys.is_empty() && seed.addresses.is_empty() {
+                return Err(Error::InvariantViolation(format!(
+                    "Seed peer {} has no pubkeys",
+                    peer_id.short_str(),
+                )));
+            }
         }
         Ok(())
     }
@@ -309,63 +345,26 @@ impl NetworkConfig {
 #[serde(rename_all = "snake_case")]
 pub enum DiscoveryMethod {
     Onchain,
-    File(PathBuf, Duration),
+    File(FileDiscovery),
+    Rest(RestDiscovery),
     None,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
-pub enum Identity {
-    FromConfig(IdentityFromConfig),
-    FromStorage(IdentityFromStorage),
-    FromFile(IdentityFromFile),
-    None,
-}
-
-impl Identity {
-    pub fn from_config(key: x25519::PrivateKey, peer_id: PeerId) -> Self {
-        let key = ConfigKey::new(key);
-        Identity::FromConfig(IdentityFromConfig { key, peer_id })
-    }
-
-    pub fn from_storage(key_name: String, peer_id_name: String, backend: SecureBackend) -> Self {
-        Identity::FromStorage(IdentityFromStorage {
-            backend,
-            key_name,
-            peer_id_name,
-        })
-    }
-
-    pub fn from_file(path: PathBuf) -> Self {
-        Identity::FromFile(IdentityFromFile { path })
-    }
-}
-
-/// The identity is stored within the config.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdentityFromConfig {
-    #[serde(flatten)]
-    pub key: ConfigKey<x25519::PrivateKey>,
-    pub peer_id: PeerId,
-}
-
-/// This represents an identity in a secure-storage as defined in NodeConfig::secure.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdentityFromStorage {
-    pub backend: SecureBackend,
-    pub key_name: String,
-    pub peer_id_name: String,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdentityFromFile {
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct FileDiscovery {
     pub path: PathBuf,
+    pub interval_secs: u64,
 }
 
-#[derive(Copy, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RestDiscovery {
+    pub url: url::Url,
+    pub interval_secs: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
     /// Maximum number of bytes/s for an IP
@@ -404,7 +403,7 @@ pub type PeerSet = HashMap<PeerId, Peer>;
 /// Downstream -> Downstream, defining a controlled downstream that I always want to connect
 /// Known -> A known peer, but it has no particular role assigned to it
 /// Unknown -> Undiscovered peer, likely due to a non-mutually authenticated connection always downstream
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum PeerRole {
     Validator = 0,
     PreferredUpstream,
@@ -415,6 +414,28 @@ pub enum PeerRole {
     Unknown,
 }
 
+impl PeerRole {
+    pub fn is_validator(self) -> bool {
+        self == PeerRole::Validator
+    }
+
+    pub fn is_vfn(self) -> bool {
+        self == PeerRole::ValidatorFullNode
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PeerRole::Validator => "validator",
+            PeerRole::PreferredUpstream => "preferred_upstream_peer",
+            PeerRole::Upstream => "upstream_peer",
+            PeerRole::ValidatorFullNode => "validator_fullnode",
+            PeerRole::Downstream => "downstream_peer",
+            PeerRole::Known => "known_peer",
+            PeerRole::Unknown => "unknown_peer",
+        }
+    }
+}
+
 impl Default for PeerRole {
     /// Default to least trusted
     fn default() -> Self {
@@ -422,8 +443,20 @@ impl Default for PeerRole {
     }
 }
 
+impl fmt::Debug for PeerRole {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+impl fmt::Display for PeerRole {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// Represents a single seed configuration for a seed peer
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default)]
 pub struct Peer {
     pub addresses: Vec<NetworkAddress>,
@@ -452,13 +485,12 @@ impl Peer {
     /// Combines two `Peer`.  Note: Does not merge duplicate addresses
     /// TODO: Instead of rejecting, maybe pick one of the roles?
     pub fn extend(&mut self, other: Peer) -> Result<(), Error> {
-        crate::config::invariant(
-            self.role != other.role,
-            format!(
+        if self.role == other.role {
+            return Err(Error::InvariantViolation(format!(
                 "Roles don't match self {:?} vs other {:?}",
                 self.role, other.role
-            ),
-        )?;
+            )));
+        }
         self.addresses.extend(other.addresses);
         self.keys.extend(other.keys);
         Ok(())
@@ -470,5 +502,30 @@ impl Peer {
             .filter_map(NetworkAddress::find_noise_proto)
             .collect();
         Peer::new(addresses, keys, role)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_num_parallel_deserialization_tasks() {
+        // Create a default network config and verify the number of deserialization tasks
+        let network_config = NetworkConfig::default();
+        assert_eq!(
+            network_config.max_parallel_deserialization_tasks,
+            Some(num_cpus::get())
+        );
+
+        // Create a network config with the number of deserialization tasks set to 1
+        let mut network_config = NetworkConfig {
+            max_parallel_deserialization_tasks: Some(1),
+            ..NetworkConfig::default()
+        };
+
+        // Configure the number of deserialization tasks and verify that it is not overridden
+        network_config.configure_num_deserialization_tasks();
+        assert_eq!(network_config.max_parallel_deserialization_tasks, Some(1));
     }
 }

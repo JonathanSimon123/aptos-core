@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -10,7 +11,7 @@ use anyhow::ensure;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt};
+use std::{fmt, sync::Arc};
 
 /// EpochState represents a trusted validator set to validate messages from the specific epoch,
 /// it could be updated with EpochChangeProof.
@@ -18,14 +19,21 @@ use std::{collections::BTreeMap, fmt};
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct EpochState {
     pub epoch: u64,
-    pub verifier: ValidatorVerifier,
+    pub verifier: Arc<ValidatorVerifier>,
 }
 
 impl EpochState {
+    pub fn new(epoch: u64, verifier: ValidatorVerifier) -> Self {
+        Self {
+            epoch,
+            verifier: verifier.into(),
+        }
+    }
+
     pub fn empty() -> Self {
         Self {
             epoch: 0,
-            verifier: ValidatorVerifier::new(BTreeMap::new()),
+            verifier: Arc::new(ValidatorVerifier::new(vec![])),
         }
     }
 }

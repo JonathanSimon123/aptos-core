@@ -23,92 +23,106 @@ provider "helm" {
   }
 }
 
+locals {
+  # helm chart paths
+  aptos_node_helm_chart_path = var.helm_chart != "" ? var.helm_chart : "${path.module}/../../helm/aptos-node"
+  monitoring_helm_chart_path = "${path.module}/../../helm/monitoring"
+
+  # override the helm release name if an override exists, otherwise adopt the workspace name
+  helm_release_name = var.helm_release_name_override != "" ? var.helm_release_name_override : local.workspace_name
+}
+
 resource "helm_release" "validator" {
-  name        = terraform.workspace
-  chart       = var.helm_chart != "" ? var.helm_chart : "${path.module}/../../helm/aptos-node"
-  max_history = 100
+  name        = local.helm_release_name
+  chart       = local.aptos_node_helm_chart_path
+  max_history = 5
   wait        = false
 
   values = [
     jsonencode({
-      imageTag = var.image_tag
+      numValidators     = var.num_validators
+      numFullnodeGroups = var.num_fullnode_groups
+      imageTag          = var.image_tag
+      manageImages      = var.manage_via_tf # if we're managing the entire deployment via terraform, override the images as well
       chain = {
-      era        = var.era
-      chain_id   = var.chain_id
-      chain_name = var.chain_name
+        era      = var.era
+        chain_id = var.chain_id
+        name     = var.chain_name
       }
       validator = {
         name = var.validator_name
+        config = {
+          storage = {
+            rocksdb_configs = {
+              enable_storage_sharding = var.enable_storage_sharding
+            }
+          }
+        }
         storage = {
           class = kubernetes_storage_class.ssd.metadata[0].name
         }
-        nodeSelector = {
-          "cloud.google.com/gke-nodepool" = google_container_node_pool.validators.name
-        }
+        nodeSelector = var.validator_instance_enable_taint ? {
+          "cloud.google.com/gke-nodepool" = "validators"
+        } : {}
         tolerations = [{
-          key    = google_container_node_pool.validators.node_config[0].taint[0].key
-          value  = google_container_node_pool.validators.node_config[0].taint[0].value
+          key    = "aptos.org/nodepool"
+          value  = "validators"
           effect = "NoExecute"
         }]
       }
       fullnode = {
+        config = {
+          storage = {
+            rocksdb_configs = {
+              enable_storage_sharding = var.enable_storage_sharding
+            }
+          }
+        }
         storage = {
-          class = "standard"
+          class = kubernetes_storage_class.ssd.metadata[0].name
         }
-        nodeSelector = {
-          "cloud.google.com/gke-nodepool" = google_container_node_pool.validators.name
-        }
+        nodeSelector = var.validator_instance_enable_taint ? {
+          "cloud.google.com/gke-nodepool" = "validators"
+        } : {}
         tolerations = [{
-          key    = google_container_node_pool.validators.node_config[0].taint[0].key
-          value  = google_container_node_pool.validators.node_config[0].taint[0].value
+          key    = "aptos.org/nodepool"
+          value  = "validators"
           effect = "NoExecute"
         }]
+      }
+      haproxy = {
+        nodeSelector = var.utility_instance_enable_taint ? {
+          "cloud.google.com/gke-nodepool" = "utilities"
+        } : {}
+        tolerations = [{
+          key    = "aptos.org/nodepool"
+          value  = "utilities"
+          effect = "NoExecute"
+        }]
+      }
+      service = {
+        domain = local.domain
       }
     }),
     var.helm_values_file != "" ? file(var.helm_values_file) : "{}",
     jsonencode(var.helm_values),
   ]
 
-  set {
-    name  = "timestamp"
-    value = var.helm_force_update ? timestamp() : ""
-  }
-}
-
-resource "helm_release" "logger" {
-  count       = var.enable_logger ? 1 : 0
-  name        = "${terraform.workspace}-log"
-  chart       = "${path.module}/../../helm/logger"
-  max_history = 10
-  wait        = false
-
-  values = [
-    jsonencode({
-      logger = {
-        name = "aptos-logger"
-      }
-      chain = {
-        name = var.chain_name
-      }
-      serviceAccount = {
-        create = false
-        name = "${terraform.workspace}-aptos-node-validator"
-      }
-    }),
-    jsonencode(var.logger_helm_values),
-  ]
-
-  set {
-    name  = "timestamp"
-    value = timestamp()
+  dynamic "set" {
+    for_each = var.manage_via_tf ? toset([""]) : toset([])
+    content {
+      # inspired by https://stackoverflow.com/a/66501021 to trigger redeployment whenever any of the charts file contents change.
+      name  = "chart_sha1"
+      value = sha1(join("", [for f in fileset(local.aptos_node_helm_chart_path, "**") : filesha1("${local.aptos_node_helm_chart_path}/${f}")]))
+    }
   }
 }
 
 resource "helm_release" "monitoring" {
   count       = var.enable_monitoring ? 1 : 0
-  name        = "${terraform.workspace}-mon"
-  chart       = "${path.module}/../../helm/monitoring"
-  max_history = 10
+  name        = "${local.helm_release_name}-mon"
+  chart       = local.monitoring_helm_chart_path
+  max_history = 5
   wait        = false
 
   values = [
@@ -118,6 +132,9 @@ resource "helm_release" "monitoring" {
       }
       validator = {
         name = var.validator_name
+      }
+      service = {
+        domain = local.domain
       }
       monitoring = {
         prometheus = {
@@ -126,12 +143,19 @@ resource "helm_release" "monitoring" {
           }
         }
       }
+      kube-state-metrics = {
+        enabled = var.enable_kube_state_metrics
+      }
+      prometheus-node-exporter = {
+        enabled = var.enable_prometheus_node_exporter
+      }
     }),
     jsonencode(var.monitoring_helm_values),
   ]
 
+  # inspired by https://stackoverflow.com/a/66501021 to trigger redeployment whenever any of the charts file contents change.
   set {
-    name  = "timestamp"
-    value = timestamp()
+    name  = "chart_sha1"
+    value = sha1(join("", [for f in fileset(local.monitoring_helm_chart_path, "**") : filesha1("${local.monitoring_helm_chart_path}/${f}")]))
   }
 }

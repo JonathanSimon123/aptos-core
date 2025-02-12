@@ -37,7 +37,9 @@ data "aws_iam_policy_document" "alb-ingress" {
       "ec2:DeleteTags",
       "ec2:DeleteSecurityGroup",
       "ec2:DescribeAccountAttributes",
+      # https://github.com/kubernetes-sigs/aws-load-balancer-controller/issues/2525
       "ec2:DescribeAddresses",
+      "ec2:DescribeAvailabilityZones",
       "ec2:DescribeInstances",
       "ec2:DescribeInstanceStatus",
       "ec2:DescribeInternetGateways",
@@ -151,14 +153,8 @@ data "aws_iam_policy_document" "alb-ingress" {
   }
 }
 
-resource "aws_iam_openid_connect_provider" "cluster" {
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = ["9e99a48a9960b14926bb7f3b02e22da2b0ab7280"] # Thumbprint of Root CA for EKS OIDC, Valid until 2037
-  url             = data.aws_eks_cluster.aptos.identity[0].oidc[0].issuer
-}
-
 locals {
-  oidc_provider = replace(aws_iam_openid_connect_provider.cluster.url, "https://", "")
+  oidc_provider = module.eks.oidc_provider
 }
 
 data "aws_iam_policy_document" "k8s-aws-integrations-assume-role" {
@@ -187,7 +183,7 @@ data "aws_iam_policy_document" "k8s-aws-integrations-assume-role" {
 }
 
 resource "aws_iam_role" "k8s-aws-integrations" {
-  name                 = "${terraform.workspace}-pfn-k8s-aws-integrations"
+  name                 = "${local.workspace_name}-pfn-k8s-aws-integrations"
   path                 = var.iam_path
   assume_role_policy   = data.aws_iam_policy_document.k8s-aws-integrations-assume-role.json
   permissions_boundary = var.permissions_boundary_policy

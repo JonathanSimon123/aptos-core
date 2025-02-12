@@ -1,272 +1,375 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //! Scratchpad for on chain values during the execution.
 
-use crate::{counters::CRITICAL_ERRORS, create_access_path, logging::AdapterLogSchema};
-#[allow(unused_imports)]
-use anyhow::format_err;
-use anyhow::Error;
-use aptos_logger::prelude::*;
-use aptos_state_view::{StateView, StateViewId};
-use aptos_types::{
-    access_path::AccessPath,
-    on_chain_config::ConfigStorage,
-    state_store::state_key::StateKey,
-    vm_status::StatusCode,
-    write_set::{WriteOp, WriteSet},
+use crate::move_vm_ext::{
+    resource_state_key, AptosMoveResolver, AsExecutorView, AsResourceGroupView,
+    ResourceGroupResolver,
 };
-use fail::fail_point;
-use move_deps::{
-    move_binary_format::errors::*,
-    move_core_types::{
-        account_address::AccountAddress,
-        gas_schedule::{GasAlgebra, GasCarrier, InternalGasUnits},
-        language_storage::{ModuleId, StructTag},
-        resolver::{ModuleResolver, ResourceResolver},
+use aptos_aggregator::{
+    bounded_math::SignedU128,
+    resolver::{TAggregatorV1View, TDelayedFieldView},
+    types::{DelayedFieldValue, DelayedFieldsSpeculativeError},
+};
+use aptos_table_natives::{TableHandle, TableResolver};
+use aptos_types::{
+    error::{PanicError, PanicOr},
+    on_chain_config::{ConfigStorage, Features, OnChainConfig},
+    state_store::{
+        errors::StateViewError,
+        state_key::StateKey,
+        state_storage_usage::StateStorageUsage,
+        state_value::{StateValue, StateValueMetadata},
+        StateView, StateViewId,
     },
-    move_table_extension::{TableHandle, TableOperation, TableResolver},
+};
+use aptos_vm_environment::{
+    gas::get_gas_feature_version, prod_configs::aptos_prod_deserializer_config,
+};
+use aptos_vm_types::{
+    resolver::{
+        ExecutorView, ResourceGroupSize, ResourceGroupView, StateStorageView, TResourceGroupView,
+    },
+    resource_group_adapter::ResourceGroupAdapter,
+};
+use bytes::Bytes;
+use move_binary_format::{deserializer::DeserializerConfig, errors::*, CompiledModule};
+use move_core_types::{
+    account_address::AccountAddress,
+    language_storage::{ModuleId, StructTag},
+    metadata::Metadata,
+    value::MoveTypeLayout,
+};
+use move_vm_types::{
+    delayed_values::delayed_field_id::DelayedFieldID,
+    resolver::{resource_size, ModuleResolver, ResourceResolver},
 };
 use std::{
-    collections::btree_map::BTreeMap,
-    ops::{Deref, DerefMut},
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
 };
 
-/// A local cache for a given a `StateView`. The cache is private to the Aptos layer
-/// but can be used as a one shot cache for systems that need a simple `RemoteCache`
-/// implementation (e.g. tests or benchmarks).
-///
-/// The cache is responsible to track all changes to the `StateView` that are the result
-/// of transaction execution. Those side effects are published at the end of a transaction
-/// execution via `StateViewCache::push_write_set`.
-///
-/// `StateViewCache` is responsible to give an up to date view over the data store,
-/// so that changes executed but not yet committed are visible to subsequent transactions.
-///
-/// If a system wishes to execute a block of transaction on a given view, a cache that keeps
-/// track of incremental changes is vital to the consistency of the data store and the system.
-pub struct StateViewCache<'a, S> {
-    data_view: &'a S,
-    data_map: BTreeMap<StateKey, Option<Vec<u8>>>,
+pub fn get_resource_group_member_from_metadata(
+    struct_tag: &StructTag,
+    metadata: &[Metadata],
+) -> Option<StructTag> {
+    let metadata = aptos_framework::get_metadata(metadata)?;
+    metadata
+        .struct_attributes
+        .get(struct_tag.name.as_ident_str().as_str())?
+        .iter()
+        .find_map(|attr| attr.get_resource_group_member())
 }
 
-impl<'a, S: StateView> StateViewCache<'a, S> {
-    /// Create a `StateViewCache` give a `StateView`. Hold updates to the data store and
-    /// forward data request to the `StateView` if not in the local cache.
-    pub fn new(data_view: &'a S) -> Self {
-        StateViewCache {
-            data_view,
-            data_map: BTreeMap::new(),
+/// Adapter to convert a `ExecutorView` into a `AptosMoveResolver`.
+///
+/// Resources in groups are handled either through dedicated interfaces of executor_view
+/// (that tie to specialized handling in block executor), or via 'standard' interfaces
+/// for (non-group) resources and subsequent handling in the StorageAdapter itself.
+pub struct StorageAdapter<'e, E> {
+    executor_view: &'e E,
+    deserializer_config: DeserializerConfig,
+    resource_group_view: ResourceGroupAdapter<'e>,
+    accessed_groups: RefCell<HashSet<StateKey>>,
+}
+
+impl<'e, E: ExecutorView> StorageAdapter<'e, E> {
+    pub(crate) fn new_with_config(
+        executor_view: &'e E,
+        gas_feature_version: u64,
+        features: &Features,
+        maybe_resource_group_view: Option<&'e dyn ResourceGroupView>,
+    ) -> Self {
+        let deserializer_config = aptos_prod_deserializer_config(features);
+        let resource_group_adapter = ResourceGroupAdapter::new(
+            maybe_resource_group_view,
+            executor_view,
+            gas_feature_version,
+            features.is_resource_groups_split_in_vm_change_set_enabled(),
+        );
+
+        Self::new(executor_view, deserializer_config, resource_group_adapter)
+    }
+
+    fn new(
+        executor_view: &'e E,
+        deserializer_config: DeserializerConfig,
+        resource_group_view: ResourceGroupAdapter<'e>,
+    ) -> Self {
+        Self {
+            executor_view,
+            deserializer_config,
+            resource_group_view,
+            accessed_groups: RefCell::new(HashSet::new()),
         }
     }
 
-    // Publishes a `WriteSet` computed at the end of a transaction.
-    // The effect is to build a layer in front of the `StateView` which keeps
-    // track of the data as if the changes were applied immediately.
-    pub(crate) fn push_write_set(&mut self, write_set: &WriteSet) {
-        for (ref ap, ref write_op) in write_set.iter() {
-            match write_op {
-                WriteOp::Value(blob) => {
-                    self.data_map.insert(ap.clone(), Some(blob.clone()));
-                }
-                WriteOp::Deletion => {
-                    self.data_map.remove(ap);
-                    self.data_map.insert(ap.clone(), None);
-                }
-            }
-        }
-    }
-}
-
-impl<'block, S: StateView> StateView for StateViewCache<'block, S> {
-    // Get some data either through the cache or the `StateView` on a cache miss.
-    fn get_state_value(&self, state_key: &StateKey) -> anyhow::Result<Option<Vec<u8>>> {
-        fail_point!("move_adapter::data_cache::get", |_| Err(format_err!(
-            "Injected failure in data_cache::get"
-        )));
-
-        match self.data_map.get(state_key) {
-            Some(opt_data) => Ok(opt_data.clone()),
-            None => match self.data_view.get_state_value(state_key) {
-                Ok(remote_data) => Ok(remote_data),
-                // TODO: should we forward some error info?
-                Err(e) => {
-                    // create an AdapterLogSchema from the `data_view` in scope. This log_context
-                    // does not carry proper information about the specific transaction and
-                    // context, but this error is related to the given `StateView` rather
-                    // than the transaction.
-                    // Also this API does not make it easy to plug in a context
-                    let log_context = AdapterLogSchema::new(self.data_view.id(), 0);
-                    CRITICAL_ERRORS.inc();
-                    error!(
-                        log_context,
-                        "[VM, StateView] Error getting data from storage for {:?}", state_key
-                    );
-                    Err(e)
-                }
-            },
-        }
-    }
-
-    fn is_genesis(&self) -> bool {
-        self.data_view.is_genesis()
-    }
-
-    fn id(&self) -> StateViewId {
-        self.data_view.id()
-    }
-}
-
-// Adapter to convert a `StateView` into a `RemoteCache`.
-pub struct RemoteStorage<'a, S>(&'a S);
-
-impl<'a, S: StateView> RemoteStorage<'a, S> {
-    pub fn new(state_store: &'a S) -> Self {
-        Self(state_store)
-    }
-
-    pub fn get(&self, access_path: &AccessPath) -> PartialVMResult<Option<Vec<u8>>> {
-        self.0
-            .get_state_value(&StateKey::AccessPath(access_path.clone()))
-            .map_err(|_| PartialVMError::new(StatusCode::STORAGE_ERROR))
-    }
-}
-
-impl<'a, S: StateView> ModuleResolver for RemoteStorage<'a, S> {
-    type Error = VMError;
-
-    fn get_module(&self, module_id: &ModuleId) -> Result<Option<Vec<u8>>, Self::Error> {
-        // REVIEW: cache this?
-        let ap = AccessPath::from(module_id);
-        self.get(&ap).map_err(|e| e.finish(Location::Undefined))
-    }
-}
-
-impl<'a, S: StateView> ResourceResolver for RemoteStorage<'a, S> {
-    type Error = VMError;
-
-    fn get_resource(
+    fn get_any_resource_with_layout(
         &self,
         address: &AccountAddress,
         struct_tag: &StructTag,
-    ) -> Result<Option<Vec<u8>>, Self::Error> {
-        let ap = create_access_path(*address, struct_tag.clone());
-        self.get(&ap).map_err(|e| e.finish(Location::Undefined))
+        metadata: &[Metadata],
+        maybe_layout: Option<&MoveTypeLayout>,
+    ) -> PartialVMResult<(Option<Bytes>, usize)> {
+        let resource_group = get_resource_group_member_from_metadata(struct_tag, metadata);
+        if let Some(resource_group) = resource_group {
+            let key = StateKey::resource_group(address, &resource_group);
+            let buf =
+                self.resource_group_view
+                    .get_resource_from_group(&key, struct_tag, maybe_layout)?;
+
+            let first_access = self.accessed_groups.borrow_mut().insert(key.clone());
+            let group_size = if first_access {
+                self.resource_group_view.resource_group_size(&key)?.get()
+            } else {
+                0
+            };
+
+            let buf_size = resource_size(&buf);
+            Ok((buf, buf_size + group_size as usize))
+        } else {
+            let state_key = resource_state_key(address, struct_tag)?;
+            let buf = self
+                .executor_view
+                .get_resource_bytes(&state_key, maybe_layout)?;
+            let buf_size = resource_size(&buf);
+            Ok((buf, buf_size))
+        }
     }
 }
 
-impl<'a, S: StateView> TableResolver for RemoteStorage<'a, S> {
-    fn resolve_table_entry(
+impl<'e, E: ExecutorView> ResourceGroupResolver for StorageAdapter<'e, E> {
+    fn release_resource_group_cache(
+        &self,
+    ) -> Option<HashMap<StateKey, BTreeMap<StructTag, Bytes>>> {
+        self.resource_group_view.release_group_cache()
+    }
+
+    fn resource_group_size(&self, group_key: &StateKey) -> PartialVMResult<ResourceGroupSize> {
+        self.resource_group_view.resource_group_size(group_key)
+    }
+
+    fn resource_size_in_group(
+        &self,
+        group_key: &StateKey,
+        resource_tag: &StructTag,
+    ) -> PartialVMResult<usize> {
+        self.resource_group_view
+            .resource_size_in_group(group_key, resource_tag)
+    }
+
+    fn resource_exists_in_group(
+        &self,
+        group_key: &StateKey,
+        resource_tag: &StructTag,
+    ) -> PartialVMResult<bool> {
+        self.resource_group_view
+            .resource_exists_in_group(group_key, resource_tag)
+    }
+}
+
+impl<'e, E: ExecutorView> AptosMoveResolver for StorageAdapter<'e, E> {}
+
+impl<'e, E: ExecutorView> ResourceResolver for StorageAdapter<'e, E> {
+    fn get_resource_bytes_with_metadata_and_layout(
+        &self,
+        address: &AccountAddress,
+        struct_tag: &StructTag,
+        metadata: &[Metadata],
+        maybe_layout: Option<&MoveTypeLayout>,
+    ) -> PartialVMResult<(Option<Bytes>, usize)> {
+        self.get_any_resource_with_layout(address, struct_tag, metadata, maybe_layout)
+    }
+}
+
+impl<'e, E: ExecutorView> ModuleResolver for StorageAdapter<'e, E> {
+    fn get_module_metadata(&self, module_id: &ModuleId) -> Vec<Metadata> {
+        let module_bytes = match self.get_module(module_id) {
+            Ok(Some(bytes)) => bytes,
+            _ => return vec![],
+        };
+        let module =
+            match CompiledModule::deserialize_with_config(&module_bytes, &self.deserializer_config)
+            {
+                Ok(module) => module,
+                _ => return vec![],
+            };
+        module.metadata
+    }
+
+    fn get_module(&self, module_id: &ModuleId) -> PartialVMResult<Option<Bytes>> {
+        self.executor_view
+            .get_module_bytes(&StateKey::module_id(module_id))
+    }
+}
+
+impl<'e, E: ExecutorView> TableResolver for StorageAdapter<'e, E> {
+    fn resolve_table_entry_bytes_with_layout(
         &self,
         handle: &TableHandle,
         key: &[u8],
-    ) -> Result<Option<Vec<u8>>, Error> {
-        self.get_state_value(&StateKey::table_item(handle.0, key.to_vec()))
+        maybe_layout: Option<&MoveTypeLayout>,
+    ) -> Result<Option<Bytes>, PartialVMError> {
+        let state_key = StateKey::table_item(&(*handle).into(), key);
+        self.executor_view
+            .get_resource_bytes(&state_key, maybe_layout)
     }
+}
 
-    fn operation_cost(
+impl<'e, E: ExecutorView> TAggregatorV1View for StorageAdapter<'e, E> {
+    type Identifier = StateKey;
+
+    fn get_aggregator_v1_state_value(
         &self,
-        _op: TableOperation,
-        _key_size: usize,
-        _val_size: usize,
-    ) -> InternalGasUnits<GasCarrier> {
-        InternalGasUnits::new(1)
+        id: &Self::Identifier,
+    ) -> PartialVMResult<Option<StateValue>> {
+        self.executor_view.get_aggregator_v1_state_value(id)
     }
 }
 
-impl<'a, S: StateView> ConfigStorage for RemoteStorage<'a, S> {
-    fn fetch_config(&self, access_path: AccessPath) -> Option<Vec<u8>> {
-        self.get(&access_path).ok()?
+impl<'e, E: ExecutorView> TDelayedFieldView for StorageAdapter<'e, E> {
+    type Identifier = DelayedFieldID;
+    type ResourceGroupTag = StructTag;
+    type ResourceKey = StateKey;
+
+    fn get_delayed_field_value(
+        &self,
+        id: &Self::Identifier,
+    ) -> Result<DelayedFieldValue, PanicOr<DelayedFieldsSpeculativeError>> {
+        self.executor_view.get_delayed_field_value(id)
+    }
+
+    fn delayed_field_try_add_delta_outcome(
+        &self,
+        id: &Self::Identifier,
+        base_delta: &SignedU128,
+        delta: &SignedU128,
+        max_value: u128,
+    ) -> Result<bool, PanicOr<DelayedFieldsSpeculativeError>> {
+        self.executor_view
+            .delayed_field_try_add_delta_outcome(id, base_delta, delta, max_value)
+    }
+
+    fn generate_delayed_field_id(&self, width: u32) -> Self::Identifier {
+        self.executor_view.generate_delayed_field_id(width)
+    }
+
+    fn validate_delayed_field_id(&self, id: &Self::Identifier) -> Result<(), PanicError> {
+        self.executor_view.validate_delayed_field_id(id)
+    }
+
+    fn get_reads_needing_exchange(
+        &self,
+        delayed_write_set_keys: &HashSet<Self::Identifier>,
+        skip: &HashSet<Self::ResourceKey>,
+    ) -> Result<
+        BTreeMap<Self::ResourceKey, (StateValueMetadata, u64, Arc<MoveTypeLayout>)>,
+        PanicError,
+    > {
+        self.executor_view
+            .get_reads_needing_exchange(delayed_write_set_keys, skip)
+    }
+
+    fn get_group_reads_needing_exchange(
+        &self,
+        delayed_write_set_keys: &HashSet<Self::Identifier>,
+        skip: &HashSet<Self::ResourceKey>,
+    ) -> PartialVMResult<BTreeMap<Self::ResourceKey, (StateValueMetadata, u64)>> {
+        self.executor_view
+            .get_group_reads_needing_exchange(delayed_write_set_keys, skip)
     }
 }
 
-impl<'a, S> Deref for RemoteStorage<'a, S> {
-    type Target = S;
-
-    fn deref(&self) -> &Self::Target {
-        self.0
+impl<'e, E: ExecutorView> ConfigStorage for StorageAdapter<'e, E> {
+    fn fetch_config_bytes(&self, state_key: &StateKey) -> Option<Bytes> {
+        self.executor_view
+            .get_resource_bytes(state_key, None)
+            .ok()?
     }
 }
 
+/// Converts `StateView` into `AptosMoveResolver`.
 pub trait AsMoveResolver<S> {
-    fn as_move_resolver(&self) -> RemoteStorage<S>;
+    fn as_move_resolver(&self) -> StorageAdapter<S>;
 }
 
 impl<S: StateView> AsMoveResolver<S> for S {
-    fn as_move_resolver(&self) -> RemoteStorage<S> {
-        RemoteStorage::new(self)
+    fn as_move_resolver(&self) -> StorageAdapter<S> {
+        let features = Features::fetch_config(self).unwrap_or_default();
+        let deserializer_config = aptos_prod_deserializer_config(&features);
+
+        let gas_feature_version = get_gas_feature_version(self);
+        let resource_group_adapter = ResourceGroupAdapter::new(
+            None,
+            self,
+            gas_feature_version,
+            features.is_resource_groups_split_in_vm_change_set_enabled(),
+        );
+        StorageAdapter::new(self, deserializer_config, resource_group_adapter)
     }
 }
 
-pub struct RemoteStorageOwned<S> {
-    state_view: S,
-}
+impl<'e, E: ExecutorView> StateStorageView for StorageAdapter<'e, E> {
+    type Key = StateKey;
 
-impl<S> Deref for RemoteStorageOwned<S> {
-    type Target = S;
+    fn id(&self) -> StateViewId {
+        self.executor_view.id()
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.state_view
+    fn read_state_value(&self, state_key: &Self::Key) -> Result<(), StateViewError> {
+        self.executor_view.read_state_value(state_key)
+    }
+
+    fn get_usage(&self) -> Result<StateStorageUsage, StateViewError> {
+        self.executor_view.get_usage()
     }
 }
 
-impl<S> DerefMut for RemoteStorageOwned<S> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.state_view
+// Allows to extract the view from `StorageAdapter`.
+impl<'e, E: ExecutorView> AsExecutorView for StorageAdapter<'e, E> {
+    fn as_executor_view(&self) -> &dyn ExecutorView {
+        self.executor_view
     }
 }
 
-impl<S: StateView> ModuleResolver for RemoteStorageOwned<S> {
-    type Error = VMError;
-
-    fn get_module(&self, module_id: &ModuleId) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.as_move_resolver().get_module(module_id)
+// Allows to extract the view from `StorageAdapter`.
+impl<'e, E> AsResourceGroupView for StorageAdapter<'e, E> {
+    fn as_resource_group_view(&self) -> &dyn ResourceGroupView {
+        &self.resource_group_view
     }
 }
 
-impl<S: StateView> ResourceResolver for RemoteStorageOwned<S> {
-    type Error = VMError;
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use aptos_vm_types::resource_group_adapter::GroupSizeKind;
 
-    fn get_resource(
-        &self,
-        address: &AccountAddress,
-        struct_tag: &StructTag,
-    ) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.as_move_resolver().get_resource(address, struct_tag)
-    }
-}
+    // Expose a method to create a storage adapter with a provided group size kind.
+    pub(crate) fn as_resolver_with_group_size_kind<S: StateView>(
+        state_view: &S,
+        group_size_kind: GroupSizeKind,
+    ) -> StorageAdapter<S> {
+        assert_ne!(group_size_kind, GroupSizeKind::AsSum, "not yet supported");
 
-impl<S: StateView> TableResolver for RemoteStorageOwned<S> {
-    fn resolve_table_entry(
-        &self,
-        handle: &TableHandle,
-        key: &[u8],
-    ) -> Result<Option<Vec<u8>>, Error> {
-        self.as_move_resolver().resolve_table_entry(handle, key)
-    }
+        let (gas_feature_version, resource_groups_split_in_vm_change_set_enabled) =
+            match group_size_kind {
+                GroupSizeKind::AsSum => (12, true),
+                GroupSizeKind::AsBlob => (10, false),
+                GroupSizeKind::None => (1, false),
+            };
 
-    fn operation_cost(
-        &self,
-        op: TableOperation,
-        key_size: usize,
-        val_size: usize,
-    ) -> InternalGasUnits<GasCarrier> {
-        self.as_move_resolver()
-            .operation_cost(op, key_size, val_size)
-    }
-}
+        let group_adapter = ResourceGroupAdapter::new(
+            // TODO[agg_v2](test) add a converter for StateView for tests that implements ResourceGroupView
+            None,
+            state_view,
+            gas_feature_version,
+            resource_groups_split_in_vm_change_set_enabled,
+        );
 
-impl<S: StateView> ConfigStorage for RemoteStorageOwned<S> {
-    fn fetch_config(&self, access_path: AccessPath) -> Option<Vec<u8>> {
-        self.as_move_resolver().fetch_config(access_path)
-    }
-}
-
-pub trait IntoMoveResolver<S> {
-    fn into_move_resolver(self) -> RemoteStorageOwned<S>;
-}
-
-impl<S: StateView> IntoMoveResolver<S> for S {
-    fn into_move_resolver(self) -> RemoteStorageOwned<S> {
-        RemoteStorageOwned { state_view: self }
+        let features = Features::fetch_config(state_view).unwrap_or_default();
+        let deserializer_config = aptos_prod_deserializer_config(&features);
+        StorageAdapter::new(state_view, deserializer_config, group_adapter)
     }
 }

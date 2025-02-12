@@ -1,45 +1,57 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     core_mempool::{CoreMempool, TimelineState},
-    network::{MempoolNetworkEvents, MempoolNetworkSender},
+    network::BroadcastPeerPriority,
     shared_mempool::start_shared_mempool,
-    ConsensusRequest, MempoolClientSender,
+    MempoolClientSender, QuorumStoreRequest,
 };
 use anyhow::{format_err, Result};
+use aptos_channels::{self, aptos_channel, message_queues::QueueStyle};
 use aptos_config::{
     config::{NetworkConfig, NodeConfig},
     network_id::NetworkId,
 };
+use aptos_event_notifications::{ReconfigNotification, ReconfigNotificationListener};
 use aptos_infallible::{Mutex, RwLock};
+use aptos_mempool_notifications::{self, MempoolNotifier};
+use aptos_network::{
+    application::{
+        interface::{NetworkClient, NetworkServiceEvents},
+        storage::PeersAndMetadata,
+    },
+    peer_manager::{ConnectionRequestSender, PeerManagerRequestSender},
+    protocols::{
+        network::{NetworkEvents, NetworkSender, NewNetworkEvents, NewNetworkSender},
+        wire::handshake::v1::ProtocolId::MempoolDirectSend,
+    },
+};
+use aptos_storage_interface::{mock::MockDbReaderWriter, DbReaderWriter};
 use aptos_types::{
-    account_config::AccountSequenceInfo, mempool_status::MempoolStatusCode,
-    on_chain_config::ON_CHAIN_CONFIG_REGISTRY, transaction::SignedTransaction,
+    mempool_status::MempoolStatusCode,
+    on_chain_config::{InMemoryOnChainConfig, OnChainConfigPayload},
+    transaction::SignedTransaction,
 };
-use channel::{self, aptos_channel, message_queues::QueueStyle};
-use event_notifications::EventSubscriptionService;
-use futures::channel::mpsc;
-use mempool_notifications::{self, MempoolNotifier};
-use network::{
-    application::storage::PeerMetadataStorage,
-    peer_manager::{conn_notifs_channel, ConnectionRequestSender, PeerManagerRequestSender},
-    protocols::network::{NewNetworkEvents, NewNetworkSender},
-};
-use std::{collections::HashSet, sync::Arc};
-use storage_interface::{mock::MockDbReaderWriter, DbReaderWriter};
-use tokio::runtime::{Builder, Handle, Runtime};
-use vm_validator::{
+use aptos_vm_validator::{
     mocks::mock_vm_validator::MockVMValidator, vm_validator::TransactionValidation,
 };
+use futures::channel::mpsc;
+use maplit::hashmap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
+use tokio::runtime::Handle;
 
 /// Mock of a running instance of shared mempool.
 pub struct MockSharedMempool {
-    _runtime: Option<Runtime>,
+    _runtime: Option<Handle>,
     _handle: Option<Handle>,
     pub ac_client: MempoolClientSender,
     pub mempool: Arc<Mutex<CoreMempool>>,
-    pub consensus_sender: mpsc::Sender<ConsensusRequest>,
+    pub consensus_to_mempool_sender: mpsc::Sender<QuorumStoreRequest>,
     pub mempool_notifier: MempoolNotifier,
 }
 
@@ -48,24 +60,30 @@ impl MockSharedMempool {
     /// Returns the runtime on which the shared mempool is running
     /// and the channel through which shared mempool receives client events.
     pub fn new() -> Self {
-        let runtime = Builder::new_multi_thread()
-            .thread_name("mock-shared-mem")
-            .enable_all()
-            .build()
-            .expect("[mock shared mempool] failed to create runtime");
-        let (ac_client, mempool, consensus_sender, mempool_notifier) = Self::start(
-            runtime.handle(),
+        // Create the shared mempool
+        let (ac_client, mempool, quorum_store_sender, mempool_notifier) = Self::start(
+            &Handle::current(),
             &DbReaderWriter::new(MockDbReaderWriter),
             MockVMValidator,
         );
         Self {
-            _runtime: Some(runtime),
+            _runtime: Some(Handle::current()),
             _handle: None,
             ac_client,
             mempool,
-            consensus_sender,
+            consensus_to_mempool_sender: quorum_store_sender,
             mempool_notifier,
         }
+    }
+
+    /// Creates a mock shared mempool and runtime
+    pub fn new_with_runtime() -> Self {
+        // Create a runtime
+        let runtime = aptos_runtimes::spawn_named_runtime("shared-mem".into(), None);
+        let _entered_runtime = runtime.enter();
+
+        // Create and return the shared mempool
+        Self::new()
     }
 
     /// Creates a mock of a running instance of shared mempool inside a tokio runtime;
@@ -75,14 +93,14 @@ impl MockSharedMempool {
         validator: V,
     ) -> Self {
         let handle = Handle::current();
-        let (ac_client, mempool, consensus_sender, mempool_notifier) =
+        let (ac_client, mempool, quorum_store_sender, mempool_notifier) =
             Self::start(&handle, db, validator);
         Self {
             _runtime: None,
             _handle: Some(handle),
             ac_client,
             mempool,
-            consensus_sender,
+            consensus_to_mempool_sender: quorum_store_sender,
             mempool_notifier,
         }
     }
@@ -94,50 +112,66 @@ impl MockSharedMempool {
     ) -> (
         MempoolClientSender,
         Arc<Mutex<CoreMempool>>,
-        mpsc::Sender<ConsensusRequest>,
+        mpsc::Sender<QuorumStoreRequest>,
         MempoolNotifier,
     ) {
-        let mut config = NodeConfig::random();
+        let mut config = NodeConfig::generate_random_config();
         config.validator_network = Some(NetworkConfig::network_with_id(NetworkId::Validator));
 
         let mempool = Arc::new(Mutex::new(CoreMempool::new(&config)));
         let (network_reqs_tx, _network_reqs_rx) = aptos_channel::new(QueueStyle::FIFO, 8, None);
         let (connection_reqs_tx, _) = aptos_channel::new(QueueStyle::FIFO, 8, None);
         let (_network_notifs_tx, network_notifs_rx) = aptos_channel::new(QueueStyle::FIFO, 8, None);
-        let (_, conn_notifs_rx) = conn_notifs_channel::new();
-        let network_sender = MempoolNetworkSender::new(
+        let network_sender = NetworkSender::new(
             PeerManagerRequestSender::new(network_reqs_tx),
             ConnectionRequestSender::new(connection_reqs_tx),
         );
-        let network_events = MempoolNetworkEvents::new(network_notifs_rx, conn_notifs_rx);
+        let network_events = NetworkEvents::new(network_notifs_rx, None, true);
         let (ac_client, client_events) = mpsc::channel(1_024);
-        let (consensus_sender, consensus_events) = mpsc::channel(1_024);
+        let (quorum_store_sender, quorum_store_receiver) = mpsc::channel(1_024);
         let (mempool_notifier, mempool_listener) =
-            mempool_notifications::new_mempool_notifier_listener_pair();
-        let mut event_subscriber = EventSubscriptionService::new(
-            ON_CHAIN_CONFIG_REGISTRY,
-            Arc::new(RwLock::new(db.clone())),
+            aptos_mempool_notifications::new_mempool_notifier_listener_pair(100);
+        let (reconfig_sender, reconfig_events) = aptos_channel::new(QueueStyle::LIFO, 1, None);
+        let reconfig_event_subscriber = ReconfigNotificationListener {
+            notification_receiver: reconfig_events,
+        };
+        reconfig_sender
+            .push((), ReconfigNotification {
+                version: 1,
+                on_chain_configs: OnChainConfigPayload::new(
+                    1,
+                    InMemoryOnChainConfig::new(HashMap::new()),
+                ),
+            })
+            .unwrap();
+        let peers_and_metadata = PeersAndMetadata::new(&[NetworkId::Validator]);
+        let network_senders = hashmap! {NetworkId::Validator => network_sender};
+        let network_client = NetworkClient::new(
+            vec![MempoolDirectSend],
+            vec![],
+            network_senders,
+            peers_and_metadata.clone(),
         );
-        let reconfig_event_subscriber = event_subscriber.subscribe_to_reconfigurations().unwrap();
-        let network_handles = vec![(NetworkId::Validator, network_sender, network_events)];
-        let peer_metadata_storage = PeerMetadataStorage::new(&[NetworkId::Validator]);
+        let network_and_events = hashmap! {NetworkId::Validator => network_events};
+        let network_service_events = NetworkServiceEvents::new(network_and_events);
 
         start_shared_mempool(
             handle,
             &config,
             mempool.clone(),
-            network_handles,
+            network_client,
+            network_service_events,
             client_events,
-            consensus_events,
+            quorum_store_receiver,
             mempool_listener,
             reconfig_event_subscriber,
             db.reader.clone(),
             Arc::new(RwLock::new(validator)),
             vec![],
-            peer_metadata_storage,
+            peers_and_metadata,
         );
 
-        (ac_client, mempool, consensus_sender, mempool_notifier)
+        (ac_client, mempool, quorum_store_sender, mempool_notifier)
     }
 
     pub fn add_txns(&self, txns: Vec<SignedTransaction>) -> Result<()> {
@@ -147,10 +181,12 @@ impl MockSharedMempool {
                 if pool
                     .add_txn(
                         txn.clone(),
-                        0,
                         txn.gas_unit_price(),
-                        AccountSequenceInfo::Sequential(0),
+                        0,
                         TimelineState::NotReady,
+                        false,
+                        None,
+                        Some(BroadcastPeerPriority::Primary),
                     )
                     .code
                     != MempoolStatusCode::Accepted
@@ -164,20 +200,18 @@ impl MockSharedMempool {
 
     pub fn get_txns(&self, size: u64) -> Vec<SignedTransaction> {
         let pool = self.mempool.lock();
-        pool.get_block(size, HashSet::new())
+        // assume txn size is less than 100kb
+        pool.get_batch(size, size * 102400, true, BTreeMap::new())
     }
 
     pub fn remove_txn(&self, txn: &SignedTransaction) {
         let mut pool = self.mempool.lock();
-        pool.remove_transaction(&txn.sender(), txn.sequence_number(), false)
+        pool.commit_transaction(&txn.sender(), txn.sequence_number())
     }
+}
 
-    /// True if all the given txns are in mempool, else false.
-    pub fn read_timeline(&self, timeline_id: u64, count: usize) -> Vec<SignedTransaction> {
-        let pool = self.mempool.lock();
-        pool.read_timeline(timeline_id, count)
-            .0
-            .into_iter()
-            .collect()
+impl Default for MockSharedMempool {
+    fn default() -> Self {
+        Self::new()
     }
 }

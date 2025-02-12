@@ -1,51 +1,37 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod integration_test_impl;
 
-use aptos_config::{config::NodeConfig, utils};
+use aptos_config::config::NodeConfig;
 use aptos_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
     HashValue,
 };
+use aptos_executor::db_bootstrapper::{generate_waypoint, maybe_bootstrap};
+use aptos_executor_types::state_compute_result::StateComputeResult;
+use aptos_storage_interface::DbReaderWriter;
 use aptos_types::{
     account_address::AccountAddress,
     block_info::BlockInfo,
-    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    ledger_info::{generate_ledger_info_with_sig, LedgerInfo, LedgerInfoWithSignatures},
     test_helpers::transaction_test_helpers::get_test_signed_txn,
     transaction::{Transaction, TransactionPayload},
     validator_signer::ValidatorSigner,
     waypoint::Waypoint,
 };
-use aptos_vm::{AptosVM, VMExecutor};
-use aptosdb::AptosDB;
-use executor::db_bootstrapper::{generate_waypoint, maybe_bootstrap};
-use executor_types::StateComputeResult;
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    thread::JoinHandle,
-};
-use storage_interface::DbReaderWriter;
-use storage_service::start_storage_service_with_db;
+use aptos_vm::VMBlockExecutor;
+use std::sync::Arc;
 
 /// Helper function for test to blindly bootstrap without waypoint.
-pub fn bootstrap_genesis<V: VMExecutor>(
+pub fn bootstrap_genesis<V: VMBlockExecutor>(
     db: &DbReaderWriter,
     genesis_txn: &Transaction,
 ) -> anyhow::Result<Waypoint> {
     let waypoint = generate_waypoint::<V>(db, genesis_txn)?;
     maybe_bootstrap::<V>(db, genesis_txn, waypoint)?;
     Ok(waypoint)
-}
-
-pub fn start_storage_service() -> (NodeConfig, JoinHandle<()>, DbReaderWriter) {
-    let (mut config, _genesis_key) = aptos_genesis_tool::test_config();
-    let server_port = utils::get_available_port();
-    config.storage.address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
-    let (db, db_rw) = DbReaderWriter::wrap(AptosDB::new_for_test(&config.storage.dir()));
-    bootstrap_genesis::<AptosVM>(&db_rw, utils::get_genesis_txn(&config).unwrap()).unwrap();
-    let handle = start_storage_service_with_db(&config, db);
-    (config, handle, db_rw)
 }
 
 pub fn gen_block_id(index: u8) -> HashValue {
@@ -56,7 +42,7 @@ pub fn gen_ledger_info_with_sigs(
     epoch: u64,
     output: &StateComputeResult,
     commit_block_id: HashValue,
-    signer: Vec<&ValidatorSigner>,
+    signer: &[ValidatorSigner],
 ) -> LedgerInfoWithSignatures {
     let ledger_info = LedgerInfo::new(
         BlockInfo::new(
@@ -64,24 +50,20 @@ pub fn gen_ledger_info_with_sigs(
             0, /* round */
             commit_block_id,
             output.root_hash(),
-            output.version(),
+            output.expect_last_version(),
             0, /* timestamp */
             output.epoch_state().clone(),
         ),
         HashValue::zero(),
     );
-    let signatures = signer
-        .iter()
-        .map(|s| (s.author(), s.sign(&ledger_info)))
-        .collect();
-    LedgerInfoWithSignatures::new(ledger_info, signatures)
+    generate_ledger_info_with_sig(signer, ledger_info)
 }
 
 pub fn extract_signer(config: &mut NodeConfig) -> ValidatorSigner {
     let sr_test = config.consensus.safety_rules.test.as_ref().unwrap();
     ValidatorSigner::new(
         sr_test.author,
-        sr_test.consensus_key.as_ref().unwrap().private_key(),
+        Arc::new(sr_test.consensus_key.as_ref().unwrap().private_key()),
     )
 }
 

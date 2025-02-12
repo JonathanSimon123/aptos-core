@@ -1,9 +1,11 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::util::time_service::{ScheduledTask, TimeService};
 use aptos_infallible::Mutex;
 use aptos_logger::prelude::*;
+use async_trait::async_trait;
 use futures::future::AbortHandle;
 use std::{sync::Arc, time::Duration};
 
@@ -27,6 +29,7 @@ struct SimulatedTimeServiceInner {
     max: Duration,
 }
 
+#[async_trait]
 impl TimeService for SimulatedTimeService {
     fn run_after(&self, timeout: Duration, mut t: Box<dyn ScheduledTask>) -> AbortHandle {
         let mut inner = self.inner.lock();
@@ -61,13 +64,19 @@ impl TimeService for SimulatedTimeService {
         self.inner.lock().now
     }
 
-    fn sleep(&self, t: Duration) {
+    async fn sleep(&self, t: Duration) {
         let inner = self.inner.clone();
         let mut inner = inner.lock();
         inner.now += t;
         if inner.now > inner.max {
             inner.now = inner.max;
         }
+    }
+}
+
+impl Default for SimulatedTimeService {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

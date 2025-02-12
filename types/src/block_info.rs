@@ -1,7 +1,11 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{epoch_state::EpochState, on_chain_config::ValidatorSet, transaction::Version};
+use crate::{
+    epoch_state::EpochState, on_chain_config::ValidatorSet, transaction::Version,
+    validator_verifier::ValidatorVerifier,
+};
 use aptos_crypto::hash::{HashValue, ACCUMULATOR_PLACEHOLDER_HASH};
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
@@ -24,7 +28,7 @@ pub const GENESIS_TIMESTAMP_USECS: u64 = 0;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct BlockInfo {
-    /// Epoch number corresponds to the set of validators that are active for this block.
+    /// The epoch to which the block belongs.
     epoch: u64,
     /// The consensus protocol is executed in rounds, which monotonically increase per epoch.
     round: Round,
@@ -73,10 +77,27 @@ impl BlockInfo {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        *self == Self::empty()
+    }
+
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn random(round: Round) -> Self {
         Self {
             epoch: 1,
+            round,
+            id: HashValue::zero(),
+            executed_state_id: HashValue::zero(),
+            version: 0,
+            timestamp_usecs: 0,
+            next_epoch_state: None,
+        }
+    }
+
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn random_with_epoch(epoch: u64, round: Round) -> Self {
+        Self {
+            epoch,
             round,
             id: HashValue::zero(),
             executed_state_id: HashValue::zero(),
@@ -97,6 +118,7 @@ impl BlockInfo {
     /// transaction. Using this genesis block means transitioning to a new epoch
     /// (GENESIS_EPOCH + 1) with this `validator_set`.
     pub fn genesis(genesis_state_root_hash: HashValue, validator_set: ValidatorSet) -> Self {
+        let verifier: ValidatorVerifier = (&validator_set).into();
         Self {
             epoch: GENESIS_EPOCH,
             round: GENESIS_ROUND,
@@ -106,7 +128,7 @@ impl BlockInfo {
             timestamp_usecs: GENESIS_TIMESTAMP_USECS,
             next_epoch_state: Some(EpochState {
                 epoch: 1,
-                verifier: (&validator_set).into(),
+                verifier: verifier.into(),
             }),
         }
     }
@@ -121,7 +143,7 @@ impl BlockInfo {
 
     /// The epoch after this block committed
     pub fn next_block_epoch(&self) -> u64 {
-        self.next_epoch_state().map_or(self.epoch(), |e| e.epoch)
+        self.next_epoch_state().map_or(self.epoch, |e| e.epoch)
     }
 
     pub fn change_timestamp(&mut self, timestamp: u64) {
@@ -187,7 +209,7 @@ impl BlockInfo {
     /// and it is not empty
     pub fn is_ordered_only(&self) -> bool {
         *self != BlockInfo::empty()
-            && self.next_epoch_state == None
+            && self.next_epoch_state.is_none()
             && self.executed_state_id == *ACCUMULATOR_PLACEHOLDER_HASH
             && self.version == 0
     }
@@ -209,7 +231,10 @@ impl Display for BlockInfo {
             self.executed_state_id(),
             self.version(),
             self.timestamp_usecs(),
-            self.next_epoch_state.as_ref().map_or("None".to_string(), |epoch_state| format!("{}", epoch_state)),
+            self.next_epoch_state.as_ref().map_or_else(|| "None".to_string(), |epoch_state| format!("{}", epoch_state)),
         )
     }
 }
+
+/// A continuously increasing sequence number for committed blocks.
+pub type BlockHeight = u64;

@@ -1,37 +1,72 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Defines Forge Tests
-pub mod aptos;
-pub mod fullnode;
-pub mod indexer;
-pub mod nft_transaction;
-pub mod rest_api;
-pub mod transaction;
+extern crate core;
 
-// Converted to local Forge backend
+#[cfg(test)]
+mod aptos;
+#[cfg(test)]
+mod aptos_cli;
 #[cfg(test)]
 mod client;
 #[cfg(test)]
 mod consensus;
 #[cfg(test)]
+mod consensus_key_rotation;
+#[cfg(test)]
+mod consensus_observer;
+#[cfg(test)]
+mod execution;
+#[cfg(test)]
 mod full_nodes;
+#[cfg(test)]
+mod fullnode;
+#[cfg(test)]
+mod genesis;
+#[cfg(test)]
+mod indexer;
+#[cfg(test)]
+mod inspection_service;
+#[cfg(test)]
+mod jwks;
+#[cfg(test)]
+mod keyless;
 #[cfg(test)]
 mod network;
 #[cfg(test)]
-mod operational_tooling;
+mod permissioned_delegation;
+#[cfg(test)]
+mod randomness;
+#[cfg(test)]
+mod rest_api;
+#[cfg(test)]
+mod rosetta;
 #[cfg(test)]
 mod state_sync;
 #[cfg(test)]
-mod state_sync_v2;
+mod state_sync_utils;
 #[cfg(test)]
 mod storage;
+#[cfg(test)]
+mod test_smoke_tests;
+#[cfg(test)]
+mod transaction;
+#[cfg(test)]
+mod txn_broadcast;
+#[cfg(test)]
+mod txn_emitter;
+#[cfg(test)]
+mod upgrade;
 
 #[cfg(test)]
 mod smoke_test_environment;
 
 #[cfg(test)]
-mod test_utils;
+mod utils;
+
+#[cfg(test)]
+mod validator_txns;
 
 #[cfg(test)]
 mod workspace_builder;

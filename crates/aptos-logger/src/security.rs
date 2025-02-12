@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //!
@@ -39,6 +40,9 @@ pub enum SecurityEvent {
 
     /// Consensus received an equivocating vote
     ConsensusEquivocatingVote,
+
+    /// Consensus received an equivocating order vote
+    ConsensusEquivocatingOrderVote,
 
     /// Consensus received an invalid proposal
     InvalidConsensusProposal,

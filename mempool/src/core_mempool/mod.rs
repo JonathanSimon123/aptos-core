@@ -1,12 +1,18 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 mod index;
 mod mempool;
-mod transaction;
+pub mod transaction;
 mod transaction_store;
-mod ttl_cache;
 
+pub use self::{
+    mempool::Mempool as CoreMempool, transaction::TimelineState,
+    transaction_store::TXN_INDEX_ESTIMATED_BYTES,
+};
 #[cfg(test)]
-pub use self::ttl_cache::TtlCache;
-pub use self::{index::TxnPointer, mempool::Mempool as CoreMempool, transaction::TimelineState};
+pub use self::{
+    transaction::{MempoolTransaction, SubmittedBy},
+    transaction_store::sender_bucket,
+};

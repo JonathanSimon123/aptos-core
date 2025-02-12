@@ -1,51 +1,62 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
     core_mempool::CoreMempool,
-    network::{MempoolNetworkEvents, MempoolNetworkSender, MempoolSyncMsg},
-    shared_mempool::start_shared_mempool,
-    tests::common::TestTransaction,
-    ConsensusRequest, MempoolClientRequest, MempoolClientSender,
+    shared_mempool::{
+        start_shared_mempool,
+        types::{MempoolMessageId, MempoolSenderBucket},
+    },
+    tests::common::{self, TestTransaction},
+    MempoolClientRequest, MempoolClientSender, MempoolSyncMsg, QuorumStoreRequest,
 };
+use aptos_channels::{aptos_channel, message_queues::QueueStyle};
 use aptos_config::{
     config::NodeConfig,
     network_id::{NetworkId, PeerNetworkId},
 };
-use aptos_id_generator::{IdGenerator, U32IdGenerator};
+use aptos_event_notifications::{ReconfigNotification, ReconfigNotificationListener};
+use aptos_id_generator::U32IdGenerator;
 use aptos_infallible::{Mutex, RwLock};
-use aptos_types::{
-    account_address::AccountAddress, mempool_status::MempoolStatusCode,
-    on_chain_config::ON_CHAIN_CONFIG_REGISTRY, transaction::SignedTransaction,
-};
-use event_notifications::EventSubscriptionService;
-use futures::{channel::oneshot, SinkExt};
-use mempool_notifications::MempoolNotifier;
-use network::{
-    application::storage::PeerMetadataStorage,
-    peer_manager::{PeerManagerNotification, PeerManagerRequest},
-    protocols::{direct_send::Message, rpc::InboundRpcRequest},
+use aptos_mempool_notifications::MempoolNotifier;
+use aptos_network::{
+    application::{
+        interface::{NetworkClient, NetworkServiceEvents},
+        storage::PeersAndMetadata,
+    },
+    peer_manager::{ConnectionRequestSender, PeerManagerRequest, PeerManagerRequestSender},
+    protocols::{
+        network::{
+            NetworkEvents, NetworkSender, NewNetworkEvents, NewNetworkSender, ReceivedMessage,
+        },
+        wire::{
+            handshake::v1::ProtocolId::MempoolDirectSend,
+            messaging::v1::{DirectSendMsg, NetworkMessage, RpcRequest},
+        },
+    },
     testutils::{
         builder::TestFrameworkBuilder,
-        test_framework::{setup_node_networks, TestFramework},
+        test_framework::TestFramework,
         test_node::{
-            ApplicationNetworkHandle, ApplicationNode, InboundNetworkHandle, NodeId,
-            OutboundMessageReceiver, TestNode,
+            ApplicationNode, InboundNetworkHandle, NodeId, OutboundMessageReceiver, TestNode,
         },
     },
     ProtocolId,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
+use aptos_storage_interface::mock::MockDbReaderWriter;
+use aptos_types::{
+    account_address::AccountAddress,
+    mempool_status::MempoolStatusCode,
+    on_chain_config::{InMemoryOnChainConfig, OnChainConfigPayload},
+    transaction::SignedTransaction,
 };
-use storage_interface::{mock::MockDbReaderWriter, DbReaderWriter};
+use aptos_vm_validator::mocks::mock_vm_validator::MockVMValidator;
+use futures::{channel::oneshot, SinkExt};
+use maplit::btreemap;
+use std::{collections::HashMap, hash::Hash, sync::Arc};
 use tokio::{runtime::Handle, time::Duration};
 use tokio_stream::StreamExt;
-use vm_validator::mocks::mock_vm_validator::MockVMValidator;
-
-/// An inbound sender for notifications from consensus
-pub type MempoolConsensusSender = futures::channel::mpsc::Sender<ConsensusRequest>;
 
 /// An individual mempool node that runs in it's own runtime.
 ///
@@ -60,15 +71,15 @@ pub struct MempoolNode {
     // Mempool specific channels
     /// Used for incoming JSON-RPC requests (e.g. adding new transactions)
     pub mempool_client_sender: MempoolClientSender,
-    /// Used for Rejections notifications from consensus
-    pub mempool_consensus_sender: MempoolConsensusSender,
+    /// Used for quorum store requests
+    pub consensus_to_mempool_sender: futures::channel::mpsc::Sender<QuorumStoreRequest>,
     /// Used for StateSync commit notifications
     pub mempool_notifications: MempoolNotifier,
 
     // Networking specifics
     node_id: NodeId,
     peer_network_ids: HashMap<NetworkId, PeerNetworkId>,
-    peer_metadata_storage: Arc<PeerMetadataStorage>,
+    peers_and_metadata: Arc<PeersAndMetadata>,
 
     inbound_handles: HashMap<NetworkId, InboundNetworkHandle>,
     outbound_handles: HashMap<NetworkId, OutboundMessageReceiver>,
@@ -125,8 +136,8 @@ impl ApplicationNode for MempoolNode {
         self.outbound_handles.get_mut(&network_id).unwrap()
     }
 
-    fn get_peer_metadata_storage(&self) -> &PeerMetadataStorage {
-        &self.peer_metadata_storage
+    fn get_peers_and_metadata(&self) -> &PeersAndMetadata {
+        &self.peers_and_metadata
     }
 
     fn peer_network_ids(&self) -> &HashMap<NetworkId, PeerNetworkId> {
@@ -149,10 +160,30 @@ impl MempoolNode {
         }
     }
 
+    pub async fn commit_txns(&mut self, txns: &[TestTransaction]) {
+        for txn in sign_transactions(txns) {
+            self.mempool
+                .lock()
+                .commit_transaction(&txn.sender(), txn.sequence_number());
+        }
+    }
+
+    pub async fn get_parking_lot_txns_via_client(&mut self) -> Vec<(AccountAddress, u64)> {
+        let (sender, receiver) = oneshot::channel();
+        self.mempool_client_sender
+            .send(MempoolClientRequest::GetAddressesFromParkingLot(sender))
+            .await
+            .unwrap();
+        receiver.await.unwrap()
+    }
+
     /// Asynchronously waits for up to 1 second for txns to appear in mempool
     pub async fn wait_on_txns_in_mempool(&self, txns: &[TestTransaction]) {
         for _ in 0..10 {
-            let block = self.mempool.lock().get_block(100, HashSet::new());
+            let block = self
+                .mempool
+                .lock()
+                .get_batch(100, 102400, true, btreemap![]);
 
             if block_contains_all_transactions(&block, txns) {
                 break;
@@ -202,7 +233,10 @@ impl MempoolNode {
         txns: &[TestTransaction],
         condition: Condition,
     ) -> Result<(), (Vec<(AccountAddress, u64)>, Vec<(AccountAddress, u64)>)> {
-        let block = self.mempool.lock().get_block(100, HashSet::new());
+        let block = self
+            .mempool
+            .lock()
+            .get_batch(100, 102400, true, btreemap![]);
         if !condition(&block, txns) {
             let actual: Vec<_> = block
                 .iter()
@@ -210,12 +244,7 @@ impl MempoolNode {
                 .collect();
             let expected: Vec<_> = txns
                 .iter()
-                .map(|txn| {
-                    (
-                        TestTransaction::get_address(txn.address),
-                        txn.sequence_number,
-                    )
-                })
+                .map(|txn| (txn.address, txn.sequence_number))
                 .collect();
             Err((actual, expected))
         } else {
@@ -232,38 +261,46 @@ impl MempoolNode {
         let network_id = remote_peer_network_id.network_id();
         let remote_peer_id = remote_peer_network_id.peer_id();
         let inbound_handle = self.get_inbound_handle(network_id);
-        let request_id = self.request_id_generator.next();
-        let request_id = bcs::to_bytes(&request_id).unwrap();
-
+        let message_id_in_request = MempoolMessageId::from_timeline_ids(vec![(
+            0 as MempoolSenderBucket,
+            (vec![1].into(), vec![10].into()),
+        )]);
         let msg = MempoolSyncMsg::BroadcastTransactionsRequest {
-            request_id: request_id.clone(),
+            message_id: message_id_in_request.clone(),
             transactions: sign_transactions(txns),
         };
-        let data = protocol_id.to_bytes(&msg).unwrap().into();
+        let data = protocol_id.to_bytes(&msg).unwrap();
         let (notif, maybe_receiver) = match protocol_id {
             ProtocolId::MempoolDirectSend => (
-                PeerManagerNotification::RecvMessage(
-                    remote_peer_id,
-                    Message {
+                ReceivedMessage {
+                    message: NetworkMessage::DirectSendMsg(DirectSendMsg {
                         protocol_id,
-                        mdata: data,
-                    },
-                ),
+                        priority: 0,
+                        raw_msg: data,
+                    }),
+                    sender: PeerNetworkId::new(network_id, remote_peer_id),
+                    receive_timestamp_micros: 0,
+                    rpc_replier: None,
+                },
                 None,
             ),
             ProtocolId::MempoolRpc => {
                 let (res_tx, res_rx) = oneshot::channel();
-                let notif = PeerManagerNotification::RecvRpc(
-                    remote_peer_id,
-                    InboundRpcRequest {
+                let rmsg = ReceivedMessage {
+                    message: NetworkMessage::RpcRequest(RpcRequest {
                         protocol_id,
-                        data,
-                        res_tx,
-                    },
-                );
-                (notif, Some(res_rx))
-            }
-            _ => panic!("Invalid protocol"),
+                        request_id: 0,
+                        priority: 0,
+                        raw_request: data,
+                    }),
+                    sender: PeerNetworkId::new(network_id, remote_peer_id),
+                    receive_timestamp_micros: 0,
+                    rpc_replier: Some(Arc::new(res_tx)),
+                };
+                (rmsg, Some(res_rx))
+            },
+
+            protocol_id => panic!("Invalid protocol id found: {:?}", protocol_id),
         };
         inbound_handle
             .inbound_message_sender
@@ -278,17 +315,17 @@ impl MempoolNode {
                 PeerManagerRequest::SendDirectSend(peer_id, msg) => {
                     assert_eq!(peer_id, remote_peer_id);
                     msg.protocol_id.from_bytes(&msg.mdata).unwrap()
-                }
+                },
                 _ => panic!("Should not be getting an RPC response"),
             }
         };
         if let MempoolSyncMsg::BroadcastTransactionsResponse {
-            request_id: response_request_id,
+            message_id: message_id_in_response,
             retry,
             backoff,
         } = response
         {
-            assert_eq!(response_request_id, request_id);
+            assert_eq!(message_id_in_response, message_id_in_request);
             assert!(!retry);
             assert!(!backoff);
         } else {
@@ -340,15 +377,16 @@ impl MempoolNode {
         let (peer_id, protocol_id, data, maybe_rpc_sender) = match message {
             PeerManagerRequest::SendRpc(peer_id, msg) => {
                 (peer_id, msg.protocol_id, msg.data, Some(msg.res_tx))
-            }
+            },
             PeerManagerRequest::SendDirectSend(peer_id, msg) => {
                 (peer_id, msg.protocol_id, msg.mdata, None)
-            }
+            },
         };
         assert_eq!(peer_id, expected_peer_id);
-        let request_id = match bcs::from_bytes(&data).unwrap() {
+        let mempool_message = common::decompress_and_deserialize(&data.to_vec());
+        let message_id = match mempool_message {
             MempoolSyncMsg::BroadcastTransactionsRequest {
-                request_id,
+                message_id,
                 transactions,
             } => {
                 if !block_only_contains_transactions(&transactions, expected_txns) {
@@ -358,12 +396,7 @@ impl MempoolNode {
                         .collect();
                     let expected_txns: Vec<_> = expected_txns
                         .iter()
-                        .map(|txn| {
-                            (
-                                TestTransaction::get_address(txn.address),
-                                txn.sequence_number,
-                            )
-                        })
+                        .map(|txn| (txn.address, txn.sequence_number))
                         .collect();
 
                     panic!(
@@ -371,29 +404,55 @@ impl MempoolNode {
                         txns, expected_txns
                     );
                 }
-                request_id
-            }
+                message_id
+            },
+            MempoolSyncMsg::BroadcastTransactionsRequestWithReadyTime {
+                message_id,
+                transactions,
+            } => {
+                let transactions: Vec<_> =
+                    transactions.iter().map(|(txn, _, _)| txn.clone()).collect();
+                if !block_only_contains_transactions(&transactions, expected_txns) {
+                    let txns: Vec<_> = transactions
+                        .iter()
+                        .map(|txn| (txn.sender(), txn.sequence_number()))
+                        .collect();
+                    let expected_txns: Vec<_> = expected_txns
+                        .iter()
+                        .map(|txn| (txn.address, txn.sequence_number))
+                        .collect();
+
+                    panic!(
+                        "Request doesn't match. Actual: {:?} Expected: {:?}",
+                        txns, expected_txns
+                    );
+                }
+                message_id
+            },
             MempoolSyncMsg::BroadcastTransactionsResponse { .. } => {
                 panic!("We aren't supposed to be getting as response here");
-            }
+            },
         };
         let response = MempoolSyncMsg::BroadcastTransactionsResponse {
-            request_id,
+            message_id,
             retry,
             backoff,
         };
         let bytes = protocol_id.to_bytes(&response).unwrap();
 
         if let Some(rpc_sender) = maybe_rpc_sender {
-            let _ = rpc_sender.send(Ok(bytes.into())).unwrap();
+            rpc_sender.send(Ok(bytes.into())).unwrap();
         } else {
-            let notif = PeerManagerNotification::RecvMessage(
-                peer_id,
-                Message {
+            let notif = ReceivedMessage {
+                message: NetworkMessage::DirectSendMsg(DirectSendMsg {
                     protocol_id,
-                    mdata: bytes.into(),
-                },
-            );
+                    priority: 0,
+                    raw_msg: bytes,
+                }),
+                sender: PeerNetworkId::new(network_id, peer_id),
+                receive_timestamp_micros: 0,
+                rpc_replier: None,
+            };
             inbound_handle
                 .inbound_message_sender
                 .push((peer_id, protocol_id), notif)
@@ -435,22 +494,32 @@ impl TestFramework<MempoolNode> for MempoolTestFramework {
             network_id_mapping.insert(network_id, *peer_network_id);
         }
 
-        let (application_handles, inbound_handles, outbound_handles, peer_metadata_storage) =
-            setup_node_networks(&network_ids);
-        let (mempool_client_sender, mempool_consensus_sender, mempool_notifications, mempool) =
-            setup_mempool(config, application_handles, peer_metadata_storage.clone());
+        let (
+            network_client,
+            network_service_events,
+            inbound_handles,
+            outbound_handles,
+            peers_and_metadata,
+        ) = setup_node_networks(&network_ids);
+        let (mempool_client_sender, consensus_to_mempool_sender, mempool_notifications, mempool) =
+            setup_mempool(
+                config,
+                network_client,
+                network_service_events,
+                peers_and_metadata.clone(),
+            );
 
         MempoolNode {
             node_id,
             peer_network_ids: network_id_mapping,
             mempool,
             mempool_client_sender,
-            mempool_consensus_sender,
+            consensus_to_mempool_sender,
             mempool_notifications,
             inbound_handles,
             outbound_handles,
             other_inbound_handles: HashMap::new(),
-            peer_metadata_storage,
+            peers_and_metadata,
             request_id_generator: U32IdGenerator::new(),
         }
     }
@@ -460,52 +529,144 @@ impl TestFramework<MempoolNode> for MempoolTestFramework {
     }
 }
 
+/// Setup the multiple networks built for a specific node
+pub fn setup_node_networks(
+    network_ids: &[NetworkId],
+) -> (
+    NetworkClient<MempoolSyncMsg>,
+    NetworkServiceEvents<MempoolSyncMsg>,
+    HashMap<NetworkId, InboundNetworkHandle>,
+    HashMap<NetworkId, OutboundMessageReceiver>,
+    Arc<PeersAndMetadata>,
+) {
+    let peers_and_metadata = PeersAndMetadata::new(network_ids);
+
+    // Build each individual network
+    let mut network_senders = HashMap::new();
+    let mut network_and_events = HashMap::new();
+    let mut inbound_handles = HashMap::new();
+    let mut outbound_handles = HashMap::new();
+    for network_id in network_ids {
+        let (network_sender, network_events, inbound_handle, outbound_handle) =
+            setup_network(peers_and_metadata.clone());
+
+        network_senders.insert(*network_id, network_sender);
+        network_and_events.insert(*network_id, network_events);
+        inbound_handles.insert(*network_id, inbound_handle);
+        outbound_handles.insert(*network_id, outbound_handle);
+    }
+
+    // Create a network client and service events
+    let network_client = NetworkClient::new(
+        vec![MempoolDirectSend],
+        vec![],
+        network_senders,
+        peers_and_metadata.clone(),
+    );
+    let network_service_events = NetworkServiceEvents::new(network_and_events);
+
+    (
+        network_client,
+        network_service_events,
+        inbound_handles,
+        outbound_handles,
+        peers_and_metadata,
+    )
+}
+
+/// Builds all the channels used for networking
+fn setup_network(
+    peers_and_metadata: Arc<PeersAndMetadata>,
+) -> (
+    NetworkSender<MempoolSyncMsg>,
+    NetworkEvents<MempoolSyncMsg>,
+    InboundNetworkHandle,
+    OutboundMessageReceiver,
+) {
+    let (reqs_inbound_sender, reqs_inbound_receiver) = aptos_channel();
+    let (reqs_outbound_sender, reqs_outbound_receiver) = aptos_channel();
+    let (connection_outbound_sender, _connection_outbound_receiver) = aptos_channel();
+
+    // Create the network sender and events
+    let network_sender = NetworkSender::new(
+        PeerManagerRequestSender::new(reqs_outbound_sender),
+        ConnectionRequestSender::new(connection_outbound_sender),
+    );
+    let network_events = NetworkEvents::new(reqs_inbound_receiver, None, true);
+
+    (
+        network_sender,
+        network_events,
+        InboundNetworkHandle {
+            inbound_message_sender: reqs_inbound_sender,
+            peers_and_metadata,
+        },
+        reqs_outbound_receiver,
+    )
+}
+
+/// A generic FIFO Aptos channel
+fn aptos_channel<K: Eq + Hash + Clone, T>(
+) -> (aptos_channel::Sender<K, T>, aptos_channel::Receiver<K, T>) {
+    static MAX_QUEUE_SIZE: usize = 8;
+    aptos_channel::new(QueueStyle::FIFO, MAX_QUEUE_SIZE, None)
+}
+
 /// Creates a full [`SharedMempool`] and mocks all of the database information.
-///
-/// This hooks in the [`ApplicationNetworkHandle`]s into mempool so that the requests make it all
-/// the way to the [`SharedMempool`]
 fn setup_mempool(
     config: NodeConfig,
-    network_handles: Vec<ApplicationNetworkHandle<MempoolNetworkSender, MempoolNetworkEvents>>,
-    peer_metadata_storage: Arc<PeerMetadataStorage>,
+    network_client: NetworkClient<MempoolSyncMsg>,
+    network_service_events: NetworkServiceEvents<MempoolSyncMsg>,
+    peers_and_metadata: Arc<PeersAndMetadata>,
 ) -> (
     MempoolClientSender,
-    MempoolConsensusSender,
+    futures::channel::mpsc::Sender<QuorumStoreRequest>,
     MempoolNotifier,
     Arc<Mutex<CoreMempool>>,
 ) {
     let (sender, _subscriber) = futures::channel::mpsc::unbounded();
     let (ac_endpoint_sender, ac_endpoint_receiver) = mpsc_channel();
-    let (consensus_sender, consensus_events) = mpsc_channel();
+    let (quorum_store_sender, quorum_store_receiver) = mpsc_channel();
     let (mempool_notifier, mempool_listener) =
-        mempool_notifications::new_mempool_notifier_listener_pair();
+        aptos_mempool_notifications::new_mempool_notifier_listener_pair(100);
 
     let mempool = Arc::new(Mutex::new(CoreMempool::new(&config)));
     let vm_validator = Arc::new(RwLock::new(MockVMValidator));
-    let db_rw = Arc::new(RwLock::new(DbReaderWriter::new(MockDbReaderWriter)));
     let db_ro = Arc::new(MockDbReaderWriter);
 
-    let mut event_subscriber = EventSubscriptionService::new(ON_CHAIN_CONFIG_REGISTRY, db_rw);
-    let reconfig_event_subscriber = event_subscriber.subscribe_to_reconfigurations().unwrap();
+    let (reconfig_sender, reconfig_events) = aptos_channel::new(QueueStyle::LIFO, 1, None);
+    let reconfig_event_subscriber = ReconfigNotificationListener {
+        notification_receiver: reconfig_events,
+    };
+    reconfig_sender
+        .push((), ReconfigNotification {
+            version: 1,
+            on_chain_configs: OnChainConfigPayload::new(
+                1,
+                InMemoryOnChainConfig::new(HashMap::new()),
+            ),
+        })
+        .unwrap();
 
     start_shared_mempool(
         &Handle::current(),
         &config,
         mempool.clone(),
-        network_handles,
+        network_client,
+        network_service_events,
         ac_endpoint_receiver,
-        consensus_events,
+        quorum_store_receiver,
         mempool_listener,
         reconfig_event_subscriber,
         db_ro,
         vm_validator,
         vec![sender],
-        peer_metadata_storage,
+        peers_and_metadata,
     );
 
     (
         ac_endpoint_sender,
-        consensus_sender,
+        quorum_store_sender,
         mempool_notifier,
         mempool,
     )
@@ -519,8 +680,14 @@ fn mpsc_channel<T>() -> (
 }
 
 /// Creates a single [`TestTransaction`] with the given `seq_num`.
-pub const fn test_transaction(seq_num: u64) -> TestTransaction {
-    TestTransaction::new(1, seq_num, 1)
+pub fn test_transaction(seq_num: u64) -> TestTransaction {
+    TestTransaction {
+        address: TestTransaction::get_address(1),
+        sequence_number: seq_num,
+        gas_price: 1,
+        account_seqno: 0,
+        script: None,
+    }
 }
 
 /// Tells us if a [`SignedTransaction`] block contains only the [`TestTransaction`]s
@@ -556,7 +723,7 @@ pub fn block_contains_any_transaction(
 fn block_contains_transaction(block: &[SignedTransaction], txn: &TestTransaction) -> bool {
     block.iter().any(|signed_txn| {
         signed_txn.sequence_number() == txn.sequence_number
-            && signed_txn.sender() == TestTransaction::get_address(txn.address)
+            && signed_txn.sender() == txn.address
             && signed_txn.gas_unit_price() == txn.gas_price
     })
 }

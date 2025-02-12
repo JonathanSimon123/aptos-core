@@ -50,6 +50,7 @@ terraform/validator/*/*-kube.config
 terraform/validator/vault-init/backend.tf
 terraform/testnet/*-kubernetes.json
 terraform/testnet/*-vault.ca
+.terraform.lock.hcl
 
 # Move Build Output
 build/
@@ -64,9 +65,20 @@ build/
 !aptos-move/framework/experimental/releases/artifacts/**
 !aptos-move/framework/aptos-framework/releases/artifacts/**
 
+# Do not ignore the Move script for the faucet.
+# https://stackoverflow.com/a/16318111/3846032
+!aptos-move/move-examples/scripts/minter/build
+aptos-move/move-examples/scripts/minter/build/*
+!aptos-move/move-examples/scripts/minter/build/Minter
+aptos-move/move-examples/scripts/minter/build/Minter/*
+!aptos-move/move-examples/scripts/minter/build/Minter/bytecode_scripts
+
 # Docker incremental build temporary files and directories
 target-out-docker
 **/Dockerfile.tmp
+# Indexer grpc temporary certificates.
+docker/compose/indexer-grpc/data-service-grpc-server.crt
+docker/compose/indexer-grpc/data-service-grpc-server.key
 
 # Doc generation output
 *.md.old
@@ -81,8 +93,9 @@ target-out-docker
 .*\#
 \#*\#
 
-# Aptos CLI files
-.aptos/
+# Aptos CLI / local testnet files
+.aptos
+**/*.rdb
 
 # VSCode settings
 .vscode/
@@ -90,3 +103,35 @@ target-out-docker
 # Typescript
 *.env
 node_modules
+
+# local /data dir sometimes used for testing
+/data
+
+# Cached python files
+__pycache__
+
+# ignore framework release bundle file
+**/*.mrb
+
+# Profiler outputs
+aptos-move/aptos-vm-profiling/**/*.log
+aptos-move/aptos-vm-profiling/**/*.txt
+
+# Gas profiler outputs
+aptos-move/e2e-move-tests/gas-profiling
+gas-profiling
+
+# replay-verify and module-verify script outputs
+metadata-cache
+/local/
+run_*
+
+# test files for indexer GRPC
+test_indexer_grpc_*.yaml
+test_indexer_grpc/*
+ecosystem/indexer-grpc/indexer-transaction-generator/*.yaml
+
+# ignore compiler artifacts
+*.dot
+*.bytecode
+!third_party/move/move-prover/tests/xsources/design/*.bytecode

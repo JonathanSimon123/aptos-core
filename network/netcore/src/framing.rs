@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use bytes::BytesMut;
@@ -71,9 +72,9 @@ where
 #[cfg(test)]
 mod test {
     use super::{read_u16frame, read_u16frame_len, write_u16frame, write_u16frame_len};
+    use aptos_memsocket::MemorySocket;
     use bytes::BytesMut;
     use futures::{executor::block_on, io::AsyncWriteExt};
-    use memsocket::MemorySocket;
     use std::io::Result;
 
     #[test]
@@ -151,8 +152,7 @@ mod test {
     fn write_large_u16frame() {
         let (mut a, _b) = MemorySocket::new_pair();
 
-        let mut buf = Vec::new();
-        buf.resize((u16::max_value() as usize) * 2, 0);
+        let buf = vec![0; (u16::max_value() as usize) * 2];
 
         let result = block_on(write_u16frame(&mut a, &buf));
         assert!(result.is_err());

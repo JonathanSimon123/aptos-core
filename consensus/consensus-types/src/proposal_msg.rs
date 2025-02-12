@@ -1,11 +1,12 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{block::Block, common::Author, sync_info::SyncInfo};
+use crate::{block::Block, common::Author, proof_of_store::ProofCache, sync_info::SyncInfo};
 use anyhow::{anyhow, ensure, format_err, Context, Result};
+use aptos_short_hex_str::AsShortHexStr;
 use aptos_types::validator_verifier::ValidatorVerifier;
 use serde::{Deserialize, Serialize};
-use short_hex_str::AsShortHexStr;
 use std::fmt;
 
 /// ProposalMsg contains the required information for the proposer election protocol to make its
@@ -79,14 +80,29 @@ impl ProposalMsg {
         Ok(())
     }
 
-    pub fn verify(&self, validator: &ValidatorVerifier) -> Result<()> {
-        self.proposal
+    pub fn verify(
+        &self,
+        sender: Author,
+        validator: &ValidatorVerifier,
+        proof_cache: &ProofCache,
+        quorum_store_enabled: bool,
+    ) -> Result<()> {
+        if let Some(proposal_author) = self.proposal.author() {
+            ensure!(
+                proposal_author == sender,
+                "Proposal author {:?} doesn't match sender {:?}",
+                proposal_author,
+                sender
+            );
+        }
+        self.proposal().payload().map_or(Ok(()), |p| {
+            p.verify(validator, proof_cache, quorum_store_enabled)
+        })?;
+
+        self.proposal()
             .validate_signature(validator)
             .map_err(|e| format_err!("{:?}", e))?;
         // if there is a timeout certificate, verify its signatures
-        if let Some(tc) = self.sync_info.highest_timeout_certificate() {
-            tc.verify(validator).map_err(|e| format_err!("{:?}", e))?;
-        }
         if let Some(tc) = self.sync_info.highest_2chain_timeout_cert() {
             tc.verify(validator).map_err(|e| format_err!("{:?}", e))?;
         }

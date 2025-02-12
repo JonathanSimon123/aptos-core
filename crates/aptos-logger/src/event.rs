@@ -1,4 +1,5 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{Metadata, Schema};
@@ -14,7 +15,7 @@ pub struct Event<'a> {
 }
 
 impl<'a> Event<'a> {
-    fn new(
+    pub(crate) fn new(
         metadata: &'a Metadata,
         message: Option<fmt::Arguments<'a>>,
         keys_and_values: &'a [&'a dyn Schema],

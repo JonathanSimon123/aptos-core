@@ -1,12 +1,13 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 //! Support for encoding transactions for common situations.
 
 use crate::account::Account;
-use aptos_transaction_builder::aptos_stdlib;
-use aptos_types::transaction::{RawTransaction, Script, SignedTransaction};
-use move_deps::move_ir_compiler::Compiler;
+use aptos_cached_packages::aptos_stdlib;
+use aptos_types::transaction::{Script, SignedTransaction};
+use move_ir_compiler::Compiler;
 use once_cell::sync::Lazy;
 
 pub static EMPTY_SCRIPT: Lazy<Vec<u8>> = Lazy::new(|| {
@@ -16,9 +17,9 @@ pub static EMPTY_SCRIPT: Lazy<Vec<u8>> = Lazy::new(|| {
       return;
     }
 ";
-
+    let modules = aptos_cached_packages::head_release_bundle().compiled_modules();
     let compiler = Compiler {
-        deps: cached_framework_packages::modules().iter().collect(),
+        deps: modules.iter().collect(),
     };
     compiler.into_script_blob(code).expect("Failed to compile")
 });
@@ -46,50 +47,32 @@ pub fn create_account_txn(
 ) -> SignedTransaction {
     sender
         .transaction()
-        .payload(aptos_stdlib::encode_account_create_account(
+        .payload(aptos_stdlib::aptos_account_create_account(
             *new_account.address(),
         ))
         .sequence_number(seq_num)
         .sign()
 }
 
-/// Returns a transaction to transfer coin from one account to another (possibly new) one, with the
-/// given arguments.
+/// Returns a transaction to transfer coin from one account to another (possibly new) one,
+/// with the given arguments. Providing 0 as gas_unit_price generates transactions that
+/// don't use an aggregator for total supply tracking (due to logic in coin.move that
+/// doesn't generate a delta for total supply when gas is 0).
 pub fn peer_to_peer_txn(
     sender: &Account,
     receiver: &Account,
     seq_num: u64,
     transfer_amount: u64,
+    gas_unit_price: u64,
 ) -> SignedTransaction {
     // get a SignedTransaction
     sender
         .transaction()
-        .payload(aptos_stdlib::encode_test_coin_transfer(
+        .payload(aptos_stdlib::aptos_coin_transfer(
             *receiver.address(),
             transfer_amount,
         ))
         .sequence_number(seq_num)
+        .gas_unit_price(gas_unit_price)
         .sign()
-}
-
-/// Returns a transaction to change the keys for the given account.
-pub fn rotate_key_txn(sender: &Account, new_key_hash: Vec<u8>, seq_num: u64) -> SignedTransaction {
-    sender
-        .transaction()
-        .payload(aptos_stdlib::encode_account_rotate_authentication_key(
-            new_key_hash,
-        ))
-        .sequence_number(seq_num)
-        .sign()
-}
-
-/// Returns a transaction to change the keys for the given account.
-pub fn raw_rotate_key_txn(sender: &Account, new_key_hash: Vec<u8>, seq_num: u64) -> RawTransaction {
-    sender
-        .transaction()
-        .payload(aptos_stdlib::encode_account_rotate_authentication_key(
-            new_key_hash,
-        ))
-        .sequence_number(seq_num)
-        .raw()
 }

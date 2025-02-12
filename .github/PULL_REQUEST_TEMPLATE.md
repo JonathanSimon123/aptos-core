@@ -1,21 +1,46 @@
-<!--
-Thank you for sending a PR. We appreciate you spending time to help improve the Aptos Core project.
+## Description
+<!-- Please include a summary of the change, including which issue it fixes or what feature it adds. Include relevant motivation, context and documentation as appropriate. List dependencies that are required for this change, if any. -->
 
-The project is undergoing daily changes. Pull Requests will be reviewed and responded to as time permits.
+## How Has This Been Tested?
+<!--
+- Please ensure that the functionality introduced by this change is well tested and verified to work as expected.
+- Ensure tests cover both happy and unhappy paths.
+- List and link relevant tests.
 -->
 
-## Motivation
+## Key Areas to Review
+<!--
+- Identify any critical parts of the code that require special attention or understanding. Explain why these parts are crucial to the functionality or architecture of the project.
+- Point out any areas where complex logic has been implemented. Provide a brief explanation of the logic and your approach to make it easier for reviewers to follow.
+- Highlight any areas where you are particularly concerned or unsure about the code's impact on the change. This can include potential performance or security issues, or compatibility with existing features.
+-->
 
-(Write your motivation for proposed changes here.)
+## Type of Change
+- [ ] New feature
+- [ ] Bug fix
+- [ ] Breaking change
+- [ ] Performance improvement
+- [ ] Refactoring
+- [ ] Dependency update
+- [ ] Documentation update
+- [ ] Tests
 
-### Have you read the [Contributing Guidelines on pull requests](https://github.com/aptos-labs/aptos-core/blob/main/CONTRIBUTING.md#pull-requests)?
+## Which Components or Systems Does This Change Impact?
+- [ ] Validator Node
+- [ ] Full Node (API, Indexer, etc.)
+- [ ] Move/Aptos Virtual Machine
+- [ ] Aptos Framework
+- [ ] Aptos CLI/SDK
+- [ ] Developer Infrastructure
+- [ ] Move Compiler
+- [ ] Other (specify)
 
-(You must have submitted a [signed CLA](https://github.com/aptos-labs/aptos-core/blob/main/CONTRIBUTING.md#contributor-license-agreement) that includes your GitHub handle prior to us accepting and landing your work. Write your answer here.)
+## Checklist
+- [ ] I have read and followed the [CONTRIBUTING](https://github.com/aptos-labs/aptos-core/blob/main/CONTRIBUTING.md) doc
+- [ ] I have performed a self-review of my own code
+- [ ] I have commented my code, particularly in hard-to-understand areas
+- [ ] I identified and added all stakeholders and component owners affected by this change as reviewers
+- [ ] I tested both happy and unhappy path of the functionality
+- [ ] I have made corresponding changes to the documentation
 
-## Test Plan
-
-(Share your test plan here. If you changed code, please provide us with clear instructions for verifying that your changes work.)
-
-## Related PRs
-
-(If this PR adds or changes functionality, please take some time to update the docs at https://github.com/aptos-labs/aptos-core/tree/main/developer-docs-site, and link to your PR here.)
+<!-- Thank you for your contribution! -->

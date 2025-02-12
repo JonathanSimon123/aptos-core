@@ -1,6 +1,8 @@
-// Copyright (c) Aptos
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -54,6 +56,13 @@ impl ModuleBundle {
         self.codes.into_iter().map(Module::into_inner).collect()
     }
 
+    pub fn into_bytes(self) -> Vec<Bytes> {
+        self.codes
+            .into_iter()
+            .map(|m| m.into_inner().into())
+            .collect()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &Module> {
         self.codes.iter()
     }
@@ -74,8 +83,8 @@ impl From<Module> for ModuleBundle {
 }
 
 impl IntoIterator for ModuleBundle {
-    type Item = Module;
     type IntoIter = std::vec::IntoIter<Self::Item>;
+    type Item = Module;
 
     fn into_iter(self) -> Self::IntoIter {
         self.codes.into_iter()

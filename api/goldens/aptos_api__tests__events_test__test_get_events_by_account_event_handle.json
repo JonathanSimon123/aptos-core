@@ -1,8 +1,12 @@
 [
   {
-    "key": "0x0500000000000000000000000000000000000000000000000000000000000000000000000a550c18",
+    "version": "0",
+    "guid": {
+      "creation_number": "2",
+      "account_address": "0x1"
+    },
     "sequence_number": "0",
-    "type": "0x1::Reconfiguration::NewEpochEvent",
+    "type": "0x1::reconfiguration::NewEpochEvent",
     "data": {
       "epoch": "1"
     }
